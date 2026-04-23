@@ -43,9 +43,11 @@ export interface PiiWasmExports {
   rms_norm(x: number, gamma: number, out: number, T: number, D: number, eps: number): void;
   matmul_bf16(x: number, w: number, bias: number, out: number, T: number, N: number, D: number): void;
   matmul_bf16_out_f32(x: number, w: number, bias: number, out: number, T: number, N: number, D: number): void;
-  matmul_bf16_x_int4block(x: number, w_int4: number, w_scales: number, bias: number, out: number, T: number, N: number, D: number): void;
-  matmul_bf16_x_int4block_out_f32(x: number, w_int4: number, w_scales: number, bias: number, out: number, T: number, N: number, D: number): void;
-  matmul_f32_x_int4block_out_f32(x: number, w_int4: number, w_scales: number, bias: number, out: number, T: number, N: number, D: number): void;
+  // int4-block matmul variants: `w_zp` is `0` for symmetric decode (no zero-points),
+  // or a pointer into WASM memory for asymmetric (ONNX MatMulNBits semantics).
+  matmul_bf16_x_int4block(x: number, w_int4: number, w_scales: number, w_zp: number, bias: number, out: number, T: number, N: number, D: number): void;
+  matmul_bf16_x_int4block_out_f32(x: number, w_int4: number, w_scales: number, w_zp: number, bias: number, out: number, T: number, N: number, D: number): void;
+  matmul_f32_x_int4block_out_f32(x: number, w_int4: number, w_scales: number, w_zp: number, bias: number, out: number, T: number, N: number, D: number): void;
   topk_partial_f32(x: number, out_idx: number, out_val: number, rows: number, cols: number, k: number): void;
   rope_apply(qk: number, cos: number, sin: number, T: number, H: number, head_dim: number): void;
   banded_attention(

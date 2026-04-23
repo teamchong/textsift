@@ -663,10 +663,12 @@ async function runMatmulInt4(ex, _weights, spec) {
   const wPtr = allocAndCopy(ex, w);
   const bPtr = allocAndCopy(ex, bias);
   const outPtr = ex.alloc(expected.byteLength);
-  // Packed blob: [N*D/2 bytes int4][N*D/32 * 2 bytes fp16 scales].
+  // Packed blob: [N * D/2 int4][N * D/32 × 2 fp16 scales][N * ceil(D/32/2) zp].
   const int4Bytes = (spec.N * spec.D) >>> 1;
+  const nBlocks = spec.D >>> 5;
   const scalesPtr = wPtr + int4Bytes;
-  ex.matmul_bf16_x_int4block(xPtr, wPtr, scalesPtr, bPtr, outPtr, spec.T, spec.N, spec.D);
+  const zpPtr = scalesPtr + spec.N * nBlocks * 2;
+  ex.matmul_bf16_x_int4block(xPtr, wPtr, scalesPtr, zpPtr, bPtr, outPtr, spec.T, spec.N, spec.D);
   return {
     tolerance: { relTol: spec.rel_tol, absTol: spec.abs_tol ?? 0 },
     ...compareBf16Tolerance(ex, outPtr, expected, {

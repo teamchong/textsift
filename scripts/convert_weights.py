@@ -149,15 +149,16 @@ def quantize_int4_block32_sym(
     tensor: object, transpose_last: bool = False,
 ) -> tuple[bytes, tuple[int, ...]]:
     """
-    Signed symmetric int4, block size 32 along the last dim, per-block fp16 scale.
-    Data layout: [..., N, D/2] packed int4 (low nibble = even d index, high nibble =
-    odd d index), concatenated with [..., N, D/32] fp16 scales.
-    Returns (packed_bytes, logical_shape).
+    Asymmetric uint4 blockwise quantization, matching ONNX MatMulNBits
+    semantics: block size 32 along the last dim, per-block fp16 scale,
+    per-block uint4 zero-point. Dequant: `value = (q - zp) * scale`.
 
-    If `transpose_last=True`, the last two dims are swapped before quantization
-    so the stored layout is [..., N=D_out, D=D_in]. Upstream's MoE expert
-    weights use [E, D_in, D_out] (x @ W pattern); our matmul kernel does
-    x @ W.T so we pre-transpose at conversion time.
+    Data layout written into one blob (back-to-back):
+      [..., N, D/2]          uint4 weights (low nibble = even d, high = odd)
+      [..., N, D/32]         fp16 scales
+      [..., N, ceil(D/32/2)] uint4 zero-points packed 2-per-byte
+
+    Returns (packed_bytes, logical_shape).
     """
     import torch
     t = tensor.detach().contiguous().cpu().to(torch.float32)
@@ -172,30 +173,42 @@ def quantize_int4_block32_sym(
     if D % INT4_BLOCK_SIZE != 0:
         raise ValueError(f"last dim {D} not divisible by {INT4_BLOCK_SIZE}")
 
-    leading = t.shape[:-1]          # flatten everything except last dim
-    t2 = t.reshape(-1, D)            # [R, D] where R = prod(leading)
+    leading = t.shape[:-1]
+    t2 = t.reshape(-1, D)                                # [R, D]
     R = t2.shape[0]
     n_blocks = D // INT4_BLOCK_SIZE
     blocks = t2.view(R, n_blocks, INT4_BLOCK_SIZE)
 
-    max_abs = blocks.abs().amax(dim=-1, keepdim=True)
-    # Scale = max_abs / 7 (not /8) so max_abs maps to +7 (int4 positive max).
-    # Prevents the most-negative int4 value (-8) from being required for
-    # symmetric range, keeping decode trivially `int8(q) * scale`.
-    scale = torch.where(max_abs > 0, max_abs / 7.0, torch.ones_like(max_abs))
-    q = torch.round(blocks / scale).clamp(-8, 7).to(torch.int8)
+    block_min = blocks.amin(dim=-1, keepdim=True)
+    block_max = blocks.amax(dim=-1, keepdim=True)
+    # Asymmetric range 0..15. scale = (max-min)/15; zp = round(-min/scale).
+    span = (block_max - block_min).clamp_min(1e-8)
+    scale = span / 15.0
+    zp_f = (-block_min / scale).round().clamp(0, 15)
+    q = (blocks / scale + zp_f).round().clamp(0, 15).to(torch.uint8)
 
-    # Pack: q is [R, n_blocks, 32] int8. Flatten last two dims, take pairs.
+    # Pack weight nibbles: low = even d, high = odd d.
     q_flat = q.reshape(R, D)
-    low = (q_flat[:, 0::2] & 0x0F).to(torch.uint8)
-    high = (q_flat[:, 1::2] & 0x0F).to(torch.uint8)
-    packed = (low | (high << 4)).contiguous()              # [R, D/2] u8
+    low = q_flat[:, 0::2]
+    high = q_flat[:, 1::2]
+    packed = (low | (high << 4)).to(torch.uint8).contiguous()              # [R, D/2] u8
 
     scale_fp16 = scale.squeeze(-1).to(torch.float16).reshape(R, n_blocks)
 
+    # Pack zero-points: block 0 → low nibble of byte 0, block 1 → high nibble
+    # of byte 0, block 2 → low of byte 1, etc. For odd n_blocks, the trailing
+    # byte's high nibble is unused (spec-compliant, decoder ignores it).
+    zp_flat = zp_f.squeeze(-1).reshape(R, n_blocks).to(torch.uint8)
+    zp_bytes_per_row = (n_blocks + 1) // 2
+    zp_packed = torch.zeros(R, zp_bytes_per_row, dtype=torch.uint8)
+    zp_packed[:, : n_blocks // 2] = zp_flat[:, 0::2] | (zp_flat[:, 1::2] << 4)
+    if n_blocks % 2 == 1:
+        zp_packed[:, -1] = zp_flat[:, -1]
+
     int4_bytes = packed.numpy().tobytes()
     scale_bytes = scale_fp16.view(torch.uint16).numpy().tobytes()
-    return int4_bytes + scale_bytes, shape
+    zp_bytes = zp_packed.numpy().tobytes()
+    return int4_bytes + scale_bytes + zp_bytes, shape
 
 
 def should_quantize(name: str, patterns: Sequence[str] | None) -> bool:

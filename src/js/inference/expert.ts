@@ -48,7 +48,7 @@ export interface ExpertConfig {
 
 function expertSlicePointers(
   tensor: WeightTensorInfo, expertIdx: number,
-): { int4Ptr: number; scalesPtr: number } {
+): { int4Ptr: number; scalesPtr: number; zpPtr: number } {
   if (tensor.shape.length !== 3) {
     throw new Error(`expert slice expects 3D tensor, got shape ${tensor.shape}`);
   }
@@ -56,12 +56,16 @@ function expertSlicePointers(
   const N = tensor.shape[1]!;
   const D = tensor.shape[2]!;
   if (D % 32 !== 0) throw new Error(`D=${D} not divisible by 32`);
+  const nBlocks = D >>> 5;
   const int4Stride = (N * D) >>> 1;            // bytes per expert for int4 data
-  const scalesStride = ((N * D) >>> 5) * 2;    // bytes per expert for fp16 scales
+  const scalesStride = N * nBlocks * 2;         // bytes per expert for fp16 scales
+  const zpStride = N * ((nBlocks + 1) >>> 1);   // bytes per expert for packed uint4 zp
   const totalInt4 = E * int4Stride;
+  const totalScales = E * scalesStride;
   return {
     int4Ptr: tensor.dataOffset + expertIdx * int4Stride,
     scalesPtr: tensor.dataOffset + totalInt4 + expertIdx * scalesStride,
+    zpPtr: tensor.dataOffset + totalInt4 + totalScales + expertIdx * zpStride,
   };
 }
 
@@ -146,7 +150,7 @@ export function expertDispatch(
     const guSlice = expertSlicePointers(weights.gateUp, e);
     const guBiasPtr = expertBiasPointer(weights.gateUpBias, e);
     wasm.matmul_bf16_x_int4block_out_f32(
-      xGatheredPtr, guSlice.int4Ptr, guSlice.scalesPtr, guBiasPtr,
+      xGatheredPtr, guSlice.int4Ptr, guSlice.scalesPtr, guSlice.zpPtr, guBiasPtr,
       gateUpPtr, m, 2 * dff, D,
     );
 
@@ -157,7 +161,7 @@ export function expertDispatch(
     const dSlice = expertSlicePointers(weights.down, e);
     const dBiasPtr = expertBiasPointer(weights.downBias, e);
     wasm.matmul_f32_x_int4block_out_f32(
-      gluPtr, dSlice.int4Ptr, dSlice.scalesPtr, dBiasPtr,
+      gluPtr, dSlice.int4Ptr, dSlice.scalesPtr, dSlice.zpPtr, dBiasPtr,
       outF32Ptr, m, D, dff,
     );
 

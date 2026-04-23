@@ -61,30 +61,44 @@ def write(path: Path, data: bytes) -> None:
 def dequantize_int4block(packed: bytes, n: int, d: int) -> torch.Tensor:
     """
     Decode the bytes produced by `convert_weights.quantize_int4_block32_sym`
-    back to an fp32 [N, D] tensor. Reference path for computing expected
-    outputs — exactly what the WASM kernel computes on-the-fly.
+    (asymmetric uint4 blockwise, ONNX-compatible) back to an fp32 [N, D]
+    tensor. Reference path for computing expected outputs — exactly what
+    the WASM kernel computes on-the-fly.
+
+    Packed layout: [N, D/2] uint4 weights, [N, D/32] fp16 scales,
+    [N, ceil(D/32/2)] uint4 zero-points (2 per byte, low nibble first).
     """
     import numpy as np
     block = INT4_BLOCK
     n_blocks = d // block
     int4_bytes = n * d // 2
-    # Split packed bytes.
+    scale_bytes = n * n_blocks * 2
+    zp_bytes_per_row = (n_blocks + 1) // 2
     int4_flat = np.frombuffer(packed[:int4_bytes], dtype=np.uint8).reshape(n, d // 2)
-    scale_u16 = np.frombuffer(packed[int4_bytes:], dtype=np.uint16).reshape(n, n_blocks)
-    scales = torch.from_numpy(scale_u16.view(np.uint16).copy()).view(torch.float16).to(torch.float32)
+    scale_u16 = np.frombuffer(
+        packed[int4_bytes : int4_bytes + scale_bytes], dtype=np.uint16
+    ).reshape(n, n_blocks)
+    scales = torch.from_numpy(scale_u16.copy()).view(torch.float16).to(torch.float32)
+    zp_flat = np.frombuffer(packed[int4_bytes + scale_bytes :], dtype=np.uint8).reshape(n, zp_bytes_per_row)
 
-    # Unpack nibbles: low (even d) and high (odd d). Sign-extend 4 bits.
-    lo = int4_flat & 0x0F
-    hi = (int4_flat >> 4) & 0x0F
-    # Sign-extend: treat as int8 via two's complement of a nibble.
-    lo = np.where(lo & 0x08, lo.astype(np.int16) - 16, lo.astype(np.int16)).astype(np.int8)
-    hi = np.where(hi & 0x08, hi.astype(np.int16) - 16, hi.astype(np.int16)).astype(np.int8)
-    q = np.empty((n, d), dtype=np.int8)
+    # Unpack weight nibbles (unsigned, 0..15).
+    lo = (int4_flat & 0x0F).astype(np.int16)
+    hi = ((int4_flat >> 4) & 0x0F).astype(np.int16)
+    q = np.empty((n, d), dtype=np.int16)
     q[:, 0::2] = lo
     q[:, 1::2] = hi
-    q_fp = torch.from_numpy(q).to(torch.float32)     # [N, D]
-    q_blocks = q_fp.view(n, n_blocks, block)
-    dequant = q_blocks * scales.unsqueeze(-1)
+
+    # Unpack zp nibbles (unsigned, one per block).
+    zp = np.zeros((n, n_blocks), dtype=np.int16)
+    zp[:, 0::2] = zp_flat[:, : n_blocks // 2] & 0x0F
+    zp[:, 1::2] = (zp_flat[:, : n_blocks // 2] >> 4) & 0x0F
+    if n_blocks % 2 == 1:
+        zp[:, -1] = zp_flat[:, -1] & 0x0F
+
+    # (q - zp) * scale per block.
+    q_blocks = torch.from_numpy(q).view(n, n_blocks, block).to(torch.float32)
+    zp_t = torch.from_numpy(zp).to(torch.float32).unsqueeze(-1)        # [n, n_blocks, 1]
+    dequant = (q_blocks - zp_t) * scales.unsqueeze(-1)
     return dequant.view(n, d)
 
 
@@ -343,14 +357,23 @@ def main() -> int:
     # Dequantize each expert slice back to fp32.
     def dequant_expert_3d(packed: bytes, E: int, N: int, D: int) -> torch.Tensor:
         out = torch.zeros(E, N, D, dtype=torch.float32)
+        block = INT4_BLOCK
+        n_blocks = D // block
         int4_per_slice = N * D // 2
-        scale_per_slice_bytes = N * D // 32 * 2
+        scale_per_slice = N * n_blocks * 2
+        zp_bytes_per_row = (n_blocks + 1) // 2
+        zp_per_slice = N * zp_bytes_per_row
         total_int4 = E * int4_per_slice
+        total_scale = E * scale_per_slice
         for e in range(E):
             s_int4 = e * int4_per_slice
-            s_scale = total_int4 + e * scale_per_slice_bytes
-            slice_bytes = packed[s_int4 : s_int4 + int4_per_slice] + \
-                          packed[s_scale : s_scale + scale_per_slice_bytes]
+            s_scale = total_int4 + e * scale_per_slice
+            s_zp = total_int4 + total_scale + e * zp_per_slice
+            slice_bytes = (
+                packed[s_int4 : s_int4 + int4_per_slice]
+                + packed[s_scale : s_scale + scale_per_slice]
+                + packed[s_zp : s_zp + zp_per_slice]
+            )
             out[e] = dequantize_int4block(slice_bytes, N, D)
         return out
 

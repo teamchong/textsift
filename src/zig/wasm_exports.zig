@@ -750,19 +750,28 @@ inline fn storeOut(comptime OutType: type, out: [*]OutType, idx: usize, val: f32
 
 /// Decode 32 int4 values at `block_d` of row `w_int4_row` into eight
 /// `@Vector(4, f32)` chunks covering the block's 32 lanes.
-/// Reused by both the TR=4 tiled path and the T-tail.
-inline fn int4BlockDecode(w_int4_row: [*]const u8, block_d: usize) [8]@Vector(4, f32) {
+/// ONNX MatMulNBits stores weights as UINT4 (range 0..15); dequant
+/// requires `(q - zp) * scale`. `zp` is the block's zero-point (also
+/// UINT4, range 0..15); passing 0 yields a symmetric decode.
+inline fn int4BlockDecode(
+    w_int4_row: [*]const u8,
+    block_d: usize,
+    zp: u8,
+) [8]@Vector(4, f32) {
     const packed_u: @Vector(16, u8) = w_int4_row[block_d / 2 ..][0..16].*;
-    const packed_i: @Vector(16, i8) = @bitCast(packed_u);
-    const lo: @Vector(16, i8) = (packed_i << @splat(4)) >> @splat(4);
-    const hi: @Vector(16, i8) = packed_i >> @splat(4);
+    const lo_u: @Vector(16, u8) = packed_u & @as(@Vector(16, u8), @splat(0x0F));
+    const hi_u: @Vector(16, u8) = (packed_u >> @splat(4)) & @as(@Vector(16, u8), @splat(0x0F));
+    const zp_v: @Vector(16, u8) = @splat(zp);
+    // Subtract zp in i16 space to allow negative results (range -15..15).
+    const lo: @Vector(16, i16) = @as(@Vector(16, i16), lo_u) - @as(@Vector(16, i16), zp_v);
+    const hi: @Vector(16, i16) = @as(@Vector(16, i16), hi_u) - @as(@Vector(16, i16), zp_v);
     var out: [8]@Vector(4, f32) = undefined;
     inline for (0..8) |chunk| {
         // Lane `chunk * 4 + c` in block corresponds to nibble `c` of
         // byte `chunk * 2 + c/2` if c is even, or the hi nibble if odd.
         const base_byte = chunk * 2;
-        const slice: @Vector(4, i8) = @shuffle(
-            i8, lo, hi,
+        const slice: @Vector(4, i16) = @shuffle(
+            i16, lo, hi,
             @Vector(4, i32){
                 base_byte,          ~@as(i32, base_byte),
                 base_byte + 1,      ~@as(i32, base_byte + 1),
@@ -774,16 +783,31 @@ inline fn int4BlockDecode(w_int4_row: [*]const u8, block_d: usize) [8]@Vector(4,
     return out;
 }
 
+/// Extract a 4-bit zero-point value for block `b` from a packed
+/// `[N, ceil(nblocks / 2)]` byte buffer. Even blocks go in the low
+/// nibble, odd blocks in the high nibble.
+inline fn extractZp(zp_row: [*]const u8, b: usize) u8 {
+    const byte = zp_row[b >> 1];
+    return if ((b & 1) == 0) byte & 0x0F else (byte >> 4) & 0x0F;
+}
+
 /// Comptime-parameterized int4-block matmul body. Instantiated by the
 /// three public exports (bf16→bf16, bf16→f32, f32→f32). Three variants
 /// × ~100 lines each are worth a controlled monomorphization; we pay
 /// the specialization cost exactly three times.
+///
+/// ONNX MatMulNBits layout:
+///   w_int4_ptr:  uint4 weights packed 2-per-byte, shape [N, K/2]
+///   w_scales_ptr: fp16 scales,                    shape [N, K/block]
+///   w_zp_ptr:    uint4 zero-points packed 2-per-byte, shape [N, ceil(K/block/2)]
+///                Pass null/0 for symmetric-decode (treats zp = 0).
 inline fn matmulInt4BlockImpl(
     comptime XType: type,
     comptime OutType: type,
     x_ptr: [*]const XType,
     w_int4_ptr: [*]const u8,
     w_scales_ptr: [*]const u16,
+    w_zp_ptr: ?[*]const u8,
     bias_ptr: [*]const u16,
     out_ptr: [*]OutType,
     T: u32,
@@ -798,6 +822,7 @@ inline fn matmulInt4BlockImpl(
 
     const w_int4_stride: usize = Dz / 2;
     const w_scale_stride: usize = Dz / BLOCK;
+    const w_zp_stride: usize = (w_scale_stride + 1) / 2;
     const w_ptr = w_int4_ptr;
     const scales_base: [*]const u16 = w_scales_ptr;
 
@@ -810,6 +835,7 @@ inline fn matmulInt4BlockImpl(
         while (n < Nz) : (n += 1) {
             const w_int4_row = w_ptr + n * w_int4_stride;
             const w_scale_row = scales_base + n * w_scale_stride;
+            const w_zp_row: ?[*]const u8 = if (w_zp_ptr) |p| p + n * w_zp_stride else null;
 
             var acc0: f32 = 0.0;
             var acc1: f32 = 0.0;
@@ -819,9 +845,10 @@ inline fn matmulInt4BlockImpl(
             while (b < w_scale_stride) : (b += 1) {
                 const scale = fp16ToF32(w_scale_row[b]);
                 const block_d = b * BLOCK;
+                const zp: u8 = if (w_zp_row) |p| extractZp(p, b) else 0;
 
                 // Decode the block's 32 int4 values once; reuse across 4 T rows.
-                const q_chunks: [8]@Vector(4, f32) = int4BlockDecode(w_int4_row, block_d);
+                const q_chunks: [8]@Vector(4, f32) = int4BlockDecode(w_int4_row, block_d, zp);
 
                 // One vector accumulator per T row (×2 for ILP).
                 var v00: @Vector(4, f32) = @splat(0);
@@ -883,13 +910,15 @@ inline fn matmulInt4BlockImpl(
         while (n < Nz) : (n += 1) {
             const w_int4_row = w_ptr + n * w_int4_stride;
             const w_scale_row = scales_base + n * w_scale_stride;
+            const w_zp_row: ?[*]const u8 = if (w_zp_ptr) |p| p + n * w_zp_stride else null;
 
             var acc: f32 = 0.0;
             var b: usize = 0;
             while (b < w_scale_stride) : (b += 1) {
                 const scale = fp16ToF32(w_scale_row[b]);
                 const block_d = b * BLOCK;
-                const q_chunks = int4BlockDecode(w_int4_row, block_d);
+                const zp: u8 = if (w_zp_row) |p| extractZp(p, b) else 0;
+                const q_chunks = int4BlockDecode(w_int4_row, block_d, zp);
 
                 var a0: @Vector(4, f32) = @splat(0);
                 var a1: @Vector(4, f32) = @splat(0);
@@ -912,16 +941,19 @@ inline fn matmulInt4BlockImpl(
     }
 }
 
-/// bf16 x × int4-blockwise W + bias → bf16 out. Existing semantics.
+/// bf16 x × int4-blockwise W + bias → bf16 out. ONNX MatMulNBits
+/// semantics: uint4 weights, (q - zp) * scale dequant.
+/// Pass `w_zp_ptr = 0` for symmetric-decode (treats zp = 0 for all blocks).
 export fn matmul_bf16_x_int4block(
     x_ptr: [*]const u16,
     w_int4_ptr: [*]const u8,
     w_scales_ptr: [*]const u16,
+    w_zp_ptr: ?[*]const u8,
     bias_ptr: [*]const u16,
     out_ptr: [*]u16,
     T: u32, N: u32, D: u32,
 ) void {
-    matmulInt4BlockImpl(u16, u16, x_ptr, w_int4_ptr, w_scales_ptr, bias_ptr, out_ptr, T, N, D);
+    matmulInt4BlockImpl(u16, u16, x_ptr, w_int4_ptr, w_scales_ptr, w_zp_ptr, bias_ptr, out_ptr, T, N, D);
 }
 
 /// bf16 x × int4-blockwise W + bias → f32 out. Used for the MoE gate_up
@@ -930,11 +962,12 @@ export fn matmul_bf16_x_int4block_out_f32(
     x_ptr: [*]const u16,
     w_int4_ptr: [*]const u8,
     w_scales_ptr: [*]const u16,
+    w_zp_ptr: ?[*]const u8,
     bias_ptr: [*]const u16,
     out_ptr: [*]f32,
     T: u32, N: u32, D: u32,
 ) void {
-    matmulInt4BlockImpl(u16, f32, x_ptr, w_int4_ptr, w_scales_ptr, bias_ptr, out_ptr, T, N, D);
+    matmulInt4BlockImpl(u16, f32, x_ptr, w_int4_ptr, w_scales_ptr, w_zp_ptr, bias_ptr, out_ptr, T, N, D);
 }
 
 /// f32 x × int4-blockwise W + bias → f32 out. Used for the MoE down_proj
@@ -943,11 +976,12 @@ export fn matmul_f32_x_int4block_out_f32(
     x_ptr: [*]const f32,
     w_int4_ptr: [*]const u8,
     w_scales_ptr: [*]const u16,
+    w_zp_ptr: ?[*]const u8,
     bias_ptr: [*]const u16,
     out_ptr: [*]f32,
     T: u32, N: u32, D: u32,
 ) void {
-    matmulInt4BlockImpl(f32, f32, x_ptr, w_int4_ptr, w_scales_ptr, bias_ptr, out_ptr, T, N, D);
+    matmulInt4BlockImpl(f32, f32, x_ptr, w_int4_ptr, w_scales_ptr, w_zp_ptr, bias_ptr, out_ptr, T, N, D);
 }
 
 // --------------------------------------------------------------

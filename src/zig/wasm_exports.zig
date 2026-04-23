@@ -936,6 +936,173 @@ export fn softmax_f32(
 }
 
 // --------------------------------------------------------------
+// Kernel: banded GQA attention with sinks
+// --------------------------------------------------------------
+//
+// Implements the upstream `eager_attention_forward` pipeline for a
+// single batch, restricted to a bidirectional sliding window.
+// Expects Q and K already scaled by `head_dim^-0.25` (upstream applies
+// this to Q and K individually before attention — see
+// `OpenAIPrivacyFilterAttention.forward`). Our attention call uses
+// `scaling = 1.0` to avoid a second multiply.
+//
+//   for each (t_q, h_q):
+//     h_kv = h_q / num_kv_groups
+//     ws = max(0, t_q - window)
+//     we = min(T, t_q + window + 1)
+//     scores[i] = dot(Q[t_q, h_q, :], K[ws+i, h_kv, :])   for i in 0..we-ws
+//     combined = cat(scores, [sinks[h_q]])                 # append sink col
+//     m = max(combined)
+//     probs = exp(combined - m) / sum(exp(combined - m))
+//     scores_drop_sink = probs[..., :-1]                    # drop sink column
+//     out[t_q, h_q, :] = sum_i scores_drop_sink[i] * V[ws+i, h_kv, :]
+//
+// Layouts (all [T, H * head_dim] row-major, NOT transposed to [H, T, ...]):
+//   q:     bf16 [T, H_q * head_dim]
+//   k:     bf16 [T, H_kv * head_dim]
+//   v:     bf16 [T, H_kv * head_dim]
+//   sinks: bf16 [H_q]
+//   out:   bf16 [T, H_q * head_dim]
+//
+// Constraint: `H_q % H_kv == 0` (GQA). Window is one-sided — `window=128`
+// means total attended keys ≤ `2*window + 1 = 257`.
+
+const MAX_WINDOW_TOTAL: usize = 512; // must be ≥ 2*window + 1
+const MAX_HEAD_DIM: usize = 256;      // stack acc cap
+
+inline fn dotBf16F32(a: [*]const u16, b: [*]const u16, n: usize) f32 {
+    const LANES: usize = 4;
+    const UNROLL: usize = 4;
+    var a0: @Vector(4, f32) = @splat(0);
+    var a1: @Vector(4, f32) = @splat(0);
+    var a2: @Vector(4, f32) = @splat(0);
+    var a3: @Vector(4, f32) = @splat(0);
+
+    const step: usize = LANES * UNROLL;
+    var i: usize = 0;
+    while (i + step <= n) : (i += step) {
+        const x0: @Vector(4, u16) = a[i ..][0..LANES].*;
+        const x1: @Vector(4, u16) = a[i + 4 ..][0..LANES].*;
+        const x2: @Vector(4, u16) = a[i + 8 ..][0..LANES].*;
+        const x3: @Vector(4, u16) = a[i + 12 ..][0..LANES].*;
+        const y0: @Vector(4, u16) = b[i ..][0..LANES].*;
+        const y1: @Vector(4, u16) = b[i + 4 ..][0..LANES].*;
+        const y2: @Vector(4, u16) = b[i + 8 ..][0..LANES].*;
+        const y3: @Vector(4, u16) = b[i + 12 ..][0..LANES].*;
+        a0 += bf16x4ToF32x4(x0) * bf16x4ToF32x4(y0);
+        a1 += bf16x4ToF32x4(x1) * bf16x4ToF32x4(y1);
+        a2 += bf16x4ToF32x4(x2) * bf16x4ToF32x4(y2);
+        a3 += bf16x4ToF32x4(x3) * bf16x4ToF32x4(y3);
+    }
+    while (i + LANES <= n) : (i += LANES) {
+        const xu: @Vector(4, u16) = a[i ..][0..LANES].*;
+        const yu: @Vector(4, u16) = b[i ..][0..LANES].*;
+        a0 += bf16x4ToF32x4(xu) * bf16x4ToF32x4(yu);
+    }
+    const combined: @Vector(4, f32) = (a0 + a1) + (a2 + a3);
+    var sum: f32 = combined[0] + combined[1] + combined[2] + combined[3];
+    while (i < n) : (i += 1) {
+        sum += bf16ToF32(a[i]) * bf16ToF32(b[i]);
+    }
+    return sum;
+}
+
+inline fn saxpyF32Bf16(p: f32, v_ptr: [*]const u16, acc: [*]f32, n: usize) void {
+    const LANES: usize = 4;
+    const p_vec: @Vector(4, f32) = @splat(p);
+    var i: usize = 0;
+    while (i + LANES <= n) : (i += LANES) {
+        const vv: @Vector(4, u16) = v_ptr[i ..][0..LANES].*;
+        const acc_vec: @Vector(4, f32) = acc[i ..][0..LANES].*;
+        const new_acc = acc_vec + p_vec * bf16x4ToF32x4(vv);
+        acc[i ..][0..LANES].* = new_acc;
+    }
+    while (i < n) : (i += 1) {
+        acc[i] += p * bf16ToF32(v_ptr[i]);
+    }
+}
+
+export fn banded_attention(
+    q_ptr: [*]const u16,
+    k_ptr: [*]const u16,
+    v_ptr: [*]const u16,
+    sinks_ptr: [*]const u16,
+    out_ptr: [*]u16,
+    T: u32,
+    H_q: u32,
+    H_kv: u32,
+    head_dim: u32,
+    window: u32,
+) void {
+    const Tz: usize = T;
+    const Hqz: usize = H_q;
+    const Hkvz: usize = H_kv;
+    const Dz: usize = head_dim;
+    const Wz: usize = window;
+    const kv_group: usize = Hqz / Hkvz;
+
+    const q_stride_t: usize = Hqz * Dz;
+    const k_stride_t: usize = Hkvz * Dz;
+
+    // Per-query scratch: one entry per key in the window, plus the sink.
+    var scores: [MAX_WINDOW_TOTAL + 1]f32 = undefined;
+    var acc: [MAX_HEAD_DIM]f32 = undefined;
+
+    var t_q: usize = 0;
+    while (t_q < Tz) : (t_q += 1) {
+        var h_q: usize = 0;
+        while (h_q < Hqz) : (h_q += 1) {
+            const h_kv = h_q / kv_group;
+            const q_base: usize = t_q * q_stride_t + h_q * Dz;
+            const out_base: usize = t_q * q_stride_t + h_q * Dz;
+
+            const ws: usize = if (t_q > Wz) t_q - Wz else 0;
+            const we: usize = if (t_q + Wz + 1 < Tz) t_q + Wz + 1 else Tz;
+            const n_keys: usize = we - ws;
+
+            const sink_logit: f32 = bf16ToF32(sinks_ptr[h_q]);
+            var row_max: f32 = sink_logit;
+
+            var t_k: usize = 0;
+            while (t_k < n_keys) : (t_k += 1) {
+                const k_base = (ws + t_k) * k_stride_t + h_kv * Dz;
+                const s = dotBf16F32(q_ptr + q_base, k_ptr + k_base, Dz);
+                scores[t_k] = s;
+                if (s > row_max) row_max = s;
+            }
+            scores[n_keys] = sink_logit;
+
+            // exp(s - max) and running sum (including sink).
+            var sum: f32 = 0.0;
+            var i: usize = 0;
+            while (i <= n_keys) : (i += 1) {
+                const e = @exp(scores[i] - row_max);
+                scores[i] = e;
+                sum += e;
+            }
+            const inv_sum: f32 = if (sum > 0.0) 1.0 / sum else 0.0;
+
+            // Zero accumulator for this query head.
+            var d: usize = 0;
+            while (d < Dz) : (d += 1) acc[d] = 0.0;
+
+            // Weighted sum of V over window keys (sink does not contribute).
+            t_k = 0;
+            while (t_k < n_keys) : (t_k += 1) {
+                const p: f32 = scores[t_k] * inv_sum;
+                const v_base = (ws + t_k) * k_stride_t + h_kv * Dz;
+                saxpyF32Bf16(p, v_ptr + v_base, &acc, Dz);
+            }
+
+            d = 0;
+            while (d < Dz) : (d += 1) {
+                out_ptr[out_base + d] = f32ToBf16(acc[d]);
+            }
+        }
+    }
+}
+
+// --------------------------------------------------------------
 // Kernel: RoPE apply (interleaved layout)
 // --------------------------------------------------------------
 //

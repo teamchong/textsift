@@ -173,6 +173,61 @@ def main() -> int:
     write(FIXTURES_DIR / "swiglu_x.f32", gate_up.numpy().tobytes())
     write(FIXTURES_DIR / "swiglu_y.f32", swiglu_ref.contiguous().numpy().tobytes())
 
+    # ----- Banded attention fixture -----
+    # Reference via upstream `eager_attention_forward` on sliding-window mask.
+    # Shapes picked so boundary queries (near t=0 and t=T-1) have truncated
+    # windows and mid-sequence queries have full windows — exercises all paths.
+    from transformers.masking_utils import create_bidirectional_sliding_window_mask
+
+    torch.manual_seed(SEED + 9)
+    att_T = 32
+    att_Hq = model.config.num_attention_heads  # 14
+    att_Hkv = model.config.num_key_value_heads # 2
+    att_hd = model.config.head_dim             # 64
+    att_win = 4
+    att_sliding = att_win + 1  # upstream quirk: sliding_window = config + 1
+
+    # Q/K already scaled by head_dim ** -0.25 per upstream convention.
+    scale = att_hd ** -0.25
+    Q_in = torch.randn(att_T, att_Hq, att_hd, dtype=torch.bfloat16)
+    K_in = torch.randn(att_T, att_Hkv, att_hd, dtype=torch.bfloat16)
+    V_in = torch.randn(att_T, att_Hkv, att_hd, dtype=torch.bfloat16)
+    sinks = torch.randn(att_Hq, dtype=torch.bfloat16) * 0.5
+    Q_scaled = (Q_in.float() * scale).to(torch.bfloat16)
+    K_scaled = (K_in.float() * scale).to(torch.bfloat16)
+
+    # Reference: manually replicate eager_attention_forward semantics.
+    # Inputs reshaped to (1, H, T, head_dim).
+    Q_b = Q_scaled.unsqueeze(0).transpose(1, 2).contiguous().float()   # (1, Hq, T, hd)
+    K_b = K_scaled.unsqueeze(0).transpose(1, 2).contiguous().float()   # (1, Hkv, T, hd)
+    V_b = V_in.unsqueeze(0).transpose(1, 2).contiguous().float()       # (1, Hkv, T, hd)
+    n_kv_groups = att_Hq // att_Hkv
+    K_rep = K_b.repeat_interleave(n_kv_groups, dim=1)                  # (1, Hq, T, hd)
+    V_rep = V_b.repeat_interleave(n_kv_groups, dim=1)
+    attn_weights = torch.matmul(Q_b, K_rep.transpose(-2, -1))           # (1, Hq, T, T), scaling already applied
+    # Sliding window mask (additive, 0 inside window, -inf outside).
+    dtype_big = torch.finfo(torch.float32).min
+    mask = torch.zeros(att_T, att_T)
+    for i in range(att_T):
+        for j in range(att_T):
+            if abs(i - j) > att_win:
+                mask[i, j] = dtype_big
+    attn_weights = attn_weights + mask
+    sinks_col = sinks.float().view(1, -1, 1, 1).expand(1, att_Hq, att_T, 1)
+    combined = torch.cat([attn_weights, sinks_col], dim=-1)
+    combined = combined - combined.max(dim=-1, keepdim=True).values
+    probs = torch.nn.functional.softmax(combined, dim=-1, dtype=torch.float32)
+    scores_ref = probs[..., :-1]                                        # drop sink
+    out_ref = torch.matmul(scores_ref, V_rep)                           # (1, Hq, T, hd)
+    out_ref = out_ref.squeeze(0).transpose(0, 1).contiguous().to(torch.bfloat16)  # (T, Hq, hd)
+
+    # Reshape Q/K/V to [T, H*hd] layout expected by the kernel.
+    write(FIXTURES_DIR / "attn_q.bf16", bf16_bytes(Q_scaled.view(att_T, att_Hq * att_hd)))
+    write(FIXTURES_DIR / "attn_k.bf16", bf16_bytes(K_scaled.view(att_T, att_Hkv * att_hd)))
+    write(FIXTURES_DIR / "attn_v.bf16", bf16_bytes(V_in.view(att_T, att_Hkv * att_hd)))
+    write(FIXTURES_DIR / "attn_sinks.bf16", bf16_bytes(sinks))
+    write(FIXTURES_DIR / "attn_out.bf16", bf16_bytes(out_ref.view(att_T, att_Hq * att_hd)))
+
     # ----- Softmax fixture (attention-shape) -----
     #
     # Shape picked to exercise both the "long" row (attention scores +

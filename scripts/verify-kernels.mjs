@@ -188,6 +188,27 @@ async function runEmbed(ex, weights, spec) {
   return compareU16(ex, outPtr, expected);
 }
 
+async function runBandedAttention(ex, _weights, spec) {
+  const q = await loadFixture(spec.q);
+  const k = await loadFixture(spec.k);
+  const v = await loadFixture(spec.v);
+  const sinks = await loadFixture(spec.sinks);
+  const expected = await loadFixture(spec.expected);
+  const qPtr = allocAndCopy(ex, q);
+  const kPtr = allocAndCopy(ex, k);
+  const vPtr = allocAndCopy(ex, v);
+  const sinksPtr = allocAndCopy(ex, sinks);
+  const outPtr = ex.alloc(expected.byteLength);
+  ex.banded_attention(qPtr, kPtr, vPtr, sinksPtr, outPtr,
+    spec.T, spec.H_q, spec.H_kv, spec.head_dim, spec.window);
+  return {
+    tolerance: { relTol: spec.rel_tol, absTol: spec.abs_tol ?? 0 },
+    ...compareBf16Tolerance(ex, outPtr, expected, {
+      relTol: spec.rel_tol, absTol: spec.abs_tol ?? 0,
+    }),
+  };
+}
+
 async function runMatmulOutF32(ex, weights, spec) {
   const x = await loadFixture(spec.x);
   const w = weights.get(spec.weight_tensor);
@@ -388,6 +409,7 @@ const RUNNERS = {
   swiglu_clamp_f32: runSwigluF32,
   matmul_bf16_out_f32: runMatmulOutF32,
   topk_partial_f32: runTopk,
+  banded_attention: runBandedAttention,
 };
 
 async function main() {

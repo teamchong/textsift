@@ -188,6 +188,83 @@ async function runEmbed(ex, weights, spec) {
   return compareU16(ex, outPtr, expected);
 }
 
+async function runMatmulOutF32(ex, weights, spec) {
+  const x = await loadFixture(spec.x);
+  const w = weights.get(spec.weight_tensor);
+  const b = weights.get(spec.bias_tensor);
+  if (!w || !b) throw new Error(`missing tensor ${spec.weight_tensor}/${spec.bias_tensor}`);
+  const expected = await loadFixture(spec.expected);
+  const xPtr = allocAndCopy(ex, x);
+  const outPtr = ex.alloc(expected.byteLength);
+  ex.matmul_bf16_out_f32(xPtr, w.ptr, b.ptr, outPtr, spec.T, spec.N, spec.D);
+  const got = new Float32Array(ex.memory.buffer, outPtr, expected.byteLength >>> 2);
+  const want = new Float32Array(
+    expected.buffer, expected.byteOffset, expected.byteLength >>> 2,
+  );
+  let maxAbs = 0, maxRel = 0, sumSq = 0, fails = 0, firstFail = -1;
+  for (let i = 0; i < want.length; i++) {
+    const abs = Math.abs(got[i] - want[i]);
+    const rel = Math.abs(want[i]) > 0 ? abs / Math.abs(want[i]) : abs;
+    if (abs > maxAbs) maxAbs = abs;
+    if (rel > maxRel) maxRel = rel;
+    sumSq += abs * abs;
+    const tol = Math.max(spec.abs_tol ?? 0, spec.rel_tol * Math.abs(want[i]));
+    if (abs > tol) {
+      fails++;
+      if (firstFail === -1) firstFail = i;
+    }
+  }
+  return {
+    tolerance: { relTol: spec.rel_tol, absTol: spec.abs_tol ?? 0 },
+    total: want.length, fails, firstFail, maxAbs, maxRel,
+    rms: Math.sqrt(sumSq / want.length),
+    got: new Uint16Array(0), want: new Uint16Array(0),
+  };
+}
+
+async function runTopk(ex, _weights, spec) {
+  const x = await loadFixture(spec.x);
+  const expectedIdx = await loadFixture(spec.expected_idx);
+  const expectedVal = await loadFixture(spec.expected_val);
+  const xPtr = allocAndCopy(ex, x);
+  const idxBytes = spec.rows * spec.k * 4;
+  const valBytes = spec.rows * spec.k * 4;
+  const idxPtr = ex.alloc(idxBytes);
+  const valPtr = ex.alloc(valBytes);
+  ex.topk_partial_f32(xPtr, idxPtr, valPtr, spec.rows, spec.cols, spec.k);
+  const gotIdx = new Int32Array(ex.memory.buffer, idxPtr, idxBytes >>> 2);
+  const wantIdx = new Int32Array(
+    expectedIdx.buffer, expectedIdx.byteOffset, expectedIdx.byteLength >>> 2,
+  );
+  const gotVal = new Float32Array(ex.memory.buffer, valPtr, valBytes >>> 2);
+  const wantVal = new Float32Array(
+    expectedVal.buffer, expectedVal.byteOffset, expectedVal.byteLength >>> 2,
+  );
+  let idxFails = 0, valFails = 0, firstFail = -1;
+  let maxAbs = 0;
+  for (let i = 0; i < wantIdx.length; i++) {
+    if (gotIdx[i] !== wantIdx[i]) {
+      idxFails++;
+      if (firstFail === -1) firstFail = i;
+    }
+    const abs = Math.abs(gotVal[i] - wantVal[i]);
+    if (abs > maxAbs) maxAbs = abs;
+    if (abs > (spec.val_abs_tol ?? 0)) valFails++;
+  }
+  // Synthesize a tolerance-shaped result for the shared printer.
+  return {
+    tolerance: { relTol: spec.val_abs_tol ?? 0, absTol: spec.val_abs_tol ?? 0 },
+    total: wantIdx.length,
+    fails: idxFails + valFails,
+    firstFail,
+    maxAbs,
+    maxRel: 0,
+    rms: 0,
+    got: new Uint16Array(0),
+    want: new Uint16Array(0),
+  };
+}
+
 async function runSwigluF32(ex, _weights, spec) {
   const x = await loadFixture(spec.x);
   const expected = await loadFixture(spec.expected);
@@ -309,6 +386,8 @@ const RUNNERS = {
   rope_apply: runRopeApply,
   softmax_f32: runSoftmaxF32,
   swiglu_clamp_f32: runSwigluF32,
+  matmul_bf16_out_f32: runMatmulOutF32,
+  topk_partial_f32: runTopk,
 };
 
 async function main() {

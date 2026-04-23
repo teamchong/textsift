@@ -39,7 +39,9 @@ interface PiiWasmExports {
   weights_name(idx: number, out: number): number;
   rms_norm(x: number, gamma: number, out: number, T: number, D: number, eps: number): void;
   matmul_bf16(x: number, w: number, bias: number, out: number, T: number, N: number, D: number): void;
+  matmul_bf16_out_f32(x: number, w: number, bias: number, out: number, T: number, N: number, D: number): void;
   matmul_bf16_x_int4block(x: number, w: number, bias: number, out: number, T: number, N: number, D: number): void;
+  topk_partial_f32(x: number, out_idx: number, out_val: number, rows: number, cols: number, k: number): void;
   rope_apply(qk: number, cos: number, sin: number, T: number, H: number, head_dim: number): void;
   softmax_f32(x: number, out: number, rows: number, cols: number): void;
   swiglu_clamp_f32(gate_up: number, out: number, T: number, D: number): void;
@@ -108,7 +110,9 @@ export async function loadPiiWasm(url: string | URL): Promise<PiiWasmExports> {
     "weights_name",
     "rms_norm",
     "matmul_bf16",
+    "matmul_bf16_out_f32",
     "matmul_bf16_x_int4block",
+    "topk_partial_f32",
     "rope_apply",
     "softmax_f32",
     "swiglu_clamp_f32",

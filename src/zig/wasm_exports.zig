@@ -454,6 +454,145 @@ export fn matmul_bf16(
     }
 }
 
+/// F32-output variant of `matmul_bf16`. Same arithmetic; stores the
+/// accumulator + bias as f32 instead of rounding to bf16. Used when
+/// the consumer runs in fp32 (router, expert chain).
+export fn matmul_bf16_out_f32(
+    x_ptr: [*]const u16,
+    w_ptr: [*]const u16,
+    bias_ptr: [*]const u16,
+    out_ptr: [*]f32,
+    T: u32,
+    N: u32,
+    D: u32,
+) void {
+    const Tz: usize = T;
+    const Nz: usize = N;
+    const Dz: usize = D;
+    const LANES: usize = 4;
+    const UNROLL: usize = 4;
+
+    var t: usize = 0;
+    while (t < Tz) : (t += 1) {
+        const x_base = t * Dz;
+        const out_base = t * Nz;
+
+        var n: usize = 0;
+        while (n < Nz) : (n += 1) {
+            const w_base = n * Dz;
+
+            var a0: @Vector(4, f32) = @splat(0);
+            var a1: @Vector(4, f32) = @splat(0);
+            var a2: @Vector(4, f32) = @splat(0);
+            var a3: @Vector(4, f32) = @splat(0);
+
+            const step: usize = LANES * UNROLL;
+            var d: usize = 0;
+            while (d + step <= Dz) : (d += step) {
+                const x0: @Vector(4, u16) = x_ptr[x_base + d ..][0..LANES].*;
+                const x1: @Vector(4, u16) = x_ptr[x_base + d + 4 ..][0..LANES].*;
+                const x2: @Vector(4, u16) = x_ptr[x_base + d + 8 ..][0..LANES].*;
+                const x3: @Vector(4, u16) = x_ptr[x_base + d + 12 ..][0..LANES].*;
+                const w0: @Vector(4, u16) = w_ptr[w_base + d ..][0..LANES].*;
+                const w1: @Vector(4, u16) = w_ptr[w_base + d + 4 ..][0..LANES].*;
+                const w2: @Vector(4, u16) = w_ptr[w_base + d + 8 ..][0..LANES].*;
+                const w3: @Vector(4, u16) = w_ptr[w_base + d + 12 ..][0..LANES].*;
+                a0 += bf16x4ToF32x4(x0) * bf16x4ToF32x4(w0);
+                a1 += bf16x4ToF32x4(x1) * bf16x4ToF32x4(w1);
+                a2 += bf16x4ToF32x4(x2) * bf16x4ToF32x4(w2);
+                a3 += bf16x4ToF32x4(x3) * bf16x4ToF32x4(w3);
+            }
+            while (d + LANES <= Dz) : (d += LANES) {
+                const xu: @Vector(4, u16) = x_ptr[x_base + d ..][0..LANES].*;
+                const wu: @Vector(4, u16) = w_ptr[w_base + d ..][0..LANES].*;
+                a0 += bf16x4ToF32x4(xu) * bf16x4ToF32x4(wu);
+            }
+            const combined: @Vector(4, f32) = (a0 + a1) + (a2 + a3);
+            var acc: f32 = combined[0] + combined[1] + combined[2] + combined[3];
+            while (d < Dz) : (d += 1) {
+                acc += bf16ToF32(x_ptr[x_base + d]) * bf16ToF32(w_ptr[w_base + d]);
+            }
+
+            out_ptr[out_base + n] = acc + bf16ToF32(bias_ptr[n]);
+        }
+    }
+}
+
+// --------------------------------------------------------------
+// Kernel: row-wise top-k (partial selection)
+// --------------------------------------------------------------
+//
+// For each row of `x: [rows, cols]`, produce the indices and values of
+// the `k` largest entries, written into `out_idx` and `out_val`.
+// Ordering within the k outputs is "largest first" — convenient for
+// softmax-then-divide in the router where order doesn't matter but
+// determinism does.
+//
+// Uses a fixed-size incremental insertion sort of k elements. For
+// k=4 and n=128 (router), this is O(n*k) = 512 compares per row,
+// which is faster than a heap for small k.
+
+export fn topk_partial_f32(
+    x_ptr: [*]const f32,
+    out_idx: [*]i32,
+    out_val: [*]f32,
+    rows: u32,
+    cols: u32,
+    k: u32,
+) void {
+    const Rz: usize = rows;
+    const Cz: usize = cols;
+    const Kz: usize = k;
+
+    var r: usize = 0;
+    while (r < Rz) : (r += 1) {
+        const row_base = r * Cz;
+        const out_base = r * Kz;
+
+        // Seed with the first k entries in input order, then sort
+        // descending.
+        var i: usize = 0;
+        while (i < Kz) : (i += 1) {
+            out_idx[out_base + i] = @intCast(i);
+            out_val[out_base + i] = x_ptr[row_base + i];
+        }
+        // Descending insertion sort on the seed k elements.
+        var s: usize = 1;
+        while (s < Kz) : (s += 1) {
+            var j: usize = s;
+            while (j > 0 and out_val[out_base + j] > out_val[out_base + j - 1]) : (j -= 1) {
+                const tv = out_val[out_base + j];
+                out_val[out_base + j] = out_val[out_base + j - 1];
+                out_val[out_base + j - 1] = tv;
+                const ti = out_idx[out_base + j];
+                out_idx[out_base + j] = out_idx[out_base + j - 1];
+                out_idx[out_base + j - 1] = ti;
+            }
+        }
+
+        // Scan the rest. If new value beats the smallest (last) slot,
+        // insert and bubble up.
+        var c: usize = Kz;
+        while (c < Cz) : (c += 1) {
+            const v = x_ptr[row_base + c];
+            if (v > out_val[out_base + Kz - 1]) {
+                // Replace last, bubble up.
+                out_val[out_base + Kz - 1] = v;
+                out_idx[out_base + Kz - 1] = @intCast(c);
+                var j: usize = Kz - 1;
+                while (j > 0 and out_val[out_base + j] > out_val[out_base + j - 1]) : (j -= 1) {
+                    const tv = out_val[out_base + j];
+                    out_val[out_base + j] = out_val[out_base + j - 1];
+                    out_val[out_base + j - 1] = tv;
+                    const ti = out_idx[out_base + j];
+                    out_idx[out_base + j] = out_idx[out_base + j - 1];
+                    out_idx[out_base + j - 1] = ti;
+                }
+            }
+        }
+    }
+}
+
 // --------------------------------------------------------------
 // Kernel: bf16 × int4-blockwise matmul with bias
 // --------------------------------------------------------------

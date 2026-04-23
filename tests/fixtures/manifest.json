@@ -51,6 +51,29 @@
       "note": "bf16 output of an fp32 matmul over dequantized int4 (block 32, sym, fp16 scale). Expected bounded by bf16 ULP (~4e-3 rel for unit-ish values) plus int4 quant error; 1e-3 rel is tight for this combo."
     },
     {
+      "name": "matmul_bf16_out_f32",
+      "x": "matmul_out_f32_x.bf16",
+      "weight_tensor": "score.weight",
+      "bias_tensor": "score.bias",
+      "expected": "matmul_out_f32_y.f32",
+      "T": 8,
+      "N": 33,
+      "D": 640,
+      "rel_tol": 1e-3,
+      "abs_tol": 1e-5,
+      "note": "F.linear with fp32 accumulation; rel_tol matches ~1/256 (bf16 input precision at typical magnitudes)."
+    },
+    {
+      "name": "topk_partial_f32",
+      "x": "topk_x.f32",
+      "expected_idx": "topk_idx.i32",
+      "expected_val": "topk_val.f32",
+      "rows": 32,
+      "cols": 128,
+      "k": 4,
+      "val_abs_tol": 0
+    },
+    {
       "name": "swiglu_clamp_f32",
       "x": "swiglu_x.f32",
       "expected": "swiglu_y.f32",

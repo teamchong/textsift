@@ -134,6 +134,30 @@ def main() -> int:
     write(FIXTURES_DIR / "embed_ids.i32", ids.numpy().tobytes())
     write(FIXTURES_DIR / "embed_out.bf16", bf16_bytes(y_embed))
 
+    # ----- matmul_bf16_out_f32 fixture (router projection path) -----
+    # Same x / W / bias as the bf16 test, different expected dtype.
+    # Upstream router runs in fp32: this kernel skips the bf16 round.
+    x_router = x_mm.clone()
+    w_router = w_bf.clone()
+    b_router = b_bf.clone()
+    y_router = F.linear(x_router.to(torch.float32), w_router.to(torch.float32), b_router.to(torch.float32))
+    write(FIXTURES_DIR / "matmul_out_f32_x.bf16", bf16_bytes(x_router))
+    write(FIXTURES_DIR / "matmul_out_f32_y.f32", y_router.contiguous().numpy().tobytes())
+
+    # ----- topk_partial_f32 fixture (router top-4) -----
+    # 128 scores per row, top-4 extraction. Spread the values so ties
+    # are unlikely and we actually exercise the selection logic.
+    torch.manual_seed(SEED + 8)
+    topk_rows = 32
+    topk_cols = 128
+    topk_x = torch.randn(topk_rows, topk_cols, dtype=torch.float32) * 2.0
+    topk_vals, topk_idx = torch.topk(topk_x, k=4, dim=-1)
+    # Confirm descending — our kernel emits "largest first" too.
+    assert (topk_vals[..., 0] >= topk_vals[..., -1]).all()
+    write(FIXTURES_DIR / "topk_x.f32", topk_x.contiguous().numpy().tobytes())
+    write(FIXTURES_DIR / "topk_idx.i32", topk_idx.to(torch.int32).contiguous().numpy().tobytes())
+    write(FIXTURES_DIR / "topk_val.f32", topk_vals.contiguous().numpy().tobytes())
+
     # ----- SwiGLU-with-clamp fixture -----
     # Matches OpenAIPrivacyFilterExperts._apply_gate. Inputs spread in a
     # range that exercises both clamp branches (some values > 7 and < -7).

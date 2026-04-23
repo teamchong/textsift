@@ -92,6 +92,35 @@ async function main() {
     ex.reset();
   }
 
+  console.log(`\nmatmul_bf16_x_int4block — SIMD (${ITERS} iters, ${WARMUP} warmup)`);
+  console.log(`${"shape".padEnd(34)} ${"ns/call".padStart(12)} ${"GFLOPS".padStart(9)}`);
+  for (const s of shapes) {
+    const xBytes = s.T * s.D * 2;
+    const wBytes = s.N * (s.D / 2) + s.N * (s.D / 32) * 2;
+    const bBytes = s.N * 2;
+    const oBytes = s.T * s.N * 2;
+    const xPtr = ex.alloc(xBytes);
+    const wPtr = ex.alloc(wBytes);
+    const bPtr = ex.alloc(bBytes);
+    const oPtr = ex.alloc(oBytes);
+    new Uint16Array(ex.memory.buffer, xPtr, xBytes >>> 1).fill(0x3F80);
+    new Uint8Array(ex.memory.buffer, wPtr, s.N * (s.D / 2)).fill(0x21); // int4 values 1, 2 alternating
+    new Uint16Array(ex.memory.buffer, wPtr + s.N * (s.D / 2), s.N * (s.D / 32)).fill(0x3C00); // fp16 1.0
+    new Uint16Array(ex.memory.buffer, bPtr, bBytes >>> 1).fill(0);
+
+    for (let i = 0; i < WARMUP; i++) ex.matmul_bf16_x_int4block(xPtr, wPtr, bPtr, oPtr, s.T, s.N, s.D);
+    const samples = [];
+    for (let i = 0; i < ITERS; i++) {
+      samples.push(time(() => ex.matmul_bf16_x_int4block(xPtr, wPtr, bPtr, oPtr, s.T, s.N, s.D)));
+    }
+    const med = median(samples);
+    const flops = 2 * s.T * s.N * s.D;
+    const gflops = flops / med;
+    const label = `T=${s.T} N=${s.N} D=${s.D} (${s.name.trim()})`;
+    console.log(`${label.padEnd(34)} ${fmtNs(med).padStart(12)} ${gflops.toFixed(2).padStart(9)}`);
+    ex.reset();
+  }
+
   console.log(`\nrms_norm`);
   console.log(`${"shape".padEnd(34)} ${"ns/call".padStart(12)}`);
   for (const { T, D, name } of [

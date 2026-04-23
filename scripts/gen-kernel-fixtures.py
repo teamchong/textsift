@@ -34,6 +34,7 @@ D = 640
 N_CLASSES = 33  # matches score.weight / score.bias
 V_TEST = 1024   # truncated embed table — full vocab is 200 064, too big for tests
 INT4_BLOCK = 32
+EXPERTS_KEEP = 4  # MoE weights truncated to first N experts for test fixtures
 
 
 # Share the quantizer with convert_weights.py so blob + fixture byte
@@ -126,12 +127,25 @@ def main() -> int:
         "model.layers.0.self_attn.sinks",
         "model.layers.0.post_attention_layernorm.weight",
     ]
+    moe_tensors = [
+        "model.layers.0.mlp.router.weight",
+        "model.layers.0.mlp.router.bias",
+        "model.layers.0.mlp.experts.gate_up_proj",
+        "model.layers.0.mlp.experts.gate_up_proj_bias",
+        "model.layers.0.mlp.experts.down_proj",
+        "model.layers.0.mlp.experts.down_proj_bias",
+    ]
     cmd = [
         sys.executable, str(convert),
         "--output", str(output_blob),
         "--embed-rows", str(V_TEST),
+        "--expert-keep", str(EXPERTS_KEEP),
+        # Expert weights: transpose last two dims before quantizing so the
+        # stored shape matches our x @ W.T matmul convention.
+        "--quant-transpose", "mlp.experts.gate_up_proj",
+        "--quant-transpose", "mlp.experts.down_proj",
     ]
-    for name in attn_tensors:
+    for name in attn_tensors + moe_tensors:
         cmd += ["--include", name]
     subprocess.check_call(cmd)
 
@@ -269,6 +283,94 @@ def main() -> int:
     y_sm_top = F.softmax(x_sm_top, dim=-1)
     write(FIXTURES_DIR / "softmax_topk_x.f32", x_sm_top.numpy().tobytes())
     write(FIXTURES_DIR / "softmax_topk_y.f32", y_sm_top.numpy().tobytes())
+
+    # ----- Expert dispatch fixture (MoE, layer 0, first 4 experts) -----
+    #
+    # Synthetic routing: every token routes to experts [0,1,2,3] with
+    # uniform scores 1/K=0.25. Exercises every in-blob expert on every
+    # token and keeps the score math predictable for debugging. The
+    # reference computes expert forward from our BLOB's dequantized
+    # weights (not the model's original fp32), so the kernel test is
+    # bounded by kernel rounding, not quant error.
+    torch.manual_seed(SEED + 11)
+    exp_T = 16
+    exp_D = model.config.hidden_size        # 640
+    exp_dff = model.config.intermediate_size  # 640
+    K = model.config.num_experts_per_tok     # 4
+
+    hidden_exp = torch.randn(exp_T, exp_D, dtype=torch.bfloat16)
+
+    routing_idx = torch.zeros(exp_T, K, dtype=torch.int32)
+    for t in range(exp_T):
+        for k in range(K):
+            routing_idx[t, k] = k % EXPERTS_KEEP  # cycle 0..3
+
+    routing_scores = torch.full((exp_T, K), 1.0 / K, dtype=torch.float32)
+
+    # Quantize + dequantize the first-4 experts ourselves so the reference
+    # uses exactly the weights that end up in the blob.
+    gu_full = sd["model.layers.0.mlp.experts.gate_up_proj"][:EXPERTS_KEEP]  # [4, D, 2*dff]
+    gu_bias_full = sd["model.layers.0.mlp.experts.gate_up_proj_bias"][:EXPERTS_KEEP]  # [4, 2*dff]
+    d_full = sd["model.layers.0.mlp.experts.down_proj"][:EXPERTS_KEEP]      # [4, dff, D]
+    d_bias_full = sd["model.layers.0.mlp.experts.down_proj_bias"][:EXPERTS_KEEP]  # [4, D]
+
+    # Quantize with transpose_last so stored shape is [E, 2*dff, D] / [E, D, dff].
+    gu_packed, gu_shape = cw.quantize_int4_block32_sym(gu_full, transpose_last=True)
+    d_packed, d_shape = cw.quantize_int4_block32_sym(d_full, transpose_last=True)
+    assert gu_shape == (EXPERTS_KEEP, 2 * exp_dff, exp_D), gu_shape
+    assert d_shape == (EXPERTS_KEEP, exp_D, exp_dff), d_shape
+
+    # Dequantize each expert slice back to fp32.
+    def dequant_expert_3d(packed: bytes, E: int, N: int, D: int) -> torch.Tensor:
+        out = torch.zeros(E, N, D, dtype=torch.float32)
+        int4_per_slice = N * D // 2
+        scale_per_slice_bytes = N * D // 32 * 2
+        total_int4 = E * int4_per_slice
+        for e in range(E):
+            s_int4 = e * int4_per_slice
+            s_scale = total_int4 + e * scale_per_slice_bytes
+            slice_bytes = packed[s_int4 : s_int4 + int4_per_slice] + \
+                          packed[s_scale : s_scale + scale_per_slice_bytes]
+            out[e] = dequantize_int4block(slice_bytes, N, D)
+        return out
+
+    gu_dequant = dequant_expert_3d(gu_packed, EXPERTS_KEEP, 2 * exp_dff, exp_D)   # [E, 2*dff, D]
+    d_dequant = dequant_expert_3d(d_packed, EXPERTS_KEEP, exp_D, exp_dff)          # [E, D, dff]
+
+    # Reference expert forward. All f32 intermediates, matching upstream.
+    hidden_fp32 = hidden_exp.to(torch.float32)
+    gu_bias_fp32 = gu_bias_full.to(torch.float32)
+    d_bias_fp32 = d_bias_full.to(torch.float32)
+    acc_ref = torch.zeros(exp_T, exp_D, dtype=torch.float32)
+    for e in range(EXPERTS_KEEP):
+        tok_idx = []
+        scores_e = []
+        for t in range(exp_T):
+            for k in range(K):
+                if routing_idx[t, k].item() == e:
+                    tok_idx.append(t)
+                    scores_e.append(routing_scores[t, k].item())
+        if not tok_idx:
+            continue
+        x_e = hidden_fp32[tok_idx]                              # [m, D]
+        # stored gu_dequant[e]: [2*dff, D], compute x @ W.T + b.
+        gate_up = x_e @ gu_dequant[e].T + gu_bias_fp32[e]        # [m, 2*dff]
+        gate, up = gate_up.chunk(2, dim=-1)
+        gate = gate.clamp(max=7.0)
+        up = up.clamp(min=-7.0, max=7.0)
+        glu = gate * torch.sigmoid(gate * 1.702)
+        gated = (up + 1.0) * glu                                 # [m, dff]
+        # stored d_dequant[e]: [D, dff], compute gated @ W.T + b.
+        out = gated @ d_dequant[e].T + d_bias_fp32[e]            # [m, D]
+        for i, t in enumerate(tok_idx):
+            acc_ref[t] += scores_e[i] * out[i]
+    acc_ref *= K
+    exp_out = acc_ref.to(torch.bfloat16)
+
+    write(FIXTURES_DIR / "moe_hidden.bf16", bf16_bytes(hidden_exp))
+    write(FIXTURES_DIR / "moe_routing_idx.i32", routing_idx.numpy().tobytes())
+    write(FIXTURES_DIR / "moe_routing_scores.f32", routing_scores.numpy().tobytes())
+    write(FIXTURES_DIR / "moe_out.bf16", bf16_bytes(exp_out))
 
     # ----- Attention forward fixture (layer 0) -----
     # Uses the real attention submodule with layer-0 weights so the

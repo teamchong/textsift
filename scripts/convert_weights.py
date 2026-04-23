@@ -92,6 +92,10 @@ def parse_args() -> argparse.Namespace:
                    help="If >0 and embed_tokens.weight is in the selection, truncate it to the first N rows. Lets tests exercise the embedding kernel without shipping 128 MB.")
     p.add_argument("--quant", action="append", default=None, metavar="PATTERN",
                    help="Quantize tensors whose name contains PATTERN to int4-blockwise-32. Repeatable. Example: --quant mlp.experts.gate_up_proj --quant mlp.experts.down_proj")
+    p.add_argument("--quant-transpose", action="append", default=None, metavar="PATTERN",
+                   help="Like --quant but also transposes the last two dims before quantization. Needed for MoE expert weights stored as [E, D_in, D_out] upstream.")
+    p.add_argument("--expert-keep", type=int, default=0, metavar="N",
+                   help="For 3D tensors matching `mlp.experts.`, keep only the first N experts along dim 0.")
     p.add_argument("--list", action="store_true",
                    help="Enumerate available tensor names and exit.")
     p.add_argument("--hash", type=Path, default=None,
@@ -141,15 +145,26 @@ def tensor_bytes(tensor: object) -> bytes:
     return t.numpy().tobytes()
 
 
-def quantize_int4_block32_sym(tensor: object) -> tuple[bytes, tuple[int, ...]]:
+def quantize_int4_block32_sym(
+    tensor: object, transpose_last: bool = False,
+) -> tuple[bytes, tuple[int, ...]]:
     """
     Signed symmetric int4, block size 32 along the last dim, per-block fp16 scale.
     Data layout: [..., N, D/2] packed int4 (low nibble = even d index, high nibble =
     odd d index), concatenated with [..., N, D/32] fp16 scales.
-    Returns (packed_bytes, shape). Shape is the LOGICAL shape (unchanged).
+    Returns (packed_bytes, logical_shape).
+
+    If `transpose_last=True`, the last two dims are swapped before quantization
+    so the stored layout is [..., N=D_out, D=D_in]. Upstream's MoE expert
+    weights use [E, D_in, D_out] (x @ W pattern); our matmul kernel does
+    x @ W.T so we pre-transpose at conversion time.
     """
     import torch
     t = tensor.detach().contiguous().cpu().to(torch.float32)
+    if transpose_last:
+        if t.dim() < 2:
+            raise ValueError(f"transpose_last requires >=2 dims; got {tuple(t.shape)}")
+        t = t.transpose(-1, -2).contiguous()
     shape = tuple(t.shape)
     if len(shape) < 2:
         raise ValueError(f"int4-block32 needs >=2 dims; got {shape}")
@@ -184,9 +199,18 @@ def quantize_int4_block32_sym(tensor: object) -> tuple[bytes, tuple[int, ...]]:
 
 
 def should_quantize(name: str, patterns: Sequence[str] | None) -> bool:
+    # Match on suffix so "mlp.experts.gate_up_proj" doesn't accidentally
+    # pick up "mlp.experts.gate_up_proj_bias" (a 2-D tensor that can't be
+    # int4-blockwise-quantized along 32-wide blocks).
     if not patterns:
         return False
-    return any(p in name for p in patterns)
+    return any(name.endswith(p) for p in patterns)
+
+
+def should_transpose_quant(name: str, patterns: Sequence[str] | None) -> bool:
+    if not patterns:
+        return False
+    return any(name.endswith(p) for p in patterns)
 
 
 def truncate_embedding(tensor: object, rows: int) -> object:
@@ -205,6 +229,7 @@ def write_blob(
     names: Sequence[str],
     output: Path,
     quant_patterns: Sequence[str] | None = None,
+    quant_transpose_patterns: Sequence[str] | None = None,
 ) -> tuple[int, str]:
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -217,8 +242,11 @@ def write_blob(
     cursor = data_offset
     for name in names:
         tensor = state_dict[name]
-        if should_quantize(name, quant_patterns):
-            payload, shape = quantize_int4_block32_sym(tensor)
+        if should_transpose_quant(name, quant_transpose_patterns):
+            payload, shape = quantize_int4_block32_sym(tensor, transpose_last=True)
+            dtype_code = DTYPE_CODES["int4_block32_sym"]
+        elif should_quantize(name, quant_patterns):
+            payload, shape = quantize_int4_block32_sym(tensor, transpose_last=False)
             dtype_code = DTYPE_CODES["int4_block32_sym"]
         else:
             dtype_code = dtype_code_from_torch(tensor.dtype)
@@ -317,7 +345,22 @@ def main() -> int:
         t = state_dict[name]
         print(f"  {name:60s} shape={tuple(t.shape)} dtype={t.dtype}", file=sys.stderr)
 
-    total_size, sha256 = write_blob(state_dict, names, args.output, args.quant)
+    # Expert truncation: slice 3D MoE tensors along dim 0 to first N experts.
+    if args.expert_keep > 0:
+        state_dict = dict(state_dict)
+        for n_name in names:
+            if "mlp.experts." in n_name and state_dict[n_name].dim() >= 2:
+                t = state_dict[n_name]
+                if t.shape[0] > args.expert_keep:
+                    state_dict[n_name] = t[: args.expert_keep].contiguous()
+                    print(
+                        f"[convert-weights] truncating {n_name} along dim 0 to first {args.expert_keep}",
+                        file=sys.stderr,
+                    )
+
+    total_size, sha256 = write_blob(
+        state_dict, names, args.output, args.quant, args.quant_transpose,
+    )
     print(f"[convert-weights] wrote {total_size} bytes ({total_size / 1024 / 1024:.2f} MiB)", file=sys.stderr)
     print(f"[convert-weights] sha256: {sha256}", file=sys.stderr)
 

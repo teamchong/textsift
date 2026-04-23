@@ -40,7 +40,9 @@ interface PiiWasmExports {
   rms_norm(x: number, gamma: number, out: number, T: number, D: number, eps: number): void;
   matmul_bf16(x: number, w: number, bias: number, out: number, T: number, N: number, D: number): void;
   matmul_bf16_out_f32(x: number, w: number, bias: number, out: number, T: number, N: number, D: number): void;
-  matmul_bf16_x_int4block(x: number, w: number, bias: number, out: number, T: number, N: number, D: number): void;
+  matmul_bf16_x_int4block(x: number, w_int4: number, w_scales: number, bias: number, out: number, T: number, N: number, D: number): void;
+  matmul_bf16_x_int4block_out_f32(x: number, w_int4: number, w_scales: number, bias: number, out: number, T: number, N: number, D: number): void;
+  matmul_f32_x_int4block_out_f32(x: number, w_int4: number, w_scales: number, bias: number, out: number, T: number, N: number, D: number): void;
   topk_partial_f32(x: number, out_idx: number, out_val: number, rows: number, cols: number, k: number): void;
   rope_apply(qk: number, cos: number, sin: number, T: number, H: number, head_dim: number): void;
   banded_attention(
@@ -48,6 +50,13 @@ interface PiiWasmExports {
     T: number, H_q: number, H_kv: number, head_dim: number, window: number,
   ): void;
   scale_bf16_inplace(x: number, scale: number, n: number): void;
+  gather_bf16(src: number, indices: number, dst: number, m: number, D: number): void;
+  scatter_add_weighted_f32(
+    target: number, values: number, indices: number, weights: number,
+    m: number, D: number,
+  ): void;
+  zero_f32(ptr: number, n: number): void;
+  cast_f32_to_bf16_scaled(src: number, dst: number, n: number, scale: number): void;
   softmax_f32(x: number, out: number, rows: number, cols: number): void;
   swiglu_clamp_f32(gate_up: number, out: number, T: number, D: number): void;
   embed_lookup(embed: number, ids: number, out: number, T: number, V: number, D: number): void;
@@ -117,10 +126,16 @@ export async function loadPiiWasm(url: string | URL): Promise<PiiWasmExports> {
     "matmul_bf16",
     "matmul_bf16_out_f32",
     "matmul_bf16_x_int4block",
+    "matmul_bf16_x_int4block_out_f32",
+    "matmul_f32_x_int4block_out_f32",
     "topk_partial_f32",
     "rope_apply",
     "banded_attention",
     "scale_bf16_inplace",
+    "gather_bf16",
+    "scatter_add_weighted_f32",
+    "zero_f32",
+    "cast_f32_to_bf16_scaled",
     "softmax_f32",
     "swiglu_clamp_f32",
     "embed_lookup",

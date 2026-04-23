@@ -14,6 +14,7 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { attentionForward } from "../src/js/inference/attention.ts";
+import { expertDispatch } from "../src/js/inference/expert.ts";
 import { buildRopeTables } from "../src/js/inference/rope.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -191,6 +192,47 @@ async function runEmbed(ex, weights, spec) {
   const outPtr = ex.alloc(expected.byteLength);
   ex.embed_lookup(embed.ptr, idsPtr, outPtr, spec.T, spec.V, spec.D);
   return compareU16(ex, outPtr, expected);
+}
+
+async function runExpertDispatch(ex, weights, spec) {
+  const hidden = await loadFixture(spec.hidden);
+  const routingIdx = await loadFixture(spec.routing_idx);
+  const routingScores = await loadFixture(spec.routing_scores);
+  const expected = await loadFixture(spec.expected);
+  const hiddenPtr = allocAndCopy(ex, hidden);
+  const idxPtr = allocAndCopy(ex, routingIdx);
+  const scoresPtr = allocAndCopy(ex, routingScores);
+  const outPtr = ex.alloc(expected.byteLength);
+
+  const w = (name) => {
+    const t = weights.get(name);
+    if (!t) throw new Error(`missing tensor: ${name}`);
+    return t;
+  };
+
+  expertDispatch(
+    ex, hiddenPtr, outPtr, idxPtr, scoresPtr,
+    {
+      gateUp: w("model.layers.0.mlp.experts.gate_up_proj"),
+      gateUpBias: w("model.layers.0.mlp.experts.gate_up_proj_bias"),
+      down: w("model.layers.0.mlp.experts.down_proj"),
+      downBias: w("model.layers.0.mlp.experts.down_proj_bias"),
+    },
+    {
+      hiddenSize: spec.hidden_size,
+      intermediateSize: spec.intermediate_size,
+      numExperts: spec.num_experts,
+      numExpertsPerTok: spec.num_experts_per_tok,
+    },
+    spec.T,
+  );
+
+  return {
+    tolerance: { relTol: spec.rel_tol, absTol: spec.abs_tol ?? 0 },
+    ...compareBf16Tolerance(ex, outPtr, expected, {
+      relTol: spec.rel_tol, absTol: spec.abs_tol ?? 0,
+    }),
+  };
 }
 
 async function runAttentionForward(ex, weights, spec) {
@@ -457,7 +499,10 @@ async function runMatmulInt4(ex, _weights, spec) {
   const wPtr = allocAndCopy(ex, w);
   const bPtr = allocAndCopy(ex, bias);
   const outPtr = ex.alloc(expected.byteLength);
-  ex.matmul_bf16_x_int4block(xPtr, wPtr, bPtr, outPtr, spec.T, spec.N, spec.D);
+  // Packed blob: [N*D/2 bytes int4][N*D/32 * 2 bytes fp16 scales].
+  const int4Bytes = (spec.N * spec.D) >>> 1;
+  const scalesPtr = wPtr + int4Bytes;
+  ex.matmul_bf16_x_int4block(xPtr, wPtr, scalesPtr, bPtr, outPtr, spec.T, spec.N, spec.D);
   return {
     tolerance: { relTol: spec.rel_tol, absTol: spec.abs_tol ?? 0 },
     ...compareBf16Tolerance(ex, outPtr, expected, {
@@ -479,6 +524,7 @@ const RUNNERS = {
   topk_partial_f32: runTopk,
   banded_attention: runBandedAttention,
   attention_forward: runAttentionForward,
+  expert_dispatch: runExpertDispatch,
 };
 
 async function main() {

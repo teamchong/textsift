@@ -659,6 +659,27 @@ inline fn fp16ToF32(bits: u16) f32 {
     return @floatCast(h);
 }
 
+/// Load 4 elements of an X-row as an f32 vector. `XType = u16` treats
+/// the source as bf16 and widens; `XType = f32` is a direct load.
+inline fn loadX4(comptime XType: type, base: [*]const XType, offset: usize) @Vector(4, f32) {
+    if (XType == u16) {
+        const xu: @Vector(4, u16) = base[offset..][0..4].*;
+        return bf16x4ToF32x4(xu);
+    } else if (XType == f32) {
+        return base[offset..][0..4].*;
+    } else @compileError("loadX4: unsupported XType");
+}
+
+/// Store an f32 accumulator lane to out. `OutType = u16` rounds to bf16;
+/// `OutType = f32` is a direct store.
+inline fn storeOut(comptime OutType: type, out: [*]OutType, idx: usize, val: f32) void {
+    if (OutType == u16) {
+        out[idx] = f32ToBf16(val);
+    } else if (OutType == f32) {
+        out[idx] = val;
+    } else @compileError("storeOut: unsupported OutType");
+}
+
 /// Decode 32 int4 values at `block_d` of row `w_int4_row` into eight
 /// `@Vector(4, f32)` chunks covering the block's 32 lanes.
 /// Reused by both the TR=4 tiled path and the T-tail.
@@ -685,11 +706,18 @@ inline fn int4BlockDecode(w_int4_row: [*]const u8, block_d: usize) [8]@Vector(4,
     return out;
 }
 
-export fn matmul_bf16_x_int4block(
-    x_ptr: [*]const u16,   // bf16 [T, D]
-    w_ptr: [*]const u8,    // packed [N, D/2] int4 followed by [N, D/32] fp16
-    bias_ptr: [*]const u16, // bf16 [N]
-    out_ptr: [*]u16,       // bf16 [T, N]
+/// Comptime-parameterized int4-block matmul body. Instantiated by the
+/// three public exports (bf16→bf16, bf16→f32, f32→f32). Three variants
+/// × ~100 lines each are worth a controlled monomorphization; we pay
+/// the specialization cost exactly three times.
+inline fn matmulInt4BlockImpl(
+    comptime XType: type,
+    comptime OutType: type,
+    x_ptr: [*]const XType,
+    w_int4_ptr: [*]const u8,
+    w_scales_ptr: [*]const u16,
+    bias_ptr: [*]const u16,
+    out_ptr: [*]OutType,
     T: u32,
     N: u32,
     D: u32,
@@ -702,7 +730,8 @@ export fn matmul_bf16_x_int4block(
 
     const w_int4_stride: usize = Dz / 2;
     const w_scale_stride: usize = Dz / BLOCK;
-    const scales_base: [*]const u16 = @ptrCast(@alignCast(w_ptr + Nz * w_int4_stride));
+    const w_ptr = w_int4_ptr;
+    const scales_base: [*]const u16 = w_scales_ptr;
 
     // TR-tiled T loop: amortize int4 decode across 4 rows of X that
     // share the same W row. Trailing 0..3 rows run through the scalar
@@ -740,22 +769,22 @@ export fn matmul_bf16_x_int4block(
                     const j = k * 8;
                     const qf0 = q_chunks[k * 2];
                     const qf1 = q_chunks[k * 2 + 1];
-                    const x0_0: @Vector(4, u16) = x_ptr[(tt + 0) * Dz + block_d + j ..][0..4].*;
-                    const x0_1: @Vector(4, u16) = x_ptr[(tt + 0) * Dz + block_d + j + 4 ..][0..4].*;
-                    const x1_0: @Vector(4, u16) = x_ptr[(tt + 1) * Dz + block_d + j ..][0..4].*;
-                    const x1_1: @Vector(4, u16) = x_ptr[(tt + 1) * Dz + block_d + j + 4 ..][0..4].*;
-                    const x2_0: @Vector(4, u16) = x_ptr[(tt + 2) * Dz + block_d + j ..][0..4].*;
-                    const x2_1: @Vector(4, u16) = x_ptr[(tt + 2) * Dz + block_d + j + 4 ..][0..4].*;
-                    const x3_0: @Vector(4, u16) = x_ptr[(tt + 3) * Dz + block_d + j ..][0..4].*;
-                    const x3_1: @Vector(4, u16) = x_ptr[(tt + 3) * Dz + block_d + j + 4 ..][0..4].*;
-                    v00 += bf16x4ToF32x4(x0_0) * qf0;
-                    v01 += bf16x4ToF32x4(x0_1) * qf1;
-                    v10 += bf16x4ToF32x4(x1_0) * qf0;
-                    v11 += bf16x4ToF32x4(x1_1) * qf1;
-                    v20 += bf16x4ToF32x4(x2_0) * qf0;
-                    v21 += bf16x4ToF32x4(x2_1) * qf1;
-                    v30 += bf16x4ToF32x4(x3_0) * qf0;
-                    v31 += bf16x4ToF32x4(x3_1) * qf1;
+                    const x0_0 = loadX4(XType, x_ptr, (tt + 0) * Dz + block_d + j);
+                    const x0_1 = loadX4(XType, x_ptr, (tt + 0) * Dz + block_d + j + 4);
+                    const x1_0 = loadX4(XType, x_ptr, (tt + 1) * Dz + block_d + j);
+                    const x1_1 = loadX4(XType, x_ptr, (tt + 1) * Dz + block_d + j + 4);
+                    const x2_0 = loadX4(XType, x_ptr, (tt + 2) * Dz + block_d + j);
+                    const x2_1 = loadX4(XType, x_ptr, (tt + 2) * Dz + block_d + j + 4);
+                    const x3_0 = loadX4(XType, x_ptr, (tt + 3) * Dz + block_d + j);
+                    const x3_1 = loadX4(XType, x_ptr, (tt + 3) * Dz + block_d + j + 4);
+                    v00 += x0_0 * qf0;
+                    v01 += x0_1 * qf1;
+                    v10 += x1_0 * qf0;
+                    v11 += x1_1 * qf1;
+                    v20 += x2_0 * qf0;
+                    v21 += x2_1 * qf1;
+                    v30 += x3_0 * qf0;
+                    v31 += x3_1 * qf1;
                 }
 
                 const c0 = v00 + v01;
@@ -769,10 +798,10 @@ export fn matmul_bf16_x_int4block(
             }
 
             const b_val = bf16ToF32(bias_ptr[n]);
-            out_ptr[(tt + 0) * Nz + n] = f32ToBf16(acc0 + b_val);
-            out_ptr[(tt + 1) * Nz + n] = f32ToBf16(acc1 + b_val);
-            out_ptr[(tt + 2) * Nz + n] = f32ToBf16(acc2 + b_val);
-            out_ptr[(tt + 3) * Nz + n] = f32ToBf16(acc3 + b_val);
+            storeOut(OutType, out_ptr, (tt + 0) * Nz + n, acc0 + b_val);
+            storeOut(OutType, out_ptr, (tt + 1) * Nz + n, acc1 + b_val);
+            storeOut(OutType, out_ptr, (tt + 2) * Nz + n, acc2 + b_val);
+            storeOut(OutType, out_ptr, (tt + 3) * Nz + n, acc3 + b_val);
         }
     }
 
@@ -798,10 +827,10 @@ export fn matmul_bf16_x_int4block(
                 var a1: @Vector(4, f32) = @splat(0);
                 inline for (0..4) |k| {
                     const j = k * 8;
-                    const xu0: @Vector(4, u16) = x_ptr[x_base + block_d + j ..][0..4].*;
-                    const xu1: @Vector(4, u16) = x_ptr[x_base + block_d + j + 4 ..][0..4].*;
-                    a0 += bf16x4ToF32x4(xu0) * q_chunks[k * 2];
-                    a1 += bf16x4ToF32x4(xu1) * q_chunks[k * 2 + 1];
+                    const xu0 = loadX4(XType, x_ptr, x_base + block_d + j);
+                    const xu1 = loadX4(XType, x_ptr, x_base + block_d + j + 4);
+                    a0 += xu0 * q_chunks[k * 2];
+                    a1 += xu1 * q_chunks[k * 2 + 1];
                 }
                 const combined: @Vector(4, f32) = a0 + a1;
                 const block_sum: f32 =
@@ -810,9 +839,47 @@ export fn matmul_bf16_x_int4block(
             }
 
             acc += bf16ToF32(bias_ptr[n]);
-            out_ptr[out_base + n] = f32ToBf16(acc);
+            storeOut(OutType, out_ptr, out_base + n, acc);
         }
     }
+}
+
+/// bf16 x × int4-blockwise W + bias → bf16 out. Existing semantics.
+export fn matmul_bf16_x_int4block(
+    x_ptr: [*]const u16,
+    w_int4_ptr: [*]const u8,
+    w_scales_ptr: [*]const u16,
+    bias_ptr: [*]const u16,
+    out_ptr: [*]u16,
+    T: u32, N: u32, D: u32,
+) void {
+    matmulInt4BlockImpl(u16, u16, x_ptr, w_int4_ptr, w_scales_ptr, bias_ptr, out_ptr, T, N, D);
+}
+
+/// bf16 x × int4-blockwise W + bias → f32 out. Used for the MoE gate_up
+/// matmul — upstream expert forward keeps the chain in fp32.
+export fn matmul_bf16_x_int4block_out_f32(
+    x_ptr: [*]const u16,
+    w_int4_ptr: [*]const u8,
+    w_scales_ptr: [*]const u16,
+    bias_ptr: [*]const u16,
+    out_ptr: [*]f32,
+    T: u32, N: u32, D: u32,
+) void {
+    matmulInt4BlockImpl(u16, f32, x_ptr, w_int4_ptr, w_scales_ptr, bias_ptr, out_ptr, T, N, D);
+}
+
+/// f32 x × int4-blockwise W + bias → f32 out. Used for the MoE down_proj
+/// matmul — the SwiGLU output feeding it is fp32.
+export fn matmul_f32_x_int4block_out_f32(
+    x_ptr: [*]const f32,
+    w_int4_ptr: [*]const u8,
+    w_scales_ptr: [*]const u16,
+    bias_ptr: [*]const u16,
+    out_ptr: [*]f32,
+    T: u32, N: u32, D: u32,
+) void {
+    matmulInt4BlockImpl(f32, f32, x_ptr, w_int4_ptr, w_scales_ptr, bias_ptr, out_ptr, T, N, D);
 }
 
 // --------------------------------------------------------------
@@ -932,6 +999,107 @@ export fn softmax_f32(
         while (c < Cz) : (c += 1) {
             out_ptr[row_base + c] *= inv_sum;
         }
+    }
+}
+
+// --------------------------------------------------------------
+// Kernel: gather bf16 rows by int32 index
+// --------------------------------------------------------------
+//
+// dst[i, :] = src[indices[i], :]   for i in 0..m
+// Used by expert dispatch to pull the token rows assigned to one expert
+// into a contiguous scratch before the matmul chain.
+
+export fn gather_bf16(
+    src_ptr: [*]const u16,
+    indices_ptr: [*]const i32,
+    dst_ptr: [*]u16,
+    m: u32,
+    D: u32,
+) void {
+    const mz: usize = m;
+    const Dz: usize = D;
+    var i: usize = 0;
+    while (i < mz) : (i += 1) {
+        const t: usize = @intCast(indices_ptr[i]);
+        const src_row = src_ptr + t * Dz;
+        const dst_row = dst_ptr + i * Dz;
+        var d: usize = 0;
+        while (d < Dz) : (d += 1) dst_row[d] = src_row[d];
+    }
+}
+
+// --------------------------------------------------------------
+// Kernel: weighted scatter-add into f32 accumulator
+// --------------------------------------------------------------
+//
+// target[indices[i], :] += weights[i] * values[i, :]   for i in 0..m
+// Expert dispatch scatters per-expert outputs back into the per-token
+// accumulator with the routing score as weight.
+
+export fn scatter_add_weighted_f32(
+    target_ptr: [*]f32,
+    values_ptr: [*]const f32,
+    indices_ptr: [*]const i32,
+    weights_ptr: [*]const f32,
+    m: u32,
+    D: u32,
+) void {
+    const mz: usize = m;
+    const Dz: usize = D;
+    const LANES: usize = 4;
+
+    var i: usize = 0;
+    while (i < mz) : (i += 1) {
+        const t: usize = @intCast(indices_ptr[i]);
+        const w: f32 = weights_ptr[i];
+        const w_vec: @Vector(4, f32) = @splat(w);
+        const val_row = values_ptr + i * Dz;
+        const tgt_row = target_ptr + t * Dz;
+
+        var d: usize = 0;
+        while (d + LANES <= Dz) : (d += LANES) {
+            const tgt: @Vector(4, f32) = tgt_row[d ..][0..LANES].*;
+            const val: @Vector(4, f32) = val_row[d ..][0..LANES].*;
+            tgt_row[d ..][0..LANES].* = tgt + w_vec * val;
+        }
+        while (d < Dz) : (d += 1) tgt_row[d] += w * val_row[d];
+    }
+}
+
+// --------------------------------------------------------------
+// Kernel: zero-fill f32 buffer (bump-alloc'd scratch comes uninit)
+// --------------------------------------------------------------
+
+export fn zero_f32(ptr: [*]f32, n: u32) void {
+    const nz: usize = n;
+    const LANES: usize = 4;
+    const zero_vec: @Vector(4, f32) = @splat(0.0);
+    var i: usize = 0;
+    while (i + LANES <= nz) : (i += LANES) {
+        ptr[i ..][0..LANES].* = zero_vec;
+    }
+    while (i < nz) : (i += 1) ptr[i] = 0.0;
+}
+
+// --------------------------------------------------------------
+// Kernel: f32 → bf16 with optional scalar multiply
+// --------------------------------------------------------------
+//
+// dst[i] = round_bf16(src[i] * scale)
+// Used to finish the MoE accumulator: multiply by `num_experts_per_tok`
+// and downcast to bf16 in one pass (saves a buffer).
+
+export fn cast_f32_to_bf16_scaled(
+    src_ptr: [*]const f32,
+    dst_ptr: [*]u16,
+    n: u32,
+    scale: f32,
+) void {
+    const nz: usize = n;
+    var i: usize = 0;
+    while (i < nz) : (i += 1) {
+        dst_ptr[i] = f32ToBf16(src_ptr[i] * scale);
     }
 }
 

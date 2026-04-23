@@ -108,10 +108,11 @@ async function main() {
     new Uint16Array(ex.memory.buffer, wPtr + s.N * (s.D / 2), s.N * (s.D / 32)).fill(0x3C00); // fp16 1.0
     new Uint16Array(ex.memory.buffer, bPtr, bBytes >>> 1).fill(0);
 
-    for (let i = 0; i < WARMUP; i++) ex.matmul_bf16_x_int4block(xPtr, wPtr, bPtr, oPtr, s.T, s.N, s.D);
+    const scalesPtr = wPtr + s.N * (s.D / 2);
+    for (let i = 0; i < WARMUP; i++) ex.matmul_bf16_x_int4block(xPtr, wPtr, scalesPtr, bPtr, oPtr, s.T, s.N, s.D);
     const samples = [];
     for (let i = 0; i < ITERS; i++) {
-      samples.push(time(() => ex.matmul_bf16_x_int4block(xPtr, wPtr, bPtr, oPtr, s.T, s.N, s.D)));
+      samples.push(time(() => ex.matmul_bf16_x_int4block(xPtr, wPtr, scalesPtr, bPtr, oPtr, s.T, s.N, s.D)));
     }
     const med = median(samples);
     const flops = 2 * s.T * s.N * s.D;

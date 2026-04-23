@@ -66,6 +66,10 @@ export interface PiiWasmExports {
   softmax_f32(x: number, out: number, rows: number, cols: number): void;
   swiglu_clamp_f32(gate_up: number, out: number, T: number, D: number): void;
   embed_lookup(embed: number, ids: number, out: number, T: number, V: number, D: number): void;
+  embed_lookup_int4(
+    embed_int4: number, embed_scales: number, embed_zp: number,
+    ids: number, out: number, T: number, V: number, D: number,
+  ): void;
 }
 
 /** Dtype codes emitted by `scripts/convert_weights.py`. */
@@ -153,6 +157,7 @@ export async function loadPiiWasm(url?: string | URL | null): Promise<PiiWasmExp
     "softmax_f32",
     "swiglu_clamp_f32",
     "embed_lookup",
+    "embed_lookup_int4",
   ];
   for (const name of required) {
     if (!(name in exports)) {

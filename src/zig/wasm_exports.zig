@@ -1514,6 +1514,77 @@ export fn rope_apply(
 }
 
 // --------------------------------------------------------------
+// Kernel: ONNX GatherBlockQuantized embedding lookup
+// --------------------------------------------------------------
+//
+// out[t, d] = (uint4(embed[ids[t], d]) - zp[ids[t], block(d)])
+//             * scale[ids[t], block(d)]
+//
+// Matches ONNX GatherBlockQuantized semantics (block_size=32, uint4
+// weights, uint4 zero-points, fp16 scales). Layout of the ONNX embed
+// table as unpacked by the reader:
+//   embed_int4:    uint4 packed, [V, D/2] bytes
+//   embed_scales:  fp16,         [V, D/32]
+//   embed_zp:      uint4 packed, [V, ceil(D/32/2)] bytes
+//
+// Output is bf16 so the downstream kernels (rms_norm, q/k/v proj) read
+// their usual input dtype.
+//
+// OOB ids zero-fill, same safety policy as the bf16 variant.
+
+export fn embed_lookup_int4(
+    embed_int4: [*]const u8,
+    embed_scales: [*]const u16,
+    embed_zp: [*]const u8,
+    ids_ptr: [*]const i32,
+    out_ptr: [*]u16,
+    T: u32,
+    V: u32,
+    D: u32,
+) void {
+    const Tz: usize = T;
+    const Dz: usize = D;
+    const BLOCK: usize = 32;
+    const n_blocks: usize = Dz / BLOCK;
+    const int4_stride: usize = Dz / 2;
+    const scale_stride: usize = n_blocks;
+    const zp_stride: usize = (n_blocks + 1) / 2;
+
+    var t: usize = 0;
+    while (t < Tz) : (t += 1) {
+        const id = ids_ptr[t];
+        const out_base = t * Dz;
+        if (id < 0 or @as(u32, @intCast(id)) >= V) {
+            var d: usize = 0;
+            while (d < Dz) : (d += 1) out_ptr[out_base + d] = 0;
+            continue;
+        }
+        const row: usize = @intCast(id);
+        const w_int4_row = embed_int4 + row * int4_stride;
+        const w_scale_row = embed_scales + row * scale_stride;
+        const w_zp_row = embed_zp + row * zp_stride;
+
+        var b: usize = 0;
+        while (b < n_blocks) : (b += 1) {
+            const scale = fp16ToF32(w_scale_row[b]);
+            const zp = extractZp(w_zp_row, b);
+            const block_d = b * BLOCK;
+
+            const q_chunks = int4BlockDecode(w_int4_row, block_d, zp);
+            // 8 chunks of 4 lanes each = 32 output lanes per block.
+            inline for (0..8) |chunk| {
+                const base = out_base + block_d + chunk * 4;
+                const qf = q_chunks[chunk];
+                out_ptr[base + 0] = f32ToBf16(qf[0] * scale);
+                out_ptr[base + 1] = f32ToBf16(qf[1] * scale);
+                out_ptr[base + 2] = f32ToBf16(qf[2] * scale);
+                out_ptr[base + 3] = f32ToBf16(qf[3] * scale);
+            }
+        }
+    }
+}
+
+// --------------------------------------------------------------
 // Kernel: embedding lookup
 // --------------------------------------------------------------
 //

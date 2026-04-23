@@ -2,12 +2,13 @@
  * Viterbi decoder for BIOES-tagged token classification.
  *
  * Inputs:
- *   - Per-token emission logits shape `[T, C]` where C = 33:
- *     class 0       = background "O"
- *     classes 1..8  = B-<label>
- *     classes 9..16 = I-<label>
- *     classes 17..24 = E-<label>
- *     classes 25..32 = S-<label>
+ *   - Per-token emission logits shape `[T, C]` where C = 33. The model
+ *     groups classes per-label (matches `config.json` `id2label`):
+ *       class 0                  = background "O"
+ *       class 1 + 4*lbl + 0      = B-<label[lbl]>
+ *       class 1 + 4*lbl + 1      = I-<label[lbl]>
+ *       class 1 + 4*lbl + 2      = E-<label[lbl]>
+ *       class 1 + 4*lbl + 3      = S-<label[lbl]>
  *
  * Algorithm:
  *   - Classic Viterbi: for every token t and every tag j, compute the
@@ -27,13 +28,24 @@ import type { ViterbiCalibration } from "../model/calibration.js";
 
 /** BIOES tag family. */
 export const BIOES_BACKGROUND = 0;
-export const BIOES_BEGIN_OFFSET = 1;   // B-span_0 = 1, B-span_7 = 8
-export const BIOES_INSIDE_OFFSET = 9;  // I-span_0 = 9, I-span_7 = 16
-export const BIOES_END_OFFSET = 17;    // E-span_0 = 17, E-span_7 = 24
-export const BIOES_SINGLE_OFFSET = 25; // S-span_0 = 25, S-span_7 = 32
+/** First tag id belonging to a labelled span (non-background). */
+export const FIRST_SPAN_CLASS = 1;
+/** Number of boundary tags per label: B, I, E, S (order fixed by model head). */
+export const NUM_BOUNDARY_TAGS = 4;
 
 export const NUM_BIOES_CLASSES = 33;
 export const NUM_SPAN_LABELS = 8;
+
+/** Boundary index within a label's 4-tag block. */
+const BOUNDARY_B = 0;
+const BOUNDARY_I = 1;
+const BOUNDARY_E = 2;
+const BOUNDARY_S = 3;
+
+/** Convert (labelIndex, boundary) to its flat class id. */
+export function bioesTagOf(labelIndex: number, boundary: 0 | 1 | 2 | 3): number {
+  return FIRST_SPAN_CLASS + labelIndex * NUM_BOUNDARY_TAGS + boundary;
+}
 
 const NEG_INF = -1e30;
 
@@ -157,10 +169,10 @@ function buildTransitionMatrix(cal: ViterbiCalibration): Float32Array {
   allow(BIOES_BACKGROUND, BIOES_BACKGROUND, cal.backgroundStay);
 
   for (let lbl = 0; lbl < NUM_SPAN_LABELS; lbl++) {
-    const B = BIOES_BEGIN_OFFSET + lbl;
-    const I = BIOES_INSIDE_OFFSET + lbl;
-    const E = BIOES_END_OFFSET + lbl;
-    const S = BIOES_SINGLE_OFFSET + lbl;
+    const B = bioesTagOf(lbl, BOUNDARY_B);
+    const I = bioesTagOf(lbl, BOUNDARY_I);
+    const E = bioesTagOf(lbl, BOUNDARY_E);
+    const S = bioesTagOf(lbl, BOUNDARY_S);
 
     // O → B-l and O → S-l: start of a new entity.
     allow(BIOES_BACKGROUND, B, cal.backgroundToStart);
@@ -182,8 +194,8 @@ function buildTransitionMatrix(cal: ViterbiCalibration): Float32Array {
     // E-l → B-l' and E-l → S-l' and S-l → B-l' and S-l → S-l' — entity
     // immediately followed by another entity. Allowed across labels.
     for (let lbl2 = 0; lbl2 < NUM_SPAN_LABELS; lbl2++) {
-      const B2 = BIOES_BEGIN_OFFSET + lbl2;
-      const S2 = BIOES_SINGLE_OFFSET + lbl2;
+      const B2 = bioesTagOf(lbl2, BOUNDARY_B);
+      const S2 = bioesTagOf(lbl2, BOUNDARY_S);
       allow(E, B2, cal.endToStart);
       allow(E, S2, cal.endToStart);
       allow(S, B2, cal.endToStart);
@@ -200,23 +212,20 @@ function buildStartScores(): Float32Array {
   const s = new Float32Array(C).fill(NEG_INF);
   s[BIOES_BACKGROUND] = 0;
   for (let lbl = 0; lbl < NUM_SPAN_LABELS; lbl++) {
-    s[BIOES_BEGIN_OFFSET + lbl] = 0;
-    s[BIOES_SINGLE_OFFSET + lbl] = 0;
+    s[bioesTagOf(lbl, BOUNDARY_B)] = 0;
+    s[bioesTagOf(lbl, BOUNDARY_S)] = 0;
   }
   return s;
 }
 
-/** For tests and debugging: categorise a tag id. */
-export function describeTag(tag: number): { prefix: "O" | "B" | "I" | "E" | "S"; labelIndex: number } {
+/** Categorise a tag id into (prefix, labelIndex). `labelIndex` is -1 for O. */
+export function describeTag(
+  tag: number,
+): { prefix: "O" | "B" | "I" | "E" | "S"; labelIndex: number } {
   if (tag === BIOES_BACKGROUND) return { prefix: "O", labelIndex: -1 };
-  if (tag >= BIOES_BEGIN_OFFSET && tag < BIOES_INSIDE_OFFSET) {
-    return { prefix: "B", labelIndex: tag - BIOES_BEGIN_OFFSET };
-  }
-  if (tag >= BIOES_INSIDE_OFFSET && tag < BIOES_END_OFFSET) {
-    return { prefix: "I", labelIndex: tag - BIOES_INSIDE_OFFSET };
-  }
-  if (tag >= BIOES_END_OFFSET && tag < BIOES_SINGLE_OFFSET) {
-    return { prefix: "E", labelIndex: tag - BIOES_END_OFFSET };
-  }
-  return { prefix: "S", labelIndex: tag - BIOES_SINGLE_OFFSET };
+  const offset = tag - FIRST_SPAN_CLASS;
+  const labelIndex = Math.floor(offset / NUM_BOUNDARY_TAGS);
+  const boundary = offset % NUM_BOUNDARY_TAGS;
+  const prefix = (["B", "I", "E", "S"] as const)[boundary]!;
+  return { prefix, labelIndex };
 }

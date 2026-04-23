@@ -97,7 +97,7 @@ def load_corpus(path: Path, max_samples: int) -> list[str]:
     return lines
 
 
-def register_router_hooks(model: Any) -> tuple[list[np.ndarray], list[str]]:
+def register_router_hooks(model: Any, num_experts: int) -> tuple[list[np.ndarray], list[str]]:
     """
     Attach forward-hooks on every MoE router in the model so we can log
     which experts were selected for each token.
@@ -114,32 +114,37 @@ def register_router_hooks(model: Any) -> tuple[list[np.ndarray], list[str]]:
 
     def make_hook(layer_index: int):
         def hook(_mod: nn.Module, _inp: Any, out: Any) -> None:
-            # The router output is typically (routing_weights, selected_experts)
-            # or a dict; we care about `selected_experts`, shape [tokens, top_k].
-            if isinstance(out, tuple) and len(out) >= 2:
-                selected = out[1]
+            # Routers differ across architectures. Identify the selected-
+            # expert-indices tensor by dtype + shape rather than tuple
+            # position: it's the integer tensor whose last dim is top_k.
+            # openai_privacy_filter returns (router_logits [T, n_exp],
+            # routing_weights [T, top_k] f32, selected_indices [T, top_k] i64).
+            # Positional indexing on out[1] captures the float weights,
+            # which round to 0 under int cast — silently collapsing every
+            # activation onto expert 0.
+            selected = None
+            if isinstance(out, tuple):
+                for item in out:
+                    if torch.is_tensor(item) and item.dtype in (torch.int32, torch.int64):
+                        selected = item
+                        break
             elif isinstance(out, dict) and "selected_experts" in out:
                 selected = out["selected_experts"]
-            elif torch.is_tensor(out):
+            elif torch.is_tensor(out) and out.dtype in (torch.int32, torch.int64):
                 selected = out
-            else:
+            if selected is None:
                 return
             counts = torch.bincount(
                 selected.flatten().to(torch.int64),
                 minlength=counters[layer_index].shape[0],
             ).cpu().numpy()
-            counters[layer_index] += counts
+            counters[layer_index] += counts[: counters[layer_index].shape[0]]
         return hook
 
-    # Walk the model tree. The MoE module naming in the upstream repo uses
-    # `.router` suffixes; we match on that pattern and size the counter from
-    # the first forward pass's output shape. Using a name filter keeps us
-    # from accidentally hooking unrelated `nn.Linear` named `gate`.
     for module_name, module in model.named_modules():
         lower = module_name.lower()
         if lower.endswith(".router") or lower.endswith(".gate") and "expert" in lower:
-            # Size the counter optimistically; resized on first hit if wrong.
-            counters.append(np.zeros(1024, dtype=np.int64))
+            counters.append(np.zeros(num_experts, dtype=np.int64))
             names.append(module_name)
             module.register_forward_hook(make_hook(len(counters) - 1))
     return counters, names
@@ -148,7 +153,12 @@ def register_router_hooks(model: Any) -> tuple[list[np.ndarray], list[str]]:
 def compute_expert_cosines(model: Any, router_names: list[str]) -> dict[str, np.ndarray]:
     """
     For each MoE layer with a hooked router, compute pairwise cosine
-    similarity between the W_up weights of all experts.
+    similarity between expert weight tensors. openai_privacy_filter stacks
+    all experts into a single parameter per layer:
+      `mlp.experts.gate_up_proj`  shape [num_experts, d_model, 2*d_ff]
+      `mlp.experts.down_proj`     shape [num_experts, d_ff,  d_model]
+    We flatten each expert's (gate_up_proj ⊕ down_proj) into one vector and
+    compute a [num_experts, num_experts] cosine-similarity matrix per layer.
 
     Returns: mapping of layer name → [num_experts, num_experts] cos-sim matrix.
     """
@@ -157,20 +167,41 @@ def compute_expert_cosines(model: Any, router_names: list[str]) -> dict[str, np.
     out: dict[str, np.ndarray] = {}
     for name in router_names:
         layer_prefix = name.rsplit(".router", 1)[0] if ".router" in name else name.rsplit(".gate", 1)[0]
-        expert_weights: list[torch.Tensor] = []
+        experts_module = None
         for sub_name, module in model.named_modules():
-            if not sub_name.startswith(layer_prefix):
-                continue
-            # Look for sub-modules named like `experts.NN.w_up` or similar.
-            if ".w_up" in sub_name or ".gate_proj" in sub_name:
-                w = getattr(module, "weight", None)
-                if isinstance(w, torch.Tensor):
-                    expert_weights.append(w.detach().float().flatten())
-        if len(expert_weights) < 2:
+            if sub_name == f"{layer_prefix}.experts":
+                experts_module = module
+                break
+        if experts_module is None:
             continue
-        mat = torch.stack(expert_weights)
-        mat = mat / mat.norm(dim=1, keepdim=True).clamp_min(1e-8)
-        cos = (mat @ mat.T).cpu().numpy()
+
+        # Gather all stacked per-expert tensors. For openai_privacy_filter
+        # the names are gate_up_proj / down_proj; other MoE archs may use
+        # wi / wo or experts.<i>.w_up — we handle both shapes.
+        stacked_tensors: list[torch.Tensor] = []
+        for param_name, param in experts_module.named_parameters(recurse=True):
+            if not isinstance(param, torch.Tensor):
+                continue
+            if param.dim() < 2:
+                continue
+            # First dim must be num_experts; anything else we flatten later.
+            stacked_tensors.append(param.detach().float())
+
+        if not stacked_tensors:
+            continue
+
+        n_experts = stacked_tensors[0].shape[0]
+        if any(t.shape[0] != n_experts for t in stacked_tensors):
+            # Mixed first-dim sizes — bail out for this layer rather than
+            # producing a confusing matrix.
+            continue
+
+        flat = torch.cat(
+            [t.reshape(n_experts, -1) for t in stacked_tensors],
+            dim=1,
+        )
+        flat = flat / flat.norm(dim=1, keepdim=True).clamp_min(1e-8)
+        cos = (flat @ flat.T).cpu().numpy()
         out[name] = cos
     return out
 
@@ -228,8 +259,12 @@ def main() -> int:
     model.to(device)
     print(f"[measure-experts] model on device, param count: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")
 
-    counters, names = register_router_hooks(model)
-    print(f"[measure-experts] hooked {len(names)} router modules")
+    num_experts = int(getattr(model.config, "num_local_experts", 0))
+    if num_experts <= 0:
+        print("[measure-experts] config.num_local_experts not set; falling back to 1024", file=sys.stderr)
+        num_experts = 1024
+    counters, names = register_router_hooks(model, num_experts)
+    print(f"[measure-experts] hooked {len(names)} router modules × {num_experts} experts")
     if not names:
         print("[measure-experts] no router modules identified — model may not expose MoE internals via standard names.", file=sys.stderr)
         print("                   Adjust `register_router_hooks` for this model's actual MoE naming.", file=sys.stderr)

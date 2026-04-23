@@ -38,15 +38,20 @@
   "license": "Apache-2.0",
   "scripts": {
     "build": "bun build src/js/index.ts --outdir dist --target browser --format esm --sourcemap=external && bun x tsc --emitDeclarationOnly",
-    "build:zig": "zig build-exe -target wasm32-freestanding -mcpu=generic+simd128+relaxed_simd -O ReleaseFast -fstrip src/zig/wasm_exports.zig --name pii -fno-entry -rdynamic && mv pii.wasm dist/",
+    "build:zig": "mise exec -- zig build-exe -target wasm32-freestanding -mcpu=generic+simd128+relaxed_simd -O ReleaseFast -fstrip src/zig/wasm_exports.zig --name pii -fno-entry -rdynamic && mv pii.wasm dist/",
+    "build:opt": "wasm-opt -O3 --strip-producers --strip-target-features dist/pii.wasm -o dist/pii.wasm --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals --enable-relaxed-simd",
     "typecheck": "bun x tsc --noEmit",
     "test": "bun x playwright test",
+    "test:zig": "mise exec -- zig test src/zig/math.zig",
+    "verify:kernels": "node scripts/verify-kernels.mjs",
+    "bench:kernels": "node scripts/bench-kernels.mjs",
+    "gen:fixtures": "python3 scripts/gen-kernel-fixtures.py",
     "measure:experts": "python3 scripts/measure-experts.py",
     "format": "bun x prettier --write src/js/",
     "format:check": "bun x prettier --check src/js/"
   },
   "dependencies": {
-    "@huggingface/transformers": "^3.0.0"
+    "@huggingface/transformers": "^4.2.0"
   },
   "devDependencies": {
     "@playwright/test": "^1.48.0",

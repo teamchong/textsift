@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>pii-wasm demo</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #f7f7f4;
+        --fg: #1b1b18;
+        --muted: #65635b;
+        --accent: #1d3a6b;
+        --border: #d8d5cc;
+        --card: #ffffff;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #111110;
+          --fg: #e8e5dd;
+          --muted: #8b887e;
+          --accent: #8fb5ff;
+          --border: #2a2a28;
+          --card: #181816;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        font: 14px/1.5 ui-sans-serif, system-ui, sans-serif;
+        color: var(--fg);
+        background: var(--bg);
+        margin: 0;
+        padding: 24px;
+        max-width: 900px;
+        margin-inline: auto;
+      }
+      h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+      p.lede { color: var(--muted); margin: 0 0 20px; }
+      textarea {
+        width: 100%;
+        min-height: 140px;
+        font: 13px/1.5 ui-monospace, Menlo, Consolas, monospace;
+        padding: 10px 12px;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: var(--card);
+        color: var(--fg);
+        resize: vertical;
+      }
+      .toolbar {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        margin-top: 8px;
+      }
+      button {
+        font: inherit;
+        padding: 6px 14px;
+        border-radius: 5px;
+        border: 1px solid var(--border);
+        background: var(--card);
+        color: var(--fg);
+        cursor: pointer;
+      }
+      button[disabled] { opacity: 0.5; cursor: wait; }
+      button.primary { background: var(--accent); color: white; border-color: transparent; }
+      .status { color: var(--muted); font-size: 12px; margin-left: auto; }
+      .section { margin-top: 20px; }
+      .section h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0 0 6px; font-weight: 600; }
+      .box {
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 10px 12px;
+        background: var(--card);
+        min-height: 44px;
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+        font-size: 13px;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .spans { display: grid; grid-template-columns: auto auto 1fr; gap: 4px 16px; font-size: 12px; font-family: ui-monospace, monospace; }
+      .spans .label { color: var(--muted); }
+      mark {
+        border-radius: 3px;
+        padding: 0 3px;
+        background: color-mix(in srgb, var(--accent) 18%, transparent);
+        color: inherit;
+        border-bottom: 1px solid var(--accent);
+      }
+      .error { color: #a33; }
+    </style>
+  </head>
+  <body>
+    <h1>pii-wasm</h1>
+    <p class="lede">Browser-native PII detection via <code>openai/privacy-filter</code>. Everything runs locally — no network calls to an inference service.</p>
+
+    <textarea id="input">Contact Bob at bob@example.com or 555-0100 before 2026-05-17.</textarea>
+    <div class="toolbar">
+      <button id="run" class="primary" disabled>Redact</button>
+      <span id="status" class="status">loading model…</span>
+    </div>
+
+    <div class="section">
+      <h2>Redacted</h2>
+      <div id="redacted" class="box"></div>
+    </div>
+
+    <div class="section">
+      <h2>Highlighted</h2>
+      <div id="highlighted" class="box"></div>
+    </div>
+
+    <div class="section">
+      <h2>Spans</h2>
+      <div id="spans" class="spans"></div>
+    </div>
+
+    <script type="module">
+      import { PrivacyFilter } from "../dist/index.js";
+
+      const $input = document.getElementById("input");
+      const $run = document.getElementById("run");
+      const $status = document.getElementById("status");
+      const $redacted = document.getElementById("redacted");
+      const $highlighted = document.getElementById("highlighted");
+      const $spans = document.getElementById("spans");
+
+      let filter;
+      try {
+        filter = await PrivacyFilter.create({
+          onProgress: (ev) => {
+            if (ev.stage === "download") {
+              const pct = ev.total ? Math.round((ev.loaded / ev.total) * 100) : 0;
+              const file = ev.url.split("/").pop();
+              $status.textContent = `downloading ${file} (${pct}%)`;
+            } else if (ev.stage === "compile") {
+              $status.textContent = `compiling (${ev.backend})…`;
+            } else if (ev.stage === "warmup") {
+              $status.textContent = `warming up…`;
+            } else if (ev.stage === "ready") {
+              $status.textContent = "ready";
+            }
+          },
+        });
+      } catch (e) {
+        $status.textContent = "";
+        $redacted.classList.add("error");
+        $redacted.textContent = `failed to initialise: ${e.message}`;
+        throw e;
+      }
+
+      $run.disabled = false;
+      $run.addEventListener("click", run);
+      run();
+
+      async function run() {
+        const text = $input.value;
+        $run.disabled = true;
+        const t0 = performance.now();
+        try {
+          const result = await filter.redact(text);
+          const dt = performance.now() - t0;
+          $status.textContent = `${result.spans.length} span(s) in ${dt.toFixed(0)} ms`;
+          $redacted.textContent = result.redactedText;
+          renderHighlighted(text, result.spans);
+          renderSpans(result.spans);
+        } catch (e) {
+          $status.textContent = "";
+          $redacted.classList.add("error");
+          $redacted.textContent = e.message;
+        } finally {
+          $run.disabled = false;
+        }
+      }
+
+      function renderHighlighted(text, spans) {
+        $highlighted.textContent = "";
+        let cursor = 0;
+        for (const s of spans) {
+          if (s.start > cursor) $highlighted.appendChild(document.createTextNode(text.slice(cursor, s.start)));
+          const el = document.createElement("mark");
+          el.textContent = text.slice(s.start, s.end);
+          el.title = s.label;
+          $highlighted.appendChild(el);
+          cursor = s.end;
+        }
+        if (cursor < text.length) $highlighted.appendChild(document.createTextNode(text.slice(cursor)));
+      }
+
+      function renderSpans(spans) {
+        $spans.textContent = "";
+        if (spans.length === 0) {
+          const empty = document.createElement("div");
+          empty.style.color = "var(--muted)";
+          empty.style.gridColumn = "1 / -1";
+          empty.textContent = "(none detected)";
+          $spans.appendChild(empty);
+          return;
+        }
+        for (const s of spans) {
+          const l = document.createElement("div");
+          l.className = "label";
+          l.textContent = s.label;
+          const r = document.createElement("div");
+          r.textContent = `[${s.start}, ${s.end})`;
+          const t = document.createElement("div");
+          t.textContent = s.text;
+          $spans.append(l, r, t);
+        }
+      }
+    </script>
+  </body>
+</html>

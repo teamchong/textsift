@@ -1,0 +1,41 @@
+{
+  "_doc": "Fixtures for bit-exact kernel parity tests. Regenerate via scripts/gen-kernel-fixtures.py. Baseline matches are the highest we've observed; any regression vs baseline should block a merge.",
+  "weights_blob": "pii-weights.bin",
+  "kernels": [
+    {
+      "name": "rms_norm",
+      "x": "rms_x.bf16",
+      "gamma_tensor": "model.norm.weight",
+      "expected": "rms_y.bf16",
+      "T": 8,
+      "D": 640,
+      "eps": 1e-5,
+      "baseline_matches": 5119,
+      "baseline_total": 5120,
+      "note": "1 ULP mismatch tracked to PyTorch's pairwise sum-of-squares accumulation order. If Phase E parity fails on norms, switch to Kahan summation."
+    },
+    {
+      "name": "matmul_bf16",
+      "x": "matmul_x.bf16",
+      "weight_tensor": "score.weight",
+      "bias_tensor": "score.bias",
+      "expected": "matmul_y.bf16",
+      "T": 8,
+      "N": 33,
+      "D": 640,
+      "baseline_matches": 264,
+      "baseline_total": 264
+    },
+    {
+      "name": "embed_lookup",
+      "ids": "embed_ids.i32",
+      "embed_tensor": "model.embed_tokens.weight",
+      "expected": "embed_out.bf16",
+      "T": 8,
+      "V": 1024,
+      "D": 640,
+      "baseline_matches": 5120,
+      "baseline_total": 5120
+    }
+  ]
+}

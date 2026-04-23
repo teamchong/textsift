@@ -33,7 +33,7 @@ export interface Logits {
 
 export interface InferenceBackend {
   /** A debug name used in progress events + error messages. */
-  readonly name: "webgpu" | "wasm" | "transformers-js";
+  readonly name: "wasm" | "transformers-js";
 
   /** Run the model once, compiling pipelines if not already done. */
   warmup(): Promise<void>;
@@ -53,4 +53,6 @@ export interface InferenceBackend {
 export interface BackendConstructionOptions {
   bundle: LoadedModelBundle;
   quantization: "int4" | "int8" | "fp16";
+  /** Execution device forwarded to ORT Web. "auto" lets transformers.js pick. */
+  device: "auto" | "wasm" | "webgpu";
 }

@@ -18,15 +18,7 @@
 import type { DetectedSpan, SpanLabel } from "../types.js";
 import type { Chunk } from "./chunking.js";
 import type { Tokenizer } from "../model/tokenizer.js";
-import {
-  BIOES_BACKGROUND,
-  BIOES_BEGIN_OFFSET,
-  BIOES_INSIDE_OFFSET,
-  BIOES_END_OFFSET,
-  BIOES_SINGLE_OFFSET,
-  NUM_SPAN_LABELS,
-  describeTag,
-} from "./viterbi.js";
+import { NUM_SPAN_LABELS, describeTag } from "./viterbi.js";
 
 export function bioesToSpans(
   tags: Uint8Array,
@@ -49,63 +41,59 @@ export function bioesToSpans(
     const tag = tags[t]!;
     const info = describeTag(tag);
 
-    if (tag === BIOES_BACKGROUND) {
-      // A B/I-run should have been closed by E-l; if we're still in one,
-      // close it at the previous token.
-      if (open !== null) {
-        emit(open.startTokenIdx, t - 1, open.label);
-        open = null;
+    switch (info.prefix) {
+      case "O": {
+        // A B/I-run should have been closed by E-l; if we're still in one,
+        // close it at the previous token.
+        if (open !== null) {
+          emit(open.startTokenIdx, t - 1, open.label);
+          open = null;
+        }
+        break;
       }
-      continue;
-    }
-
-    if (tag >= BIOES_SINGLE_OFFSET) {
-      // S-l: single-token entity.
-      if (open !== null) {
-        emit(open.startTokenIdx, t - 1, open.label);
-        open = null;
-      }
-      emit(t, t, info.labelIndex);
-      continue;
-    }
-
-    if (tag >= BIOES_END_OFFSET) {
-      // E-l: close the open run (or synthesise one at this position).
-      if (open !== null && open.label === info.labelIndex) {
-        emit(open.startTokenIdx, t, info.labelIndex);
-        open = null;
-      } else {
-        // E without matching B — salvage as single-token span.
+      case "S": {
+        // S-l: single-token entity.
         if (open !== null) {
           emit(open.startTokenIdx, t - 1, open.label);
           open = null;
         }
         emit(t, t, info.labelIndex);
+        break;
       }
-      continue;
-    }
-
-    if (tag >= BIOES_INSIDE_OFFSET) {
-      // I-l: extend the run if label matches; otherwise close the old
-      // run and start a new implicit B-l.
-      if (open !== null && open.label === info.labelIndex) {
-        // continue the run; no state change.
-      } else {
+      case "E": {
+        // E-l: close the open run (or synthesise one at this position).
+        if (open !== null && open.label === info.labelIndex) {
+          emit(open.startTokenIdx, t, info.labelIndex);
+          open = null;
+        } else {
+          // E without matching B — salvage as single-token span.
+          if (open !== null) {
+            emit(open.startTokenIdx, t - 1, open.label);
+            open = null;
+          }
+          emit(t, t, info.labelIndex);
+        }
+        break;
+      }
+      case "I": {
+        // I-l: extend the run if label matches; otherwise close the old
+        // run and start a new implicit B-l.
+        if (open === null || open.label !== info.labelIndex) {
+          if (open !== null) {
+            emit(open.startTokenIdx, t - 1, open.label);
+          }
+          open = { label: info.labelIndex, startTokenIdx: t };
+        }
+        break;
+      }
+      case "B": {
+        // B-l: close any open run and start fresh.
         if (open !== null) {
           emit(open.startTokenIdx, t - 1, open.label);
         }
         open = { label: info.labelIndex, startTokenIdx: t };
+        break;
       }
-      continue;
-    }
-
-    if (tag >= BIOES_BEGIN_OFFSET) {
-      // B-l: close any open run and start fresh.
-      if (open !== null) {
-        emit(open.startTokenIdx, t - 1, open.label);
-      }
-      open = { label: info.labelIndex, startTokenIdx: t };
-      continue;
     }
   }
 
@@ -117,23 +105,50 @@ export function bioesToSpans(
   return spans;
 
   function emit(startTokenIdx: number, endTokenIdx: number, labelIndex: number) {
-    const startOffset = chunk.tokenToCharOffset[startTokenIdx];
-    const endOffset = chunk.tokenToCharOffset[endTokenIdx + 1] ?? chunk.tokenToCharOffset[endTokenIdx]!;
-    if (startOffset === undefined || endOffset === undefined) return;
-    const absStart = chunk.charOffset + startOffset;
-    const absEnd = chunk.charOffset + endOffset;
+    const rawStartOffset = chunk.tokenToCharOffset[startTokenIdx];
+    const rawEndOffset =
+      chunk.tokenToCharOffset[endTokenIdx + 1] ?? chunk.tokenToCharOffset[endTokenIdx]!;
+    if (rawStartOffset === undefined || rawEndOffset === undefined) return;
     const label = labelSet[labelIndex] as SpanLabel | undefined;
     if (!label) return;
-    const text = chunk.text.slice(startOffset, endOffset);
+
+    // Match upstream opf's `trim_char_spans_whitespace`: BPE tokens on
+    // ByteLevel BPE often include a leading space that should not bleed
+    // into the emitted PII span. Trim symmetrically at both ends.
+    let startOffset = rawStartOffset;
+    let endOffset = rawEndOffset;
+    while (startOffset < endOffset && isWhitespace(chunk.text.charCodeAt(startOffset))) {
+      startOffset++;
+    }
+    while (endOffset > startOffset && isWhitespace(chunk.text.charCodeAt(endOffset - 1))) {
+      endOffset--;
+    }
+    if (endOffset <= startOffset) return;
+
     spans.push({
       label,
-      start: absStart,
-      end: absEnd,
-      text,
+      start: chunk.charOffset + startOffset,
+      end: chunk.charOffset + endOffset,
+      text: chunk.text.slice(startOffset, endOffset),
       marker: `[${label}]`,
       confidence: 1.0, // confidence from Viterbi is all-or-nothing; per-token softmax
                       // is the right source for a finer value. Populated by the
                       // pipeline once emission probs are piped through.
     });
   }
+}
+
+function isWhitespace(code: number): boolean {
+  // Match JavaScript `String.prototype.trim` whitespace semantics, which
+  // align with Python `str.isspace` for the characters relevant to English
+  // model outputs (space, tab, newline, CR, form feed, NBSP, etc.).
+  return (
+    code === 0x20 ||
+    code === 0x09 ||
+    code === 0x0a ||
+    code === 0x0b ||
+    code === 0x0c ||
+    code === 0x0d ||
+    code === 0xa0
+  );
 }

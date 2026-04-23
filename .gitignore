@@ -13,3 +13,7 @@ test-results/
 playwright-report/
 coverage/
 .claude/
+# Measurement artifacts (corpora, .npz binaries). Reproduction recipe
+# lives in docs/stage3-gate-measurement.md.
+data/
+measurements/

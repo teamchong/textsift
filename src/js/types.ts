@@ -92,15 +92,20 @@ export interface CreateOptions {
   modelSource?: string;
 
   /**
-   * Backend selection. `"auto"` picks WebGPU when `navigator.gpu`
-   * reports a compatible adapter, WASM otherwise.
+   * Backend selection. Stage 0 ships only the transformers.js backend,
+   * which runs on onnxruntime-web (WASM on CPU, WebGPU when available).
+   * Kept as an option so Stage 1's custom Zig+WASM backend can slot in
+   * without breaking the public API. WebGPU (custom WGSL) is deferred —
+   * see `docs/roadmap.md`.
    */
-  backend?: "auto" | "webgpu" | "wasm";
+  backend?: "auto" | "wasm";
 
   /**
-   * Quantization level for the model weights. Defaults to `"int4"`.
-   * `"fp16"` is provided for accuracy debugging and should rarely
-   * be needed.
+   * Quantization level for the model weights. Defaults to `"int8"`, which
+   * maps to `onnx/model_q4f16.onnx` (~772 MB) — the smallest ONNX export
+   * in openai/privacy-filter that runs in a browser without OOM.  `"int4"`
+   * maps to the same file.  `"fp16"` maps to `onnx/model_fp16.onnx` (~2 GB)
+   * for maximum accuracy; only use it if memory permits.
    */
   quantization?: "int4" | "int8" | "fp16";
 

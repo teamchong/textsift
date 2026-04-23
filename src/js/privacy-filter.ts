@@ -174,10 +174,20 @@ export class PrivacyFilter {
       const calibration = loadCalibration(bundle.calibrationJson);
       const tokenizer = await Tokenizer.fromBundle(bundle);
 
-      progress?.({ stage: "compile", backend: "wasm" });
+      // In browsers, q4f16 requires ORT Web's WebGPU execution provider
+      // (MatMulNBits / GatherBlockQuantized have no WASM CPU kernel).
+      // In Node, onnxruntime-node has no "wasm" device; let transformers.js
+      // pick the default execution provider (CPU on cold install, CoreML if
+      // available). `backend: "wasm"` in a browser forces the CPU path.
+      const hasWebGPU = typeof navigator !== "undefined"
+        && !!(navigator as { gpu?: unknown }).gpu;
+      const device: "auto" | "wasm" | "webgpu" = hasWebGPU
+        ? (this.opts.backend === "wasm" ? "wasm" : "webgpu")
+        : "auto";
+      progress?.({ stage: "compile", backend: device === "webgpu" ? "webgpu" : "wasm" });
       const backend = await selectBackend({
-        preference: this.opts.backend ?? "auto",
-        quantization: this.opts.quantization ?? "int4",
+        quantization: this.opts.quantization ?? "int8",
+        device,
         bundle,
       });
 

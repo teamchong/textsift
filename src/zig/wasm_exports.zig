@@ -370,17 +370,22 @@ export fn rms_norm(
 //   bias: bf16 [N]
 //   out:  bf16 [T, N]
 //
-// Accumulation is f32; every bf16 load is upcast before multiply. Final
-// acc + bias is rounded to bf16 via RNE. Every projection in the model
-// (q/k/v/o, router, classifier head, expert gate/up/down) uses this
-// shape with bias — there's no no-bias variant upstream.
+// Inner D-loop uses:
+//   (1) 4-wide SIMD bf16→f32 widen + vector multiply (see `bf16x4ToF32x4`).
+//   (2) Four independent @Vector(4, f32) accumulators, each covering a
+//       separate 4-lane slice of D, unrolled 16-at-a-time. The four
+//       accumulators break the serial add dependency chain, giving the
+//       WASM engine (V8/SM/JSC) room to schedule FMA-ish throughput.
+//   (3) Horizontal reduce at the end: (a0+a1+a2+a3)[0..3] summed to scalar.
 //
-// The inner D-loop uses 4-wide SIMD for the bf16→f32 widen and the
-// element-wise multiply, then drains lane-by-lane into a scalar `acc`
-// to keep the accumulate order identical to the reference scalar code
-// (which is bit-exact against PyTorch F.linear). Crucially we do NOT
-// use `@mulAdd` — relaxed_madd has implementation-defined fusion and
-// would diverge from PyTorch's separate mul+add rounding.
+// The accumulate order differs from a strictly-scalar reference, so the
+// output is NOT bit-exact against the scalar-drain version this kernel
+// used to ship. Parity contract is tolerance-based (rel_tol ≤ 1e-3 on
+// the bf16 output); see `tests/fixtures/manifest.json`.
+//
+// `@mulAdd` is deliberately avoided — relaxed_madd has
+// implementation-defined fusion, which would introduce further
+// engine-dependent drift on top of the accumulator-order drift.
 
 export fn matmul_bf16(
     x_ptr: [*]const u16,
@@ -395,6 +400,7 @@ export fn matmul_bf16(
     const Nz: usize = N;
     const Dz: usize = D;
     const LANES: usize = 4;
+    const UNROLL: usize = 4; // 4 accumulators → 16 lanes per outer step
 
     var t: usize = 0;
     while (t < Tz) : (t += 1) {
@@ -405,20 +411,39 @@ export fn matmul_bf16(
         while (n < Nz) : (n += 1) {
             const w_base = n * Dz;
 
-            var acc: f32 = 0.0;
-            var d: usize = 0;
+            var a0: @Vector(4, f32) = @splat(0);
+            var a1: @Vector(4, f32) = @splat(0);
+            var a2: @Vector(4, f32) = @splat(0);
+            var a3: @Vector(4, f32) = @splat(0);
 
+            const step: usize = LANES * UNROLL; // 16
+            var d: usize = 0;
+            while (d + step <= Dz) : (d += step) {
+                const x0: @Vector(4, u16) = x_ptr[x_base + d ..][0..LANES].*;
+                const x1: @Vector(4, u16) = x_ptr[x_base + d + 4 ..][0..LANES].*;
+                const x2: @Vector(4, u16) = x_ptr[x_base + d + 8 ..][0..LANES].*;
+                const x3: @Vector(4, u16) = x_ptr[x_base + d + 12 ..][0..LANES].*;
+                const w0: @Vector(4, u16) = w_ptr[w_base + d ..][0..LANES].*;
+                const w1: @Vector(4, u16) = w_ptr[w_base + d + 4 ..][0..LANES].*;
+                const w2: @Vector(4, u16) = w_ptr[w_base + d + 8 ..][0..LANES].*;
+                const w3: @Vector(4, u16) = w_ptr[w_base + d + 12 ..][0..LANES].*;
+                a0 += bf16x4ToF32x4(x0) * bf16x4ToF32x4(w0);
+                a1 += bf16x4ToF32x4(x1) * bf16x4ToF32x4(w1);
+                a2 += bf16x4ToF32x4(x2) * bf16x4ToF32x4(w2);
+                a3 += bf16x4ToF32x4(x3) * bf16x4ToF32x4(w3);
+            }
+
+            // 4-lane tail: keep using the same accumulators so the tail
+            // doesn't synchronise the pipeline.
             while (d + LANES <= Dz) : (d += LANES) {
                 const xu: @Vector(4, u16) = x_ptr[x_base + d ..][0..LANES].*;
                 const wu: @Vector(4, u16) = w_ptr[w_base + d ..][0..LANES].*;
-                const prod: @Vector(4, f32) = bf16x4ToF32x4(xu) * bf16x4ToF32x4(wu);
-                acc += prod[0];
-                acc += prod[1];
-                acc += prod[2];
-                acc += prod[3];
+                a0 += bf16x4ToF32x4(xu) * bf16x4ToF32x4(wu);
             }
 
             // Scalar tail for D not divisible by 4.
+            const combined: @Vector(4, f32) = (a0 + a1) + (a2 + a3);
+            var acc: f32 = combined[0] + combined[1] + combined[2] + combined[3];
             while (d < Dz) : (d += 1) {
                 acc += bf16ToF32(x_ptr[x_base + d]) * bf16ToF32(w_ptr[w_base + d]);
             }
@@ -495,6 +520,32 @@ inline fn fp16ToF32(bits: u16) f32 {
     return @floatCast(h);
 }
 
+/// Decode 32 int4 values at `block_d` of row `w_int4_row` into eight
+/// `@Vector(4, f32)` chunks covering the block's 32 lanes.
+/// Reused by both the TR=4 tiled path and the T-tail.
+inline fn int4BlockDecode(w_int4_row: [*]const u8, block_d: usize) [8]@Vector(4, f32) {
+    const packed_u: @Vector(16, u8) = w_int4_row[block_d / 2 ..][0..16].*;
+    const packed_i: @Vector(16, i8) = @bitCast(packed_u);
+    const lo: @Vector(16, i8) = (packed_i << @splat(4)) >> @splat(4);
+    const hi: @Vector(16, i8) = packed_i >> @splat(4);
+    var out: [8]@Vector(4, f32) = undefined;
+    inline for (0..8) |chunk| {
+        // Lane `chunk * 4 + c` in block corresponds to nibble `c` of
+        // byte `chunk * 2 + c/2` if c is even, or the hi nibble if odd.
+        const base_byte = chunk * 2;
+        const slice: @Vector(4, i8) = @shuffle(
+            i8, lo, hi,
+            @Vector(4, i32){
+                base_byte,          ~@as(i32, base_byte),
+                base_byte + 1,      ~@as(i32, base_byte + 1),
+            },
+        );
+        const widened: @Vector(4, i32) = slice;
+        out[chunk] = @floatFromInt(widened);
+    }
+    return out;
+}
+
 export fn matmul_bf16_x_int4block(
     x_ptr: [*]const u16,   // bf16 [T, D]
     w_ptr: [*]const u8,    // packed [N, D/2] int4 followed by [N, D/32] fp16
@@ -508,16 +559,89 @@ export fn matmul_bf16_x_int4block(
     const Nz: usize = N;
     const Dz: usize = D;
     const BLOCK: usize = 32;
-    const LANES: usize = 4;
+    const TR: usize = 4;
 
     const w_int4_stride: usize = Dz / 2;
     const w_scale_stride: usize = Dz / BLOCK;
     const scales_base: [*]const u16 = @ptrCast(@alignCast(w_ptr + Nz * w_int4_stride));
 
-    var t: usize = 0;
-    while (t < Tz) : (t += 1) {
-        const x_base = t * Dz;
-        const out_base = t * Nz;
+    // TR-tiled T loop: amortize int4 decode across 4 rows of X that
+    // share the same W row. Trailing 0..3 rows run through the scalar
+    // tail below.
+    var tt: usize = 0;
+    while (tt + TR <= Tz) : (tt += TR) {
+        var n: usize = 0;
+        while (n < Nz) : (n += 1) {
+            const w_int4_row = w_ptr + n * w_int4_stride;
+            const w_scale_row = scales_base + n * w_scale_stride;
+
+            var acc0: f32 = 0.0;
+            var acc1: f32 = 0.0;
+            var acc2: f32 = 0.0;
+            var acc3: f32 = 0.0;
+            var b: usize = 0;
+            while (b < w_scale_stride) : (b += 1) {
+                const scale = fp16ToF32(w_scale_row[b]);
+                const block_d = b * BLOCK;
+
+                // Decode the block's 32 int4 values once; reuse across 4 T rows.
+                const q_chunks: [8]@Vector(4, f32) = int4BlockDecode(w_int4_row, block_d);
+
+                // One vector accumulator per T row (×2 for ILP).
+                var v00: @Vector(4, f32) = @splat(0);
+                var v01: @Vector(4, f32) = @splat(0);
+                var v10: @Vector(4, f32) = @splat(0);
+                var v11: @Vector(4, f32) = @splat(0);
+                var v20: @Vector(4, f32) = @splat(0);
+                var v21: @Vector(4, f32) = @splat(0);
+                var v30: @Vector(4, f32) = @splat(0);
+                var v31: @Vector(4, f32) = @splat(0);
+
+                inline for (0..4) |k| {
+                    const j = k * 8;
+                    const qf0 = q_chunks[k * 2];
+                    const qf1 = q_chunks[k * 2 + 1];
+                    const x0_0: @Vector(4, u16) = x_ptr[(tt + 0) * Dz + block_d + j ..][0..4].*;
+                    const x0_1: @Vector(4, u16) = x_ptr[(tt + 0) * Dz + block_d + j + 4 ..][0..4].*;
+                    const x1_0: @Vector(4, u16) = x_ptr[(tt + 1) * Dz + block_d + j ..][0..4].*;
+                    const x1_1: @Vector(4, u16) = x_ptr[(tt + 1) * Dz + block_d + j + 4 ..][0..4].*;
+                    const x2_0: @Vector(4, u16) = x_ptr[(tt + 2) * Dz + block_d + j ..][0..4].*;
+                    const x2_1: @Vector(4, u16) = x_ptr[(tt + 2) * Dz + block_d + j + 4 ..][0..4].*;
+                    const x3_0: @Vector(4, u16) = x_ptr[(tt + 3) * Dz + block_d + j ..][0..4].*;
+                    const x3_1: @Vector(4, u16) = x_ptr[(tt + 3) * Dz + block_d + j + 4 ..][0..4].*;
+                    v00 += bf16x4ToF32x4(x0_0) * qf0;
+                    v01 += bf16x4ToF32x4(x0_1) * qf1;
+                    v10 += bf16x4ToF32x4(x1_0) * qf0;
+                    v11 += bf16x4ToF32x4(x1_1) * qf1;
+                    v20 += bf16x4ToF32x4(x2_0) * qf0;
+                    v21 += bf16x4ToF32x4(x2_1) * qf1;
+                    v30 += bf16x4ToF32x4(x3_0) * qf0;
+                    v31 += bf16x4ToF32x4(x3_1) * qf1;
+                }
+
+                const c0 = v00 + v01;
+                const c1 = v10 + v11;
+                const c2 = v20 + v21;
+                const c3 = v30 + v31;
+                acc0 += ((c0[0] + c0[1]) + (c0[2] + c0[3])) * scale;
+                acc1 += ((c1[0] + c1[1]) + (c1[2] + c1[3])) * scale;
+                acc2 += ((c2[0] + c2[1]) + (c2[2] + c2[3])) * scale;
+                acc3 += ((c3[0] + c3[1]) + (c3[2] + c3[3])) * scale;
+            }
+
+            const b_val = bf16ToF32(bias_ptr[n]);
+            out_ptr[(tt + 0) * Nz + n] = f32ToBf16(acc0 + b_val);
+            out_ptr[(tt + 1) * Nz + n] = f32ToBf16(acc1 + b_val);
+            out_ptr[(tt + 2) * Nz + n] = f32ToBf16(acc2 + b_val);
+            out_ptr[(tt + 3) * Nz + n] = f32ToBf16(acc3 + b_val);
+        }
+    }
+
+    // T tail for T not divisible by 4. One row at a time, same decode
+    // pattern without the cross-row amortization.
+    while (tt < Tz) : (tt += 1) {
+        const x_base = tt * Dz;
+        const out_base = tt * Nz;
 
         var n: usize = 0;
         while (n < Nz) : (n += 1) {
@@ -529,19 +653,20 @@ export fn matmul_bf16_x_int4block(
             while (b < w_scale_stride) : (b += 1) {
                 const scale = fp16ToF32(w_scale_row[b]);
                 const block_d = b * BLOCK;
+                const q_chunks = int4BlockDecode(w_int4_row, block_d);
 
-                var block_sum: f32 = 0.0;
-                var j: usize = 0;
-                while (j < BLOCK) : (j += LANES) {
-                    const xu: @Vector(4, u16) = x_ptr[x_base + block_d + j ..][0..LANES].*;
-                    const xf: @Vector(4, f32) = bf16x4ToF32x4(xu);
-                    const qf: @Vector(4, f32) = int4x4LoadF32(w_int4_row, block_d + j);
-                    const prod: @Vector(4, f32) = xf * qf;
-                    block_sum += prod[0];
-                    block_sum += prod[1];
-                    block_sum += prod[2];
-                    block_sum += prod[3];
+                var a0: @Vector(4, f32) = @splat(0);
+                var a1: @Vector(4, f32) = @splat(0);
+                inline for (0..4) |k| {
+                    const j = k * 8;
+                    const xu0: @Vector(4, u16) = x_ptr[x_base + block_d + j ..][0..4].*;
+                    const xu1: @Vector(4, u16) = x_ptr[x_base + block_d + j + 4 ..][0..4].*;
+                    a0 += bf16x4ToF32x4(xu0) * q_chunks[k * 2];
+                    a1 += bf16x4ToF32x4(xu1) * q_chunks[k * 2 + 1];
                 }
+                const combined: @Vector(4, f32) = a0 + a1;
+                const block_sum: f32 =
+                    (combined[0] + combined[1]) + (combined[2] + combined[3]);
                 acc += block_sum * scale;
             }
 

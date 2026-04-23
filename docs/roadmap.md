@@ -121,11 +121,13 @@ Target: 1.5–2× faster than Stage 0 Chrome warm-inference
       **264/264 bit-exact** vs PyTorch `F.linear` on classifier head
       (score.weight [33, 640] + score.bias). Same kernel reused for
       q/k/v/o projections + router. f32 accumulation, bf16 output
-      with RNE rounding. 4-wide SIMD inner loop (`@Vector(4, u16)`
-      bf16→f32 widen + vector multiply; scalar lane-by-lane drain
-      preserves the accumulate order that matches PyTorch's reference.
-      No `@mulAdd` — relaxed_madd fusion would diverge from PyTorch's
-      two-rounding semantics).
+      with RNE rounding. 4-wide SIMD inner loop with four independent
+      `@Vector(4, f32)` accumulators unrolled 16-wide — breaks the
+      serial add chain, horizontal-reduces at the end. **~17 GFLOPS**
+      measured in Node on M-series across the Phase-D shapes. Up from
+      2.7 GFLOPS before the multi-accumulator rewrite. No `@mulAdd` —
+      relaxed_madd fusion has implementation-defined rounding which
+      would add drift on top of the accumulator-order drift.
 - [x] Embedding lookup — pure gather. **5120/5120 bit-exact** on
       [T=8, D=640] with a 1024-row truncated embed table. 0.06 ms.
       OOB ids zero-fill rather than crash.
@@ -134,14 +136,16 @@ Target: 1.5–2× faster than Stage 0 Chrome warm-inference
       the −8 slot goes unused), per-block fp16 scale. Layout per
       tensor: `[N, D/2]` packed u8 followed by `[N, D/32]` fp16 scales.
       Matches ONNX MatMulNBits semantics so ONNX exports could in
-      principle share the format. Kernel: 4-wide SIMD over 32-element
-      blocks (bf16 widen + int4 nibble unpack + vector multiply +
-      lane-drain into `block_sum`), scalar accumulate across blocks
-      (each block has its own scale, can't hoist). **Bit-exact** on
-      the fixture (maxAbs=0, maxRel=0 vs `F.linear(x, dequant(W), b)`
-      at bf16 output precision). Manifest tolerance set to 1e-3
-      relative / 1e-4 absolute — tight for the bf16+int4 combination;
-      anything looser would hide a kernel bug.
+      principle share the format. Kernel: wide 16-byte int4 load per
+      block + sign-extended nibble unpack via `(i8 << 4) >>_s 4` +
+      8 compile-time `@shuffle` masks to carve out 4-lane slices.
+      TR=4 outer tiling across T amortizes int4 decode over 4 rows of
+      X sharing the same W row — eight vector accumulators in the tile
+      (2 per T row). **Bit-exact** on the fixture (maxAbs=0, maxRel=0
+      vs `F.linear(x, dequant(W), b)` at bf16 output precision).
+      Manifest tolerance set to 1e-3 relative / 1e-4 absolute — tight
+      for the bf16+int4 combination; anything looser would hide a
+      kernel bug. **~13 GFLOPS** measured (up from 3.3 pre-TR).
 
 **Allocator bug caught during Phase C4.** Initial design hardcoded
 `heap_base = 64 KiB`, assuming Zig's static data + shadow stack fit

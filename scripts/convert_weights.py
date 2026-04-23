@@ -345,11 +345,17 @@ def main() -> int:
         t = state_dict[name]
         print(f"  {name:60s} shape={tuple(t.shape)} dtype={t.dtype}", file=sys.stderr)
 
-    # Expert truncation: slice 3D MoE tensors along dim 0 to first N experts.
+    # Expert truncation: slice MoE tensors along dim 0 to first N experts.
+    # Covers both the 3-D expert weight tensors (`mlp.experts.*`) AND the
+    # 2-D / 1-D router parameters (`mlp.router.*`). The router's output
+    # dimension MUST match the blob's expert count — otherwise the router
+    # emits indices that our blob can't serve.
     if args.expert_keep > 0:
         state_dict = dict(state_dict)
         for n_name in names:
-            if "mlp.experts." in n_name and state_dict[n_name].dim() >= 2:
+            is_expert = "mlp.experts." in n_name and state_dict[n_name].dim() >= 2
+            is_router = "mlp.router." in n_name and state_dict[n_name].dim() >= 1
+            if is_expert or is_router:
                 t = state_dict[n_name]
                 if t.shape[0] > args.expert_keep:
                     state_dict[n_name] = t[: args.expert_keep].contiguous()

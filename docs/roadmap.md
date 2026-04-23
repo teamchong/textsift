@@ -166,7 +166,7 @@ baselines and blocks on regression. Zig unit tests for pure helpers
 `wasm-opt -O3` pass under `npm run build:opt`. WASM module is
 ~3.4 KB with the SIMD matmul.
 
-### Phase D — attention + MoE (biggest)
+### Phase D — attention + MoE (done)
 
 - [x] Rotary embeddings with yarn scaling (`rope_type: "yarn"`).
       `src/js/inference/rope.ts` computes inv_freq (NTK-by-parts ramp
@@ -177,10 +177,28 @@ baselines and blocks on regression. Zig unit tests for pure helpers
       semantics (upcast → mul → round → upcast → combine → round),
       which is noisier than a single-rounding chain but bit-exact
       against the reference.
-- [ ] GQA attention with banded/sliding window (14 query heads,
-      2 KV heads, window 128).
-- [ ] MoE router (top-4 of 128 experts per token) + sparse expert
-      dispatch.
+- [x] GQA attention with banded/sliding window (14 query heads,
+      2 KV heads, window 128). `banded_attention` kernel scores only
+      cells inside `[i−128, i+128]` (O(T·window), not O(T²));
+      attention sinks folded into softmax before AV combine.
+      `attention_forward` TS composition wires Q/K/V projections
+      + RoPE + `head_dim^-0.25` scale + banded attention + O proj.
+      Parity maxAbs 0.25, rms 0.01 vs real layer-0 weights.
+- [x] MoE router + sparse expert dispatch. `matmul_bf16_out_f32`
+      for fp32 router logits, `topk_partial_f32`, `softmax_f32`.
+      Expert dispatch is expert-major: inverts routing, batches
+      tokens per expert, runs int4 matmul (bf16 x → int4 W → f32 out)
+      → SwiGLU-with-clamp → int4 matmul (f32 x → int4 W → f32 out),
+      scatter-adds weighted into an f32 accumulator, scales by
+      `num_experts_per_tok` and rounds to bf16. Parity maxRel 7e-3.
+- [x] Block + model forward composition. `blockForward` stitches
+      norm + attn + residual + norm + MLP + residual. `modelForward`
+      runs embed + N blocks (ping-pong buffers) + final norm +
+      classifier head. `WasmBackend.forward` wires this into the
+      public `InferenceBackend` contract with auto-detected layer
+      count and expert count. `selectBackend({ backend: "wasm",
+      wasmWeightsUrl })` reaches it. 1-layer-truncated e2e parity
+      vs PyTorch: rms 0.014 on final logits.
 
 ### Phase E — assembly + parity
 

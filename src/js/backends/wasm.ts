@@ -16,6 +16,8 @@ import type {
   InferenceBackend,
   Logits,
 } from "./abstract.js";
+import { modelForward, type ModelConfig, type ModelWeights } from "../inference/model.js";
+import type { BlockWeights } from "../inference/block.js";
 
 /** Exports declared in `src/zig/wasm_exports.zig`. Keep in sync. */
 export interface PiiWasmExports {
@@ -233,46 +235,177 @@ export async function loadWeights(
 
 const DEFAULT_WASM_URL = new URL("../../../dist/pii.wasm", import.meta.url);
 
+/**
+ * Privacy-filter architecture constants baked into the Stage-1 backend.
+ * Matches `openai/privacy-filter/config.json`. NUM_LAYERS and
+ * numExperts/numExpertsInBlob are auto-detected from the loaded blob
+ * so test fixtures with truncated layers/experts work through the same
+ * code path as production.
+ */
+const PF_CONFIG: Omit<ModelConfig, "vocabSize" | "numExperts" | "numExpertsInBlob"> = {
+  hiddenSize: 640,
+  numHeads: 14,
+  numKvHeads: 2,
+  headDim: 64,
+  slidingWindow: 128,
+  intermediateSize: 640,
+  numExpertsPerTok: 4,
+  rmsNormEps: 1e-5,
+  numClasses: 33,
+  rope: {
+    headDim: 64,
+    theta: 150000.0,
+    factor: 32.0,
+    originalMaxPositionEmbeddings: 4096,
+    betaFast: 32.0,
+    betaSlow: 1.0,
+    truncate: false,
+  },
+};
+
+export interface WasmBackendOptions extends BackendConstructionOptions {
+  /** URL or path to the `pii-weights.bin` blob produced by `scripts/convert_weights.py`. */
+  weightsUrl: string | URL;
+  /** Optional sha256 for integrity check. */
+  weightsSha256?: string;
+}
+
+function weightByName(map: ReadonlyMap<string, WeightTensorInfo>, name: string): WeightTensorInfo {
+  const t = map.get(name);
+  if (!t) throw new Error(`WasmBackend: missing weight "${name}"`);
+  return t;
+}
+
+function detectNumLayers(map: ReadonlyMap<string, WeightTensorInfo>): number {
+  let max = -1;
+  for (const name of map.keys()) {
+    const m = /^model\.layers\.(\d+)\./.exec(name);
+    if (m) max = Math.max(max, Number.parseInt(m[1]!, 10));
+  }
+  if (max < 0) throw new Error("WasmBackend: no model.layers.* tensors in blob");
+  return max + 1;
+}
+
+function buildModelWeights(
+  map: ReadonlyMap<string, WeightTensorInfo>,
+  numLayers: number,
+): ModelWeights {
+  const blocks: BlockWeights[] = [];
+  for (let L = 0; L < numLayers; L++) {
+    const p = `model.layers.${L}.`;
+    blocks.push({
+      inputLayernorm: weightByName(map, `${p}input_layernorm.weight`),
+      postAttentionLayernorm: weightByName(map, `${p}post_attention_layernorm.weight`),
+      attn: {
+        qProj: weightByName(map, `${p}self_attn.q_proj.weight`),
+        qProjBias: weightByName(map, `${p}self_attn.q_proj.bias`),
+        kProj: weightByName(map, `${p}self_attn.k_proj.weight`),
+        kProjBias: weightByName(map, `${p}self_attn.k_proj.bias`),
+        vProj: weightByName(map, `${p}self_attn.v_proj.weight`),
+        vProjBias: weightByName(map, `${p}self_attn.v_proj.bias`),
+        oProj: weightByName(map, `${p}self_attn.o_proj.weight`),
+        oProjBias: weightByName(map, `${p}self_attn.o_proj.bias`),
+        sinks: weightByName(map, `${p}self_attn.sinks`),
+      },
+      routerW: weightByName(map, `${p}mlp.router.weight`),
+      routerB: weightByName(map, `${p}mlp.router.bias`),
+      experts: {
+        gateUp: weightByName(map, `${p}mlp.experts.gate_up_proj`),
+        gateUpBias: weightByName(map, `${p}mlp.experts.gate_up_proj_bias`),
+        down: weightByName(map, `${p}mlp.experts.down_proj`),
+        downBias: weightByName(map, `${p}mlp.experts.down_proj_bias`),
+      },
+    });
+  }
+  return {
+    embedTokens: weightByName(map, "model.embed_tokens.weight"),
+    blocks,
+    finalLayernorm: weightByName(map, "model.norm.weight"),
+    classifierW: weightByName(map, "score.weight"),
+    classifierB: weightByName(map, "score.bias"),
+  };
+}
+
 export class WasmBackend implements InferenceBackend {
   readonly name = "wasm" as const;
   private wasm: PiiWasmExports | null = null;
-  private readonly opts: BackendConstructionOptions;
+  private weightMap: Map<string, WeightTensorInfo> | null = null;
+  private modelWeights: ModelWeights | null = null;
+  private numExpertsInBlob = 0;
+  private readonly opts: WasmBackendOptions;
 
-  constructor(opts: BackendConstructionOptions) {
+  constructor(opts: WasmBackendOptions) {
     this.opts = opts;
   }
 
   async warmup(): Promise<void> {
     this.wasm = await loadPiiWasm(DEFAULT_WASM_URL);
 
-    // Plumbing smoke-test: confirm ABI round-trip works before any real
-    // compute. If this ever fires, the module we loaded doesn't match
-    // the interface in `wasm_exports.zig`.
     const echoed = this.wasm.echo(42);
     if (echoed !== 42) {
       throw new Error(`WasmBackend: echo round-trip returned ${echoed}, expected 42`);
     }
+
+    const tensors = await loadWeights(this.wasm, this.opts.weightsUrl, this.opts.weightsSha256);
+    this.weightMap = new Map(tensors.map((t) => [t.name, t]));
+    const numLayers = detectNumLayers(this.weightMap);
+    this.modelWeights = buildModelWeights(this.weightMap, numLayers);
+    // numExperts (the router's output size) comes from the router weight's
+    // first dim. Truncated test blobs have < 128 experts; full blobs 128.
+    this.numExpertsInBlob = this.modelWeights.blocks[0]!.routerW.shape[0]!;
   }
 
   async forward(
-    _tokenIds: Int32Array,
+    tokenIds: Int32Array,
     _attentionMask: Uint8Array,
   ): Promise<Logits> {
-    // Phase A: no kernels yet. Weight loading is Phase B; RMSNorm + int4
-    // matmul are Phase C; attention + MoE are Phase D. Until those land
-    // this backend exists only so the build pipeline + JS bridge are
-    // exercised end-to-end.
-    throw new Error(
-      "WasmBackend.forward is not implemented yet — Stage 1 kernels are pending. "
-        + "Use the default `backend: \"auto\"` (transformers.js) until Stage 1 ships.",
-    );
+    if (!this.wasm || !this.modelWeights) {
+      throw new Error("WasmBackend: call warmup() before forward()");
+    }
+    const wasm = this.wasm;
+    const T = tokenIds.length;
+    const vocabSize = this.modelWeights.embedTokens.shape[0]!;
+
+    const idsBytes = T * 4;
+    const logitsBytes = T * PF_CONFIG.numClasses * 2;
+    const idsPtr = wasm.alloc(idsBytes);
+    const logitsPtr = wasm.alloc(logitsBytes);
+    if (idsPtr === 0 || logitsPtr === 0) {
+      throw new Error("WasmBackend.forward: alloc OOM for inputs/outputs");
+    }
+    new Int32Array(wasm.memory.buffer, idsPtr, T).set(tokenIds);
+
+    modelForward(wasm, idsPtr, logitsPtr, this.modelWeights, {
+      ...PF_CONFIG,
+      vocabSize,
+      numExperts: this.numExpertsInBlob,
+      numExpertsInBlob: this.numExpertsInBlob,
+    }, T);
+
+    // Upcast bf16 → f32 for the backend contract.
+    const bf16View = new Uint16Array(wasm.memory.buffer, logitsPtr, T * PF_CONFIG.numClasses);
+    const f32 = new Float32Array(bf16View.length);
+    const tmp = new ArrayBuffer(4);
+    const tmpU32 = new Uint32Array(tmp);
+    const tmpF32 = new Float32Array(tmp);
+    for (let i = 0; i < bf16View.length; i++) {
+      tmpU32[0] = bf16View[i]! << 16;
+      f32[i] = tmpF32[0]!;
+    }
+
+    wasm.reset();
+
+    return {
+      data: f32,
+      sequenceLength: T,
+      numClasses: PF_CONFIG.numClasses,
+    };
   }
 
   dispose(): void {
-    // WebAssembly.Memory is GC'd once the instance is unreferenced; no
-    // explicit free is required. Reset the bump heap to drop per-call
-    // scratch.
     this.wasm?.reset();
     this.wasm = null;
+    this.weightMap = null;
+    this.modelWeights = null;
   }
 }

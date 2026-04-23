@@ -168,8 +168,15 @@ baselines and blocks on regression. Zig unit tests for pure helpers
 
 ### Phase D — attention + MoE (biggest)
 
-- [ ] Rotary embeddings with yarn scaling (`rope_type: "yarn"` in
-      the upstream config).
+- [x] Rotary embeddings with yarn scaling (`rope_type: "yarn"`).
+      `src/js/inference/rope.ts` computes inv_freq (NTK-by-parts ramp
+      between interpolation and extrapolation) + attention_scaling
+      (`0.1·log(factor)+1`) + cos/sin tables as bf16 — bit-identical
+      to PyTorch's layer output. `rope_apply` in Zig does the
+      interleaved rotation using PyTorch's eager 3-rounding bf16
+      semantics (upcast → mul → round → upcast → combine → round),
+      which is noisier than a single-rounding chain but bit-exact
+      against the reference.
 - [ ] GQA attention with banded/sliding window (14 query heads,
       2 KV heads, window 128).
 - [ ] MoE router (top-4 of 128 experts per token) + sparse expert

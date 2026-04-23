@@ -134,6 +134,41 @@ def main() -> int:
     write(FIXTURES_DIR / "embed_ids.i32", ids.numpy().tobytes())
     write(FIXTURES_DIR / "embed_out.bf16", bf16_bytes(y_embed))
 
+    # ----- RoPE yarn apply fixture -----
+    #
+    # Runs the upstream `OpenAIPrivacyFilterRotaryEmbedding` layer once
+    # to get cos/sin tables with yarn scaling + attention_factor baked
+    # in, then applies `_apply_rotary_emb` for the expected output.
+    from transformers.models.openai_privacy_filter.modeling_openai_privacy_filter import (
+        OpenAIPrivacyFilterRotaryEmbedding,
+        _apply_rotary_emb,
+    )
+    rope_layer = OpenAIPrivacyFilterRotaryEmbedding(model.config)
+    position_ids = torch.arange(T, dtype=torch.long).unsqueeze(0)
+    dummy = torch.empty(1, T, model.config.hidden_size, dtype=torch.bfloat16)
+    cos_full, sin_full = rope_layer(dummy, position_ids)         # each: [1, T, head_dim/2], bf16
+    # Layer already downcasts to the input dtype (bf16). Store bytes directly
+    # so there's no f32 ↔ bf16 round-trip ambiguity.
+    cos_bf = cos_full.squeeze(0).contiguous()                    # bf16 [T, head_dim/2]
+    sin_bf = sin_full.squeeze(0).contiguous()
+
+    torch.manual_seed(SEED + 4)
+    H = model.config.num_attention_heads
+    head_dim = model.config.head_dim
+    q_in = torch.randn(T, H, head_dim, dtype=torch.bfloat16)
+
+    # Reference expects (batch, num_heads, seq, head_dim); cos/sin (batch, 1, seq, head_dim/2).
+    q_b = q_in.unsqueeze(0).transpose(1, 2).contiguous()
+    cos_b = cos_bf.unsqueeze(0).unsqueeze(1)
+    sin_b = sin_bf.unsqueeze(0).unsqueeze(1)
+    q_ref = _apply_rotary_emb(q_b, cos_b, sin_b)
+    q_out = q_ref.squeeze(0).transpose(0, 1).contiguous()         # [T, H, head_dim]
+
+    write(FIXTURES_DIR / "rope_qk_in.bf16", bf16_bytes(q_in))
+    write(FIXTURES_DIR / "rope_cos.bf16", bf16_bytes(cos_bf))
+    write(FIXTURES_DIR / "rope_sin.bf16", bf16_bytes(sin_bf))
+    write(FIXTURES_DIR / "rope_qk_out.bf16", bf16_bytes(q_out.to(torch.bfloat16)))
+
     # ----- 5. Int4-blockwise matmul fixture (quantized score.weight) -----
     torch.manual_seed(SEED + 3)
     x_i4 = torch.randn(T, D, dtype=torch.bfloat16)

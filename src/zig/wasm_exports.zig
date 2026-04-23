@@ -677,6 +677,76 @@ export fn matmul_bf16_x_int4block(
 }
 
 // --------------------------------------------------------------
+// Kernel: RoPE apply (interleaved layout)
+// --------------------------------------------------------------
+//
+// Applies rotary position embedding in-place to an already-projected
+// Q or K tensor. The privacy-filter layout is "interleaved pairs":
+// for each head's head_dim-wide vector `x`, pair (x[2p], x[2p+1]) is
+// rotated by angle `theta_{t,p}`, with cos/sin tables precomputed
+// by the JS caller (yarn scaling + mscale folded into cos/sin).
+//
+//   for each (t, h, p):
+//     c = cos[t, p]
+//     s = sin[t, p]
+//     a = x[t, h, 2p]
+//     b = x[t, h, 2p+1]
+//     x[t, h, 2p]   = a*c - b*s
+//     x[t, h, 2p+1] = b*c + a*s
+//
+// qk:   bf16 [T, H, head_dim]          row-major, in-place
+// cos:  bf16 [T, head_dim/2]            yarn's mscale already baked in
+// sin:  bf16 [T, head_dim/2]
+//
+// cos/sin are bf16 because that's what the upstream layer returns (it
+// downcasts its f32 compute to the caller's dtype, which is bf16 in
+// Phase D). Widened to f32 inside the kernel for the rotation math.
+
+export fn rope_apply(
+    qk_ptr: [*]u16,
+    cos_ptr: [*]const u16,
+    sin_ptr: [*]const u16,
+    T: u32,
+    H: u32,
+    head_dim: u32,
+) void {
+    const Tz: usize = T;
+    const Hz: usize = H;
+    const Dz: usize = head_dim;
+    const HalfDz: usize = Dz / 2;
+
+    var t: usize = 0;
+    while (t < Tz) : (t += 1) {
+        const cos_row: [*]const u16 = cos_ptr + t * HalfDz;
+        const sin_row: [*]const u16 = sin_ptr + t * HalfDz;
+
+        var h: usize = 0;
+        while (h < Hz) : (h += 1) {
+            const head_base: usize = (t * Hz + h) * Dz;
+
+            var p: usize = 0;
+            while (p < HalfDz) : (p += 1) {
+                const c = bf16ToF32(cos_row[p]);
+                const s = bf16ToF32(sin_row[p]);
+                const a = bf16ToF32(qk_ptr[head_base + 2 * p]);
+                const b = bf16ToF32(qk_ptr[head_base + 2 * p + 1]);
+                // PyTorch eager bf16 arithmetic rounds between every op:
+                // upcast → mul → round to bf16 → upcast → combine → round.
+                // Three roundings total per lane, which produces bit-identical
+                // output vs the reference but is slightly noisier than a
+                // single-rounding f32 chain.
+                const ac = bf16ToF32(f32ToBf16(a * c));
+                const bs = bf16ToF32(f32ToBf16(b * s));
+                const bc = bf16ToF32(f32ToBf16(b * c));
+                const as_ = bf16ToF32(f32ToBf16(a * s));
+                qk_ptr[head_base + 2 * p] = f32ToBf16(ac - bs);
+                qk_ptr[head_base + 2 * p + 1] = f32ToBf16(bc + as_);
+            }
+        }
+    }
+}
+
+// --------------------------------------------------------------
 // Kernel: embedding lookup
 // --------------------------------------------------------------
 //

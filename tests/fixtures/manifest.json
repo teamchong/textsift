@@ -49,6 +49,18 @@
       "rel_tol": 1e-3,
       "abs_tol": 1e-4,
       "note": "bf16 output of an fp32 matmul over dequantized int4 (block 32, sym, fp16 scale). Expected bounded by bf16 ULP (~4e-3 rel for unit-ish values) plus int4 quant error; 1e-3 rel is tight for this combo."
+    },
+    {
+      "name": "rope_apply",
+      "qk_in": "rope_qk_in.bf16",
+      "cos": "rope_cos.bf16",
+      "sin": "rope_sin.bf16",
+      "expected": "rope_qk_out.bf16",
+      "T": 8,
+      "H": 14,
+      "head_dim": 64,
+      "baseline_matches": 7168,
+      "baseline_total": 7168
     }
   ]
 }

@@ -188,6 +188,18 @@ async function runEmbed(ex, weights, spec) {
   return compareU16(ex, outPtr, expected);
 }
 
+async function runRopeApply(ex, _weights, spec) {
+  const qkIn = await loadFixture(spec.qk_in);
+  const cos = await loadFixture(spec.cos);
+  const sin = await loadFixture(spec.sin);
+  const expected = await loadFixture(spec.expected);
+  const qkPtr = allocAndCopy(ex, qkIn);
+  const cosPtr = allocAndCopy(ex, cos);
+  const sinPtr = allocAndCopy(ex, sin);
+  ex.rope_apply(qkPtr, cosPtr, sinPtr, spec.T, spec.H, spec.head_dim);
+  return compareU16(ex, qkPtr, expected);
+}
+
 async function runMatmulInt4(ex, _weights, spec) {
   // int4 matmul uses a standalone packed-weight fixture rather than a
   // tensor from the weight blob, because our blob only carries bf16 of
@@ -216,6 +228,7 @@ const RUNNERS = {
   matmul_bf16: runMatmul,
   embed_lookup: runEmbed,
   matmul_bf16_x_int4block: runMatmulInt4,
+  rope_apply: runRopeApply,
 };
 
 async function main() {

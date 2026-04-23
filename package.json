@@ -44,6 +44,7 @@
     "test": "bun x playwright test",
     "test:zig": "mise exec -- zig test src/zig/math.zig",
     "verify:kernels": "node scripts/verify-kernels.mjs",
+    "verify:rope": "bun scripts/verify-rope-precompute.mjs",
     "bench:kernels": "node scripts/bench-kernels.mjs",
     "gen:fixtures": "python3 scripts/gen-kernel-fixtures.py",
     "measure:experts": "python3 scripts/measure-experts.py",

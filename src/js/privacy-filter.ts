@@ -201,6 +201,7 @@ export class PrivacyFilter {
         backend: wantsStage1 ? "wasm" : "transformers-js",
         wasmWeightsUrl: this.opts.wasmWeightsUrl,
         wasmWeightsSha256: this.opts.wasmWeightsSha256,
+        wasmModuleUrl: this.opts.wasmModuleUrl,
       });
 
       progress?.({ stage: "warmup" });

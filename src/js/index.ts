@@ -16,6 +16,11 @@
 
 export { PrivacyFilter } from "./privacy-filter.js";
 
+// Advanced: direct backend access for tests + power users who want to
+// skip the tokenizer / chunking pipeline. Most consumers should use
+// `PrivacyFilter.create({ backend: "wasm", ... })` instead.
+export { WasmBackend } from "./backends/wasm.js";
+
 export type {
   CreateOptions,
   RedactOptions,

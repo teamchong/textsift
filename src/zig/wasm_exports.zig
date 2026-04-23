@@ -371,7 +371,7 @@ export fn rms_norm(
 //   out:  bf16 [T, N]
 //
 // Inner D-loop uses:
-//   (1) 4-wide SIMD bf16→f32 widen + vector multiply (see `bf16x4ToF32x4`).
+//   (1) 4-wide SIMD bf16→f32 widen (see `bf16x4ToF32x4`).
 //   (2) Four independent @Vector(4, f32) accumulators, each covering a
 //       separate 4-lane slice of D, unrolled 16-at-a-time. The four
 //       accumulators break the serial add dependency chain, giving the
@@ -383,9 +383,11 @@ export fn rms_norm(
 // used to ship. Parity contract is tolerance-based (rel_tol ≤ 1e-3 on
 // the bf16 output); see `tests/fixtures/manifest.json`.
 //
-// `@mulAdd` is deliberately avoided — relaxed_madd has
-// implementation-defined fusion, which would introduce further
-// engine-dependent drift on top of the accumulator-order drift.
+// `@mulAdd` was tried and reverted — Zig's wasm-freestanding codegen
+// has no hardware f32x4 FMA intrinsic, so it falls back to a scalar
+// software fma that runs ~6× slower than the separate-mul-add vector
+// form. `f32x4.relaxed_madd` would help here, but Zig has no builtin
+// for it yet; inline asm or a future compiler update is needed.
 
 export fn matmul_bf16(
     x_ptr: [*]const u16,
@@ -400,12 +402,89 @@ export fn matmul_bf16(
     const Nz: usize = N;
     const Dz: usize = D;
     const LANES: usize = 4;
-    const UNROLL: usize = 4; // 4 accumulators → 16 lanes per outer step
+    const TR: usize = 4;
 
-    var t: usize = 0;
-    while (t < Tz) : (t += 1) {
-        const x_base = t * Dz;
-        const out_base = t * Nz;
+    // TR-tiled T loop: amortize W row loads across 4 X rows. For each
+    // tile of 4 consecutive T rows, one pass over W gives us 4 outputs
+    // per n. Register footprint: TR × 2 accumulator vectors + 4 X
+    // loads/iter + 2 W loads/iter.
+    var tt: usize = 0;
+    while (tt + TR <= Tz) : (tt += TR) {
+        var n: usize = 0;
+        while (n < Nz) : (n += 1) {
+            const w_base = n * Dz;
+
+            var a00: @Vector(4, f32) = @splat(0);
+            var a01: @Vector(4, f32) = @splat(0);
+            var a10: @Vector(4, f32) = @splat(0);
+            var a11: @Vector(4, f32) = @splat(0);
+            var a20: @Vector(4, f32) = @splat(0);
+            var a21: @Vector(4, f32) = @splat(0);
+            var a30: @Vector(4, f32) = @splat(0);
+            var a31: @Vector(4, f32) = @splat(0);
+
+            const step: usize = LANES * 2; // 8-wide step, two accs per T row
+            var d: usize = 0;
+            while (d + step <= Dz) : (d += step) {
+                const w0 = bf16x4ToF32x4(w_ptr[w_base + d ..][0..LANES].*);
+                const w1 = bf16x4ToF32x4(w_ptr[w_base + d + 4 ..][0..LANES].*);
+                const x00 = bf16x4ToF32x4(x_ptr[(tt + 0) * Dz + d ..][0..LANES].*);
+                const x01 = bf16x4ToF32x4(x_ptr[(tt + 0) * Dz + d + 4 ..][0..LANES].*);
+                const x10 = bf16x4ToF32x4(x_ptr[(tt + 1) * Dz + d ..][0..LANES].*);
+                const x11 = bf16x4ToF32x4(x_ptr[(tt + 1) * Dz + d + 4 ..][0..LANES].*);
+                const x20 = bf16x4ToF32x4(x_ptr[(tt + 2) * Dz + d ..][0..LANES].*);
+                const x21 = bf16x4ToF32x4(x_ptr[(tt + 2) * Dz + d + 4 ..][0..LANES].*);
+                const x30 = bf16x4ToF32x4(x_ptr[(tt + 3) * Dz + d ..][0..LANES].*);
+                const x31 = bf16x4ToF32x4(x_ptr[(tt + 3) * Dz + d + 4 ..][0..LANES].*);
+                a00 += x00 * w0;
+                a01 += x01 * w1;
+                a10 += x10 * w0;
+                a11 += x11 * w1;
+                a20 += x20 * w0;
+                a21 += x21 * w1;
+                a30 += x30 * w0;
+                a31 += x31 * w1;
+            }
+
+            // 4-lane tail for the last step if D % 8 != 0.
+            while (d + LANES <= Dz) : (d += LANES) {
+                const w0 = bf16x4ToF32x4(w_ptr[w_base + d ..][0..LANES].*);
+                a00 += bf16x4ToF32x4(x_ptr[(tt + 0) * Dz + d ..][0..LANES].*) * w0;
+                a10 += bf16x4ToF32x4(x_ptr[(tt + 1) * Dz + d ..][0..LANES].*) * w0;
+                a20 += bf16x4ToF32x4(x_ptr[(tt + 2) * Dz + d ..][0..LANES].*) * w0;
+                a30 += bf16x4ToF32x4(x_ptr[(tt + 3) * Dz + d ..][0..LANES].*) * w0;
+            }
+
+            const c0 = a00 + a01;
+            const c1 = a10 + a11;
+            const c2 = a20 + a21;
+            const c3 = a30 + a31;
+            var acc0: f32 = (c0[0] + c0[1]) + (c0[2] + c0[3]);
+            var acc1: f32 = (c1[0] + c1[1]) + (c1[2] + c1[3]);
+            var acc2: f32 = (c2[0] + c2[1]) + (c2[2] + c2[3]);
+            var acc3: f32 = (c3[0] + c3[1]) + (c3[2] + c3[3]);
+
+            while (d < Dz) : (d += 1) {
+                const wv = bf16ToF32(w_ptr[w_base + d]);
+                acc0 += bf16ToF32(x_ptr[(tt + 0) * Dz + d]) * wv;
+                acc1 += bf16ToF32(x_ptr[(tt + 1) * Dz + d]) * wv;
+                acc2 += bf16ToF32(x_ptr[(tt + 2) * Dz + d]) * wv;
+                acc3 += bf16ToF32(x_ptr[(tt + 3) * Dz + d]) * wv;
+            }
+
+            const b_val = bf16ToF32(bias_ptr[n]);
+            out_ptr[(tt + 0) * Nz + n] = f32ToBf16(acc0 + b_val);
+            out_ptr[(tt + 1) * Nz + n] = f32ToBf16(acc1 + b_val);
+            out_ptr[(tt + 2) * Nz + n] = f32ToBf16(acc2 + b_val);
+            out_ptr[(tt + 3) * Nz + n] = f32ToBf16(acc3 + b_val);
+        }
+    }
+
+    // T tail for T not divisible by TR. Same structure as the old
+    // single-row path.
+    while (tt < Tz) : (tt += 1) {
+        const x_base = tt * Dz;
+        const out_base = tt * Nz;
 
         var n: usize = 0;
         while (n < Nz) : (n += 1) {
@@ -416,38 +495,27 @@ export fn matmul_bf16(
             var a2: @Vector(4, f32) = @splat(0);
             var a3: @Vector(4, f32) = @splat(0);
 
-            const step: usize = LANES * UNROLL; // 16
+            const step: usize = LANES * 4;
             var d: usize = 0;
             while (d + step <= Dz) : (d += step) {
-                const x0: @Vector(4, u16) = x_ptr[x_base + d ..][0..LANES].*;
-                const x1: @Vector(4, u16) = x_ptr[x_base + d + 4 ..][0..LANES].*;
-                const x2: @Vector(4, u16) = x_ptr[x_base + d + 8 ..][0..LANES].*;
-                const x3: @Vector(4, u16) = x_ptr[x_base + d + 12 ..][0..LANES].*;
-                const w0: @Vector(4, u16) = w_ptr[w_base + d ..][0..LANES].*;
-                const w1: @Vector(4, u16) = w_ptr[w_base + d + 4 ..][0..LANES].*;
-                const w2: @Vector(4, u16) = w_ptr[w_base + d + 8 ..][0..LANES].*;
-                const w3: @Vector(4, u16) = w_ptr[w_base + d + 12 ..][0..LANES].*;
-                a0 += bf16x4ToF32x4(x0) * bf16x4ToF32x4(w0);
-                a1 += bf16x4ToF32x4(x1) * bf16x4ToF32x4(w1);
-                a2 += bf16x4ToF32x4(x2) * bf16x4ToF32x4(w2);
-                a3 += bf16x4ToF32x4(x3) * bf16x4ToF32x4(w3);
+                a0 += bf16x4ToF32x4(x_ptr[x_base + d ..][0..LANES].*) *
+                    bf16x4ToF32x4(w_ptr[w_base + d ..][0..LANES].*);
+                a1 += bf16x4ToF32x4(x_ptr[x_base + d + 4 ..][0..LANES].*) *
+                    bf16x4ToF32x4(w_ptr[w_base + d + 4 ..][0..LANES].*);
+                a2 += bf16x4ToF32x4(x_ptr[x_base + d + 8 ..][0..LANES].*) *
+                    bf16x4ToF32x4(w_ptr[w_base + d + 8 ..][0..LANES].*);
+                a3 += bf16x4ToF32x4(x_ptr[x_base + d + 12 ..][0..LANES].*) *
+                    bf16x4ToF32x4(w_ptr[w_base + d + 12 ..][0..LANES].*);
             }
-
-            // 4-lane tail: keep using the same accumulators so the tail
-            // doesn't synchronise the pipeline.
             while (d + LANES <= Dz) : (d += LANES) {
-                const xu: @Vector(4, u16) = x_ptr[x_base + d ..][0..LANES].*;
-                const wu: @Vector(4, u16) = w_ptr[w_base + d ..][0..LANES].*;
-                a0 += bf16x4ToF32x4(xu) * bf16x4ToF32x4(wu);
+                a0 += bf16x4ToF32x4(x_ptr[x_base + d ..][0..LANES].*) *
+                    bf16x4ToF32x4(w_ptr[w_base + d ..][0..LANES].*);
             }
-
-            // Scalar tail for D not divisible by 4.
             const combined: @Vector(4, f32) = (a0 + a1) + (a2 + a3);
             var acc: f32 = combined[0] + combined[1] + combined[2] + combined[3];
             while (d < Dz) : (d += 1) {
                 acc += bf16ToF32(x_ptr[x_base + d]) * bf16ToF32(w_ptr[w_base + d]);
             }
-
             acc += bf16ToF32(bias_ptr[n]);
             out_ptr[out_base + n] = f32ToBf16(acc);
         }

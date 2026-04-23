@@ -118,6 +118,13 @@ export interface CreateOptions {
   wasmWeightsSha256?: string;
 
   /**
+   * Override the URL of the `pii.wasm` module. Defaults to a sibling of
+   * the bundled JS (`./pii.wasm`). Required when hosting the .wasm at
+   * a different path than the bundled entry point.
+   */
+  wasmModuleUrl?: string;
+
+  /**
    * Quantization level for the model weights. Defaults to `"int8"`, which
    * maps to `onnx/model_q4f16.onnx` (~772 MB) — the smallest ONNX export
    * in openai/privacy-filter that runs in a browser without OOM.  `"int4"`

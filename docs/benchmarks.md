@@ -74,18 +74,36 @@ transformers.js**, so the decision path is bit-equivalent in practice.
 ### What we measured internally
 
 Peak kernel throughput on the same hardware:
-- `matmul_bf16` (4 accumulators, 16-wide unroll): **~17 GFLOPS** across
-  Phase D shapes (classifier head, router, K/V, Q, O projections).
-- `matmul_bf16_x_int4block` (TR=4 tiled, wide-decode): **~13 GFLOPS**.
-- End-to-end 41-token warm forward: **321 ms** (blob + warmup amortized).
+- `matmul_bf16` (TR=4 outer tiling over T, 8 accumulators, 8-wide inner
+  unroll): **~23 GFLOPS** on T≥16 shapes (router, K/V, Q, O projections),
+  dropping to 8 GFLOPS on the classifier head (T=8, N=33 — small
+  workload dominated by tile-setup overhead, absolute time 40 µs).
+- `matmul_bf16_x_int4block` (TR=4 tiled, wide-decode, 8 accumulators):
+  **~13 GFLOPS**. Near-ceiling for this int4 structure — the
+  unpack+widen path adds ~2× ops/D-lane vs bf16, so 13 GFLOPS is
+  consistent with 60% of the bf16 peak.
+- End-to-end 41-token warm forward (full 944 MB blob, single layer):
+  **321 ms** (blob + warmup amortized).
 
 ### Remaining headroom
 
-- WASM SIMD128 peaks at ~25% of native peak on modern Apple cores. The
-  dominant matmul path is already in the 60-70% of WASM-SIMD-128 peak
-  window (estimated); further single-threaded gains would come from
-  `@mulAdd` (relaxed_madd), which trades bit-exact parity for ~1.5–2×.
+- `@mulAdd` / `f32x4.relaxed_madd`: Zig's wasm-freestanding target has
+  no vector-FMA builtin yet; `@mulAdd` on `@Vector(4, f32)` falls back
+  to a scalar software `__muladd` that runs ~6× slower than the
+  separate-mul-add vector form. Tried and reverted (2026-04-23). The
+  relaxed_madd intrinsic would likely give another 1.5–2× when it
+  lands in Zig.
 - WebGPU backend (Stage 2, deferred) would skip CPU entirely.
-- Multi-threaded WASM (SharedArrayBuffer + Atomics) isn't wired yet; the
-  kernels are thread-safe by construction (pure + output-disjoint), so
-  layer-parallel or expert-parallel scheduling is a future option.
+- Multi-threaded WASM (SharedArrayBuffer + Atomics) isn't wired yet.
+  Kernels are thread-safe by construction (pure reads + output-disjoint
+  writes), so layer-parallel or expert-parallel scheduling is an
+  option once the harness lands.
+
+### Browser smoke (Chromium, M-series)
+
+`bun x playwright test` against the truncated test blob:
+- WasmBackend direct call: warmup 39 ms, single forward 13 ms
+  (T=16, 1-layer truncated model). Argmax agreement 16/16 vs PyTorch.
+- `PrivacyFilter.create({ backend: "wasm" })` end-to-end: 1.4 s first
+  create (tokenizer fetch from HF Hub + warmup), detect/redact ~5–8 ms
+  on trivial inputs.

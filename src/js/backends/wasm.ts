@@ -269,6 +269,14 @@ export interface WasmBackendOptions extends BackendConstructionOptions {
   weightsUrl: string | URL;
   /** Optional sha256 for integrity check. */
   weightsSha256?: string;
+  /**
+   * Override the URL the backend fetches `pii.wasm` from. Defaults to
+   * a path relative to the bundled JS (`./pii.wasm`), which works when
+   * the bundle and the .wasm live in the same directory. Node tests
+   * that import directly from source use a different relative path;
+   * provide this option to pin the URL explicitly.
+   */
+  wasmModuleUrl?: string | URL;
 }
 
 function weightByName(map: ReadonlyMap<string, WeightTensorInfo>, name: string): WeightTensorInfo {
@@ -340,7 +348,8 @@ export class WasmBackend implements InferenceBackend {
   }
 
   async warmup(): Promise<void> {
-    this.wasm = await loadPiiWasm(DEFAULT_WASM_URL);
+    const wasmUrl = this.opts.wasmModuleUrl ?? DEFAULT_WASM_URL;
+    this.wasm = await loadPiiWasm(wasmUrl);
 
     const echoed = this.wasm.echo(42);
     if (echoed !== 42) {

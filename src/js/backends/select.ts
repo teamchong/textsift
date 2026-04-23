@@ -21,6 +21,8 @@ export interface SelectOptions {
   wasmWeightsUrl?: string | URL;
   /** Optional sha256 of the weight blob for integrity check. */
   wasmWeightsSha256?: string;
+  /** Override for the `pii.wasm` module URL; defaults to a path sibling to the bundled JS. */
+  wasmModuleUrl?: string | URL;
 }
 
 export async function selectBackend(opts: SelectOptions): Promise<InferenceBackend> {
@@ -35,6 +37,7 @@ export async function selectBackend(opts: SelectOptions): Promise<InferenceBacke
       ...opts,
       weightsUrl: opts.wasmWeightsUrl,
       weightsSha256: opts.wasmWeightsSha256,
+      wasmModuleUrl: opts.wasmModuleUrl,
     });
   }
   const { TransformersJsBackend } = await import("./transformers-js.js");

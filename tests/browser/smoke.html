@@ -1,0 +1,88 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>pii-wasm — browser smoke</title>
+  </head>
+  <body>
+    <pre id="out">starting</pre>
+    <script type="module">
+      // Exercise WasmBackend in a real browser. Playwright reads
+      // `window.__result` to assert against.
+      import { WasmBackend } from "/dist/index.js";
+
+      const $out = document.getElementById("out");
+      const log = (msg) => { $out.textContent += "\n" + msg; };
+
+      const bf16ToF32 = (u) => {
+        const b = new ArrayBuffer(4);
+        new DataView(b).setUint32(0, u << 16, true);
+        return new DataView(b).getFloat32(0, true);
+      };
+
+      try {
+        log("constructing backend");
+        const backend = new WasmBackend({
+          weightsUrl: "/tests/fixtures/pii-weights.bin",
+          wasmModuleUrl: "/dist/pii.wasm",
+          bundle: undefined,
+          quantization: "int4",
+          device: "wasm",
+        });
+        log("warmup");
+        const t0 = performance.now();
+        await backend.warmup();
+        const tWarmup = performance.now() - t0;
+
+        const idsResp = await fetch("/tests/fixtures/mdl_input_ids.i32");
+        const idsBytes = new Uint8Array(await idsResp.arrayBuffer());
+        const ids = new Int32Array(
+          idsBytes.buffer.slice(idsBytes.byteOffset, idsBytes.byteOffset + idsBytes.byteLength),
+        );
+        const mask = new Uint8Array(ids.length).fill(1);
+        log(`forward T=${ids.length}`);
+        const t1 = performance.now();
+        const logits = await backend.forward(ids, mask);
+        const tForward = performance.now() - t1;
+
+        const refResp = await fetch("/tests/fixtures/mdl_logits.bf16");
+        const refBytes = new Uint8Array(await refResp.arrayBuffer());
+        const refU16 = new Uint16Array(
+          refBytes.buffer.slice(refBytes.byteOffset, refBytes.byteOffset + refBytes.byteLength),
+        );
+
+        const C = 33, T = ids.length;
+        let classMatches = 0, maxAbs = 0, sumSq = 0;
+        for (let t = 0; t < T; t++) {
+          let g = 0, gMax = logits.data[t * C];
+          let w = 0, wMax = bf16ToF32(refU16[t * C]);
+          for (let c = 1; c < C; c++) {
+            if (logits.data[t * C + c] > gMax) { gMax = logits.data[t * C + c]; g = c; }
+            const rv = bf16ToF32(refU16[t * C + c]);
+            if (rv > wMax) { wMax = rv; w = c; }
+          }
+          if (g === w) classMatches++;
+          for (let c = 0; c < C; c++) {
+            const abs = Math.abs(logits.data[t * C + c] - bf16ToF32(refU16[t * C + c]));
+            if (abs > maxAbs) maxAbs = abs;
+            sumSq += abs * abs;
+          }
+        }
+        const rms = Math.sqrt(sumSq / (T * C));
+        window.__result = {
+          ok: classMatches === T,
+          T, C, classMatches, maxAbs, rms,
+          tWarmupMs: tWarmup, tForwardMs: tForward,
+          sequenceLength: logits.sequenceLength,
+          numClasses: logits.numClasses,
+        };
+        log(`done: argmax ${classMatches}/${T}  warmup=${tWarmup.toFixed(1)}ms  forward=${tForward.toFixed(1)}ms`);
+        backend.dispose();
+      } catch (e) {
+        window.__result = { ok: false, error: String(e) };
+        log("ERROR: " + e);
+        throw e;
+      }
+    </script>
+  </body>
+</html>

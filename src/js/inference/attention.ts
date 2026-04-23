@@ -51,6 +51,11 @@ export function attentionForward(
   config: AttentionConfig,
   tables: AttentionTables,
   T: number,
+  /**
+   * Pointer to a `u8 [T]` mask in WASM memory (1 = valid token, 0 = padding).
+   * Pass `0` to treat all keys as valid.
+   */
+  maskPtr: number = 0,
 ): void {
   const Hq = config.numHeads;
   const Hkv = config.numKvHeads;
@@ -89,7 +94,7 @@ export function attentionForward(
 
   // Banded attention (scores + sink + softmax + AV combine).
   wasm.banded_attention(
-    qPtr, kPtr, vPtr, weights.sinks.dataOffset, attnOutPtr,
+    qPtr, kPtr, vPtr, weights.sinks.dataOffset, maskPtr, attnOutPtr,
     T, Hq, Hkv, hd, config.slidingWindow,
   );
 

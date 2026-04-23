@@ -79,6 +79,7 @@ export function blockForwardWithRouting(
   tables: AttentionTables,
   config: BlockConfig,
   T: number,
+  maskPtr: number = 0,
 ): void {
   const D = config.hiddenSize;
 
@@ -92,7 +93,7 @@ export function blockForwardWithRouting(
   wasm.rms_norm(inputPtr, weights.inputLayernorm.dataOffset, normed1Ptr, T, D, config.rmsNormEps);
 
   const attnOutPtr = wasm.alloc(T * D * 2);
-  attentionForward(wasm, normed1Ptr, attnOutPtr, weights.attn, config, tables, T);
+  attentionForward(wasm, normed1Ptr, attnOutPtr, weights.attn, config, tables, T, maskPtr);
 
   const h1Ptr = wasm.alloc(T * D * 2);
   wasm.add_bf16(residualPtr, attnOutPtr, h1Ptr, T * D);
@@ -129,6 +130,7 @@ export function blockForward(
   tables: AttentionTables,
   config: BlockConfig,
   T: number,
+  maskPtr: number = 0,
 ): void {
   const D = config.hiddenSize;
   const K = config.numExpertsPerTok;
@@ -143,7 +145,7 @@ export function blockForward(
   wasm.rms_norm(inputPtr, weights.inputLayernorm.dataOffset, normed1Ptr, T, D, config.rmsNormEps);
 
   const attnOutPtr = wasm.alloc(T * D * 2);
-  attentionForward(wasm, normed1Ptr, attnOutPtr, weights.attn, config, tables, T);
+  attentionForward(wasm, normed1Ptr, attnOutPtr, weights.attn, config, tables, T, maskPtr);
 
   const h1Ptr = wasm.alloc(T * D * 2);
   wasm.add_bf16(residualPtr, attnOutPtr, h1Ptr, T * D);

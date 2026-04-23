@@ -49,6 +49,8 @@ export function modelForward(
   weights: ModelWeights,
   config: ModelConfig,
   T: number,
+  /** Optional `u8 [T]` mask pointer (1=valid, 0=padding). 0 = no mask. */
+  maskPtr: number = 0,
 ): void {
   const D = config.hiddenSize;
 
@@ -70,7 +72,7 @@ export function modelForward(
   let srcPtr = h0Ptr;
   let dstPtr = h1Ptr;
   for (const blockWeights of weights.blocks) {
-    blockForward(wasm, srcPtr, dstPtr, blockWeights, tables, config, T);
+    blockForward(wasm, srcPtr, dstPtr, blockWeights, tables, config, T, maskPtr);
     const tmp = srcPtr;
     srcPtr = dstPtr;
     dstPtr = tmp;

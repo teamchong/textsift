@@ -268,6 +268,26 @@ def main() -> int:
     write(FIXTURES_DIR / "attn_sinks.f32", sinks.numpy().tobytes())
     write(FIXTURES_DIR / "attn_out.bf16", bf16_bytes(out_ref.view(att_T, att_Hq * att_hd)))
 
+    # Masked variant: second half of tokens marked padding. We expect the
+    # first half's outputs to match a `T=att_T/2` unmasked attention on
+    # the same Q/K/V prefix — padding keys should contribute nothing.
+    pad_T = att_T // 2
+    mask_vec = torch.cat([torch.ones(pad_T, dtype=torch.uint8), torch.zeros(att_T - pad_T, dtype=torch.uint8)])
+    # Reference: recompute attention with a mask that -∞s all columns j ≥ pad_T.
+    mask_pad = torch.zeros(att_T, att_T)
+    for i in range(att_T):
+        for j in range(att_T):
+            if abs(i - j) > att_win or j >= pad_T:
+                mask_pad[i, j] = dtype_big
+    attn_weights2 = torch.matmul(Q_b, K_rep.transpose(-2, -1)) + mask_pad
+    combined2 = torch.cat([attn_weights2, sinks_col], dim=-1)
+    combined2 = combined2 - combined2.max(dim=-1, keepdim=True).values
+    probs2 = torch.nn.functional.softmax(combined2, dim=-1, dtype=torch.float32)
+    scores2 = probs2[..., :-1]
+    out_ref2 = torch.matmul(scores2, V_rep).squeeze(0).transpose(0, 1).contiguous().to(torch.bfloat16)
+    write(FIXTURES_DIR / "attn_mask.u8", mask_vec.numpy().tobytes())
+    write(FIXTURES_DIR / "attn_out_masked.bf16", bf16_bytes(out_ref2.view(att_T, att_Hq * att_hd)))
+
     # ----- Softmax fixture (attention-shape) -----
     #
     # Shape picked to exercise both the "long" row (attention scores +

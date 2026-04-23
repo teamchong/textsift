@@ -1192,6 +1192,7 @@ export fn scale_bf16_inplace(
 //   k:     bf16 [T, H_kv * head_dim]
 //   v:     bf16 [T, H_kv * head_dim]
 //   sinks: f32  [H_q]                 (upstream keeps sinks in fp32)
+//   mask:  u8   [T] or NULL (= 0 ptr) (1 = valid key, 0 = padding — skip)
 //   out:   bf16 [T, H_q * head_dim]
 //
 // Constraint: `H_q % H_kv == 0` (GQA). Window is one-sided — `window=128`
@@ -1257,6 +1258,7 @@ export fn banded_attention(
     k_ptr: [*]const u16,
     v_ptr: [*]const u16,
     sinks_ptr: [*]const f32,
+    mask_ptr: ?[*]const u8,    // NULL = all keys valid
     out_ptr: [*]u16,
     T: u32,
     H_q: u32,
@@ -1295,8 +1297,15 @@ export fn banded_attention(
 
             var t_k: usize = 0;
             while (t_k < n_keys) : (t_k += 1) {
-                const k_base = (ws + t_k) * k_stride_t + h_kv * Dz;
-                const s = dotBf16F32(q_ptr + q_base, k_ptr + k_base, Dz);
+                const abs_k = ws + t_k;
+                const is_valid: bool = if (mask_ptr) |m| (m[abs_k] != 0) else true;
+                const k_base = abs_k * k_stride_t + h_kv * Dz;
+                // Padding keys get -∞ logit so exp(·) rounds to 0 and
+                // they contribute nothing to the softmax or AV combine.
+                const s: f32 = if (is_valid)
+                    dotBf16F32(q_ptr + q_base, k_ptr + k_base, Dz)
+                else
+                    -std.math.inf(f32);
                 scores[t_k] = s;
                 if (s > row_max) row_max = s;
             }

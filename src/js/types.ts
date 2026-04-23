@@ -92,13 +92,30 @@ export interface CreateOptions {
   modelSource?: string;
 
   /**
-   * Backend selection. Stage 0 ships only the transformers.js backend,
-   * which runs on onnxruntime-web (WASM on CPU, WebGPU when available).
-   * Kept as an option so Stage 1's custom Zig+WASM backend can slot in
-   * without breaking the public API. WebGPU (custom WGSL) is deferred —
-   * see `docs/roadmap.md`.
+   * Backend selection.
+   *   - `"auto"` (default): transformers.js path. WebGPU in browsers,
+   *     onnxruntime-node's CPU EP in Node. Downloads the ONNX export
+   *     from `modelSource` lazily.
+   *   - `"wasm"`: Stage-1 custom Zig+WASM backend. Requires
+   *     `wasmWeightsUrl` pointing to a `pii-weights.bin` blob produced
+   *     by `scripts/convert_weights.py`. Does not download anything
+   *     itself; the caller is responsible for serving the blob.
+   * WebGPU (custom WGSL) is deferred — see `docs/roadmap.md`.
    */
   backend?: "auto" | "wasm";
+
+  /**
+   * URL of the flat `pii-weights.bin` blob. Required when
+   * `backend: "wasm"`. Ignored otherwise.
+   */
+  wasmWeightsUrl?: string;
+
+  /**
+   * Optional sha256 (hex) of the weight blob, for integrity checking
+   * before the WASM backend trusts its contents. Strongly recommended
+   * for production deploys where the blob is fetched over a network.
+   */
+  wasmWeightsSha256?: string;
 
   /**
    * Quantization level for the model weights. Defaults to `"int8"`, which

@@ -471,8 +471,9 @@ async function runBandedAttention(ex, _weights, spec) {
   const kPtr = allocAndCopy(ex, k);
   const vPtr = allocAndCopy(ex, v);
   const sinksPtr = allocAndCopy(ex, sinks);
+  const maskPtr = spec.mask ? allocAndCopy(ex, await loadFixture(spec.mask)) : 0;
   const outPtr = ex.alloc(expected.byteLength);
-  ex.banded_attention(qPtr, kPtr, vPtr, sinksPtr, outPtr,
+  ex.banded_attention(qPtr, kPtr, vPtr, sinksPtr, maskPtr, outPtr,
     spec.T, spec.H_q, spec.H_kv, spec.head_dim, spec.window);
   return {
     tolerance: { relTol: spec.rel_tol, absTol: spec.abs_tol ?? 0 },

@@ -48,7 +48,7 @@ export interface PiiWasmExports {
   topk_partial_f32(x: number, out_idx: number, out_val: number, rows: number, cols: number, k: number): void;
   rope_apply(qk: number, cos: number, sin: number, T: number, H: number, head_dim: number): void;
   banded_attention(
-    q: number, k: number, v: number, sinks: number, out: number,
+    q: number, k: number, v: number, sinks: number, mask: number, out: number,
     T: number, H_q: number, H_kv: number, head_dim: number, window: number,
   ): void;
   scale_bf16_inplace(x: number, scale: number, n: number): void;
@@ -234,6 +234,7 @@ export async function loadWeights(
 }
 
 const DEFAULT_WASM_URL = new URL("../../../dist/pii.wasm", import.meta.url);
+const WARMUP_T = 16;
 
 /**
  * Privacy-filter architecture constants baked into the Stage-1 backend.
@@ -353,17 +354,31 @@ export class WasmBackend implements InferenceBackend {
     // numExperts (the router's output size) comes from the router weight's
     // first dim. Truncated test blobs have < 128 experts; full blobs 128.
     this.numExpertsInBlob = this.modelWeights.blocks[0]!.routerW.shape[0]!;
+
+    // Prefill: run one dummy forward so V8 JITs every hot-path kernel
+    // and the bump heap hits its steady-state size. Amortizes that
+    // cost out of the user's first real request. T chosen small enough
+    // to keep warmup fast but large enough that the TR-tiled matmul
+    // path (TR=4) is actually exercised.
+    const warmupTokens = new Int32Array(WARMUP_T);
+    const dummyMask = new Uint8Array(WARMUP_T).fill(1);
+    await this.forward(warmupTokens, dummyMask);
   }
 
   async forward(
     tokenIds: Int32Array,
-    _attentionMask: Uint8Array,
+    attentionMask: Uint8Array,
   ): Promise<Logits> {
     if (!this.wasm || !this.modelWeights) {
       throw new Error("WasmBackend: call warmup() before forward()");
     }
     const wasm = this.wasm;
     const T = tokenIds.length;
+    if (attentionMask.length !== T) {
+      throw new Error(
+        `WasmBackend.forward: attentionMask length ${attentionMask.length} does not match tokenIds length ${T}`,
+      );
+    }
     const vocabSize = this.modelWeights.embedTokens.shape[0]!;
 
     const idsBytes = T * 4;
@@ -375,12 +390,25 @@ export class WasmBackend implements InferenceBackend {
     }
     new Int32Array(wasm.memory.buffer, idsPtr, T).set(tokenIds);
 
+    // If every mask byte is 1, skip the alloc/copy and pass maskPtr=0
+    // so banded_attention takes its faster mask-free path.
+    let maskPtr = 0;
+    for (let i = 0; i < T; i++) {
+      if (attentionMask[i] !== 1) {
+        const p = wasm.alloc(T);
+        if (p === 0) throw new Error("WasmBackend.forward: alloc OOM for mask");
+        new Uint8Array(wasm.memory.buffer, p, T).set(attentionMask);
+        maskPtr = p;
+        break;
+      }
+    }
+
     modelForward(wasm, idsPtr, logitsPtr, this.modelWeights, {
       ...PF_CONFIG,
       vocabSize,
       numExperts: this.numExpertsInBlob,
       numExpertsInBlob: this.numExpertsInBlob,
-    }, T);
+    }, T, maskPtr);
 
     // Upcast bf16 → f32 for the backend contract.
     const bf16View = new Uint16Array(wasm.memory.buffer, logitsPtr, T * PF_CONFIG.numClasses);

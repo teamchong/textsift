@@ -174,21 +174,33 @@ export class PrivacyFilter {
       const calibration = loadCalibration(bundle.calibrationJson);
       const tokenizer = await Tokenizer.fromBundle(bundle);
 
-      // In browsers, q4f16 requires ORT Web's WebGPU execution provider
-      // (MatMulNBits / GatherBlockQuantized have no WASM CPU kernel).
-      // In Node, onnxruntime-node has no "wasm" device; let transformers.js
-      // pick the default execution provider (CPU on cold install, CoreML if
-      // available). `backend: "wasm"` in a browser forces the CPU path.
+      // Stage-1 Zig+WASM backend is requested explicitly via
+      // `backend: "wasm"` + `wasmWeightsUrl`. Anything else routes to
+      // transformers.js. In browsers, transformers.js wants WebGPU
+      // (q4f16 needs MatMulNBits / GatherBlockQuantized with no WASM
+      // CPU kernel); in Node, onnxruntime-node picks CPU automatically
+      // and doesn't accept a "wasm" device string.
+      const wantsStage1 = this.opts.backend === "wasm";
+      if (wantsStage1 && !this.opts.wasmWeightsUrl) {
+        throw new PrivacyFilterError(
+          "backend: \"wasm\" requires wasmWeightsUrl pointing to a pii-weights.bin blob",
+          "BACKEND_UNAVAILABLE",
+        );
+      }
       const hasWebGPU = typeof navigator !== "undefined"
         && !!(navigator as { gpu?: unknown }).gpu;
-      const device: "auto" | "wasm" | "webgpu" = hasWebGPU
-        ? (this.opts.backend === "wasm" ? "wasm" : "webgpu")
-        : "auto";
-      progress?.({ stage: "compile", backend: device === "webgpu" ? "webgpu" : "wasm" });
+      const device: "auto" | "wasm" | "webgpu" = hasWebGPU ? "webgpu" : "auto";
+      progress?.({
+        stage: "compile",
+        backend: wantsStage1 ? "wasm" : (device === "webgpu" ? "webgpu" : "wasm"),
+      });
       const backend = await selectBackend({
         quantization: this.opts.quantization ?? "int8",
         device,
         bundle,
+        backend: wantsStage1 ? "wasm" : "transformers-js",
+        wasmWeightsUrl: this.opts.wasmWeightsUrl,
+        wasmWeightsSha256: this.opts.wasmWeightsSha256,
       });
 
       progress?.({ stage: "warmup" });

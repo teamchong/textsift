@@ -677,6 +677,71 @@ export fn matmul_bf16_x_int4block(
 }
 
 // --------------------------------------------------------------
+// Kernel: SwiGLU with clamp (privacy-filter variant)
+// --------------------------------------------------------------
+//
+// Matches `OpenAIPrivacyFilterExperts._apply_gate` exactly:
+//   gate, up = gate_up.chunk(2, dim=-1)
+//   gate = gate.clamp(max=7.0)
+//   up   = up.clamp(-7.0, 7.0)
+//   glu  = gate * sigmoid(gate * 1.702)
+//   out  = (up + 1.0) * glu
+//
+// All compute in f32 — the upstream expert forward runs in fp32
+// throughout (`.float()` on every op). Input and output are f32.
+//
+// gate_up: [T, 2*D]   f32       (gate concatenated with up)
+// out:     [T, D]     f32
+//
+// Note on the 1.702 constant: this is the GELU-approximation scale
+// `α = 1.702` that makes `x * sigmoid(α * x)` ≈ gelu(x). Combined with
+// the `+1` on the up branch and the clamps, this is the privacy-filter
+// specific gate (differs from vanilla SwiGLU's `silu(gate) * up`).
+
+const SWIGLU_LIMIT: f32 = 7.0;
+const SWIGLU_ALPHA: f32 = 1.702;
+
+inline fn sigmoidF32(x: f32) f32 {
+    // Numerically stable: for positive x, σ(x) = 1/(1+exp(-x)); for
+    // negative x, σ(x) = exp(x)/(1+exp(x)). Keeps the exp argument ≤ 0
+    // so intermediate values can't overflow.
+    if (x >= 0.0) {
+        const e = @exp(-x);
+        return 1.0 / (1.0 + e);
+    }
+    const e = @exp(x);
+    return e / (1.0 + e);
+}
+
+export fn swiglu_clamp_f32(
+    gate_up_ptr: [*]const f32,
+    out_ptr: [*]f32,
+    T: u32,
+    D: u32,
+) void {
+    const Tz: usize = T;
+    const Dz: usize = D;
+    const stride: usize = 2 * Dz;
+
+    var t: usize = 0;
+    while (t < Tz) : (t += 1) {
+        const row_base = t * stride;
+        const out_base = t * Dz;
+
+        var d: usize = 0;
+        while (d < Dz) : (d += 1) {
+            var gate = gate_up_ptr[row_base + d];
+            var up = gate_up_ptr[row_base + Dz + d];
+            if (gate > SWIGLU_LIMIT) gate = SWIGLU_LIMIT;
+            if (up > SWIGLU_LIMIT) up = SWIGLU_LIMIT;
+            if (up < -SWIGLU_LIMIT) up = -SWIGLU_LIMIT;
+            const glu = gate * sigmoidF32(gate * SWIGLU_ALPHA);
+            out_ptr[out_base + d] = (up + 1.0) * glu;
+        }
+    }
+}
+
+// --------------------------------------------------------------
 // Kernel: row-wise softmax, f32 in / f32 out, numerically stable
 // --------------------------------------------------------------
 //

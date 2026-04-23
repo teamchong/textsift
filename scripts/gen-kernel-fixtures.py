@@ -134,6 +134,21 @@ def main() -> int:
     write(FIXTURES_DIR / "embed_ids.i32", ids.numpy().tobytes())
     write(FIXTURES_DIR / "embed_out.bf16", bf16_bytes(y_embed))
 
+    # ----- SwiGLU-with-clamp fixture -----
+    # Matches OpenAIPrivacyFilterExperts._apply_gate. Inputs spread in a
+    # range that exercises both clamp branches (some values > 7 and < -7).
+    torch.manual_seed(SEED + 7)
+    swiglu_T = 16
+    swiglu_D = 640                                # = intermediate_size
+    gate_up = torch.randn(swiglu_T, 2 * swiglu_D, dtype=torch.float32) * 6.0
+    gate_ref, up_ref = gate_up.chunk(2, dim=-1)
+    gate_ref = gate_ref.clamp(min=None, max=7.0)
+    up_ref = up_ref.clamp(min=-7.0, max=7.0)
+    glu = gate_ref * torch.sigmoid(gate_ref * 1.702)
+    swiglu_ref = (up_ref + 1.0) * glu
+    write(FIXTURES_DIR / "swiglu_x.f32", gate_up.numpy().tobytes())
+    write(FIXTURES_DIR / "swiglu_y.f32", swiglu_ref.contiguous().numpy().tobytes())
+
     # ----- Softmax fixture (attention-shape) -----
     #
     # Shape picked to exercise both the "long" row (attention scores +

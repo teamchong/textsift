@@ -51,6 +51,15 @@
       "note": "bf16 output of an fp32 matmul over dequantized int4 (block 32, sym, fp16 scale). Expected bounded by bf16 ULP (~4e-3 rel for unit-ish values) plus int4 quant error; 1e-3 rel is tight for this combo."
     },
     {
+      "name": "swiglu_clamp_f32",
+      "x": "swiglu_x.f32",
+      "expected": "swiglu_y.f32",
+      "T": 16,
+      "D": 640,
+      "rel_tol": 1e-5,
+      "abs_tol": 1e-6
+    },
+    {
       "name": "softmax_f32",
       "x": "softmax_att_x.f32",
       "expected": "softmax_att_y.f32",

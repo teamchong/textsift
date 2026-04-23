@@ -37,7 +37,7 @@
   ],
   "license": "Apache-2.0",
   "scripts": {
-    "build": "bun build src/js/index.ts --outdir dist --target browser --format esm --sourcemap=external && bun x tsc --emitDeclarationOnly",
+    "build": "npm run build:zig && npm run build:opt && node scripts/inline-wasm.mjs && bun build src/js/index.ts --outdir dist --target browser --format esm --sourcemap=external && bun x tsc --emitDeclarationOnly",
     "build:zig": "mise exec -- zig build-exe -target wasm32-freestanding -mcpu=generic+simd128+relaxed_simd -O ReleaseFast -fstrip src/zig/wasm_exports.zig --name pii -fno-entry -rdynamic && mv pii.wasm dist/",
     "build:opt": "wasm-opt -O3 --strip-producers --strip-target-features dist/pii.wasm -o dist/pii.wasm --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals --enable-relaxed-simd",
     "typecheck": "bun x tsc --noEmit",

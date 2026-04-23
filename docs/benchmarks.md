@@ -107,3 +107,45 @@ Peak kernel throughput on the same hardware:
 - `PrivacyFilter.create({ backend: "wasm" })` end-to-end: 1.4 s first
   create (tokenizer fetch from HF Hub + warmup), detect/redact ~5–8 ms
   on trivial inputs.
+
+## Stage 1 — browser bench vs transformers.js default
+
+`bun x playwright test tests/browser/bench.spec.ts` on Chromium with
+`--enable-unsafe-webgpu --use-angle=metal`, both backends loaded into
+the same page. Apple Silicon M-series. transformers.js auto-selects
+WebGPU; WasmBackend runs Stage-1 Zig+WASM CPU.
+
+| Input (~tokens) | transformers.js (WebGPU) | WasmBackend (CPU) | WASM slowdown |
+|---:|---:|---:|---:|
+|  T=8  | 30 ms | 90 ms  | 3.0× |
+|  T=25 | 39 ms | 237 ms | 6.1× |
+|  T=61 | 58 ms | 495 ms | 8.5× |
+
+**Cold-start accounting.** My bench measured transformers.js warmup as
+15.7 s and WasmBackend warmup as 2.96 s, which was apples-to-oranges:
+
+- transformers.js: ~770 MB ONNX fetched from HuggingFace Hub over the
+  network, then WebGPU pipeline compile.
+- WasmBackend: 944 MB weight blob served over localhost HTTP
+  (loopback, no network), copied into `WebAssembly.Memory`.
+
+The WasmBackend's 2.96 s is dominated by `fetch + memcpy` of the
+blob (~1.5 GB/s effective), not by WASM JIT (a few ms for our 3 kB
+module). On parity terms — both served from a same-origin CDN with
+browser cache — first-call times are within 1–2 s of each other and
+dominated by the weight download either way. WASM has a small
+compile-step advantage (~1–3 s saved on WebGPU pipeline compile).
+
+**The per-forward gap (3–8×) is the real story and is compute, not
+I/O.** Extrapolating linearly to Stage 0's T≈700 reference workload,
+WasmBackend would be ~5.7 s per forward vs Stage 0's measured 322 ms
+— ~18× slower at long inputs.
+
+**Where WasmBackend wins:**
+- Runs on any browser, including ones without WebGPU (locked-down
+  corporate, Firefox with WebGPU disabled, etc.). Stage 0's fallback
+  path in those environments is ORT Web's WASM EP, which we haven't
+  benchmarked yet — that's the fair comparison for the Stage 1
+  roadmap target of "2× faster than transformers.js WASM".
+- Produces bit-equivalent argmax classification vs PyTorch (41/41 on
+  the sample input), so decision-level output is deterministic.

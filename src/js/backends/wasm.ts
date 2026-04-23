@@ -18,6 +18,7 @@ import type {
 } from "./abstract.js";
 import { modelForward, type ModelConfig, type ModelWeights } from "../inference/model.js";
 import type { BlockWeights } from "../inference/block.js";
+import { PII_WASM_BYTES } from "./pii-wasm-inline.js";
 
 /** Exports declared in `src/zig/wasm_exports.zig`. Keep in sync. */
 export interface PiiWasmExports {
@@ -93,19 +94,26 @@ export interface WeightTensorInfo {
 }
 
 /**
- * Load `pii.wasm` from the given URL and return its typed exports
- * plus a readiness check. Exported (not just used internally) so the
- * Stage-1 kernel unit tests can instantiate the module directly
- * without going through the full backend.
+ * Load `pii.wasm` and return its typed exports plus a readiness check.
+ * If `url` is `null` or undefined, uses the inlined bytes baked into
+ * the bundle (`PII_WASM_BYTES`) — this is the default and avoids the
+ * extra HTTP request for a ~3 KB file.
  */
-export async function loadPiiWasm(url: string | URL): Promise<PiiWasmExports> {
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(
-      `loadPiiWasm: fetch ${url} → ${response.status} ${response.statusText}`,
-    );
+export async function loadPiiWasm(url?: string | URL | null): Promise<PiiWasmExports> {
+  let instance: WebAssembly.Instance;
+  if (url == null) {
+    const result = await WebAssembly.instantiate(PII_WASM_BYTES as BufferSource, {});
+    instance = result.instance;
+  } else {
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(
+        `loadPiiWasm: fetch ${url} → ${response.status} ${response.statusText}`,
+      );
+    }
+    const result = await WebAssembly.instantiateStreaming(response, {});
+    instance = result.instance;
   }
-  const { instance } = await WebAssembly.instantiateStreaming(response, {});
   const exports = instance.exports as unknown as PiiWasmExports;
 
   const required: readonly (keyof PiiWasmExports)[] = [
@@ -233,7 +241,6 @@ export async function loadWeights(
   return out;
 }
 
-const DEFAULT_WASM_URL = new URL("../../../dist/pii.wasm", import.meta.url);
 const WARMUP_T = 16;
 
 /**
@@ -348,8 +355,11 @@ export class WasmBackend implements InferenceBackend {
   }
 
   async warmup(): Promise<void> {
-    const wasmUrl = this.opts.wasmModuleUrl ?? DEFAULT_WASM_URL;
-    this.wasm = await loadPiiWasm(wasmUrl);
+    // If the caller provides an explicit URL, fetch from there (useful
+    // if they want to host a different .wasm build). Otherwise use the
+    // bytes baked into the bundle — saves one round trip and avoids
+    // the `new URL(..., import.meta.url)` resolution quirk.
+    this.wasm = await loadPiiWasm(this.opts.wasmModuleUrl);
 
     const echoed = this.wasm.echo(42);
     if (echoed !== 42) {

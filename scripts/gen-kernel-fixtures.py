@@ -372,6 +372,112 @@ def main() -> int:
     write(FIXTURES_DIR / "moe_routing_scores.f32", routing_scores.numpy().tobytes())
     write(FIXTURES_DIR / "moe_out.bf16", bf16_bytes(exp_out))
 
+    # ----- Model forward fixture (1-layer-truncated) -----
+    #
+    # Shrinks the real model to a single block (layer 0) + first N
+    # experts so the fixture doesn't need 8 layers' × 128 experts'
+    # weights. Our WASM modelForward runs the same single-block
+    # pipeline against the committed blob. IDs are bounded by V_TEST.
+    torch.manual_seed(SEED + 13)
+    mdl_T = 16
+    mdl_ids = torch.randint(0, V_TEST, (mdl_T,), dtype=torch.int32)
+
+    # Patch layer-0 experts to the dequantized versions of our blob so
+    # the reference's fp32 compute sees the same weights we carry. Then
+    # truncate the experts + router to the first EXPERTS_KEEP experts —
+    # otherwise the real router would emit indices in [0, 128) that our
+    # 4-expert blob can't serve.
+    layer0 = model.model.layers[0]
+    with torch.no_grad():
+        layer0.mlp.experts.gate_up_proj.data[:EXPERTS_KEEP] = \
+            gu_dequant.transpose(-1, -2).to(torch.bfloat16)
+        layer0.mlp.experts.down_proj.data[:EXPERTS_KEEP] = \
+            d_dequant.transpose(-1, -2).to(torch.bfloat16)
+    layer0.mlp.experts.num_experts = EXPERTS_KEEP
+    layer0.mlp.experts.gate_up_proj = torch.nn.Parameter(
+        layer0.mlp.experts.gate_up_proj.data[:EXPERTS_KEEP].clone()
+    )
+    layer0.mlp.experts.gate_up_proj_bias = torch.nn.Parameter(
+        layer0.mlp.experts.gate_up_proj_bias.data[:EXPERTS_KEEP].clone()
+    )
+    layer0.mlp.experts.down_proj = torch.nn.Parameter(
+        layer0.mlp.experts.down_proj.data[:EXPERTS_KEEP].clone()
+    )
+    layer0.mlp.experts.down_proj_bias = torch.nn.Parameter(
+        layer0.mlp.experts.down_proj_bias.data[:EXPERTS_KEEP].clone()
+    )
+    layer0.mlp.router.num_experts = EXPERTS_KEEP
+    layer0.mlp.router.weight = torch.nn.Parameter(
+        layer0.mlp.router.weight.data[:EXPERTS_KEEP].clone()
+    )
+    layer0.mlp.router.bias = torch.nn.Parameter(
+        layer0.mlp.router.bias.data[:EXPERTS_KEEP].clone()
+    )
+    # Truncate to 1 layer.
+    model.model.layers = torch.nn.ModuleList([model.model.layers[0]])
+    model.config.num_hidden_layers = 1
+    model.config.num_local_experts = EXPERTS_KEEP
+
+    with torch.no_grad():
+        out = model(input_ids=mdl_ids.unsqueeze(0).long())
+    mdl_logits = out.logits.squeeze(0).contiguous().to(torch.bfloat16)
+
+    write(FIXTURES_DIR / "mdl_input_ids.i32", mdl_ids.numpy().tobytes())
+    write(FIXTURES_DIR / "mdl_logits.bf16", bf16_bytes(mdl_logits))
+
+    # ----- Block forward fixture (layer 0, synthetic routing) -----
+    #
+    # Exercises `blockForwardWithRouting`: norm + attention + residual +
+    # norm + MLP (expert dispatch with fixed routing) + residual.
+    # Uses the actual layer-0 attention module plus the layer-0 experts
+    # module, but the experts' weights are pre-patched with the
+    # dequantized versions of our blob — so the reference is bound by
+    # kernel rounding only, not quantization error.
+    torch.manual_seed(SEED + 12)
+    blk_T = 16
+    d_model = model.config.hidden_size
+    sliding = model.config.sliding_window
+    K = model.config.num_experts_per_tok
+
+    # Model-forward fixture already patched + truncated layer0 above.
+    # The block-forward fixture reuses that same truncated module, so
+    # we don't repeat the patch here.
+
+    hidden_blk = torch.randn(1, blk_T, d_model, dtype=torch.bfloat16)
+    routing_idx_blk = torch.zeros(blk_T, K, dtype=torch.int32)
+    for t in range(blk_T):
+        for k in range(K):
+            routing_idx_blk[t, k] = k % EXPERTS_KEEP
+    routing_scores_blk = torch.full((blk_T, K), 1.0 / K, dtype=torch.float32)
+
+    pos_ids_blk = torch.arange(blk_T, dtype=torch.long).unsqueeze(0)
+    cos_blk, sin_blk = rope_layer(hidden_blk, pos_ids_blk)
+    mask_blk = torch.zeros(blk_T, blk_T, dtype=torch.float32)
+    for i in range(blk_T):
+        for j in range(blk_T):
+            if abs(i - j) > sliding:
+                mask_blk[i, j] = torch.finfo(torch.float32).min
+    mask_blk_4d = mask_blk.view(1, 1, blk_T, blk_T).to(torch.bfloat16)
+
+    with torch.no_grad():
+        residual1 = hidden_blk
+        normed1 = layer0.input_layernorm(hidden_blk)
+        attn_out, _ = layer0.self_attn(normed1, (cos_blk, sin_blk), attention_mask=mask_blk_4d)
+        h1 = residual1 + attn_out
+        residual2 = h1
+        normed2 = layer0.post_attention_layernorm(h1)
+        # Run experts module directly with our synthetic routing.
+        experts_out_flat = layer0.mlp.experts(
+            normed2.reshape(-1, d_model), routing_idx_blk.long(), routing_scores_blk,
+        )
+        moe_out = experts_out_flat.reshape(1, blk_T, d_model) * K
+        h_blk_out = residual2 + moe_out
+
+    write(FIXTURES_DIR / "blk_hidden.bf16", bf16_bytes(hidden_blk.squeeze(0).contiguous()))
+    write(FIXTURES_DIR / "blk_routing_idx.i32", routing_idx_blk.numpy().tobytes())
+    write(FIXTURES_DIR / "blk_routing_scores.f32", routing_scores_blk.numpy().tobytes())
+    write(FIXTURES_DIR / "blk_out.bf16", bf16_bytes(h_blk_out.squeeze(0).contiguous().to(torch.bfloat16)))
+
     # ----- Attention forward fixture (layer 0) -----
     # Uses the real attention submodule with layer-0 weights so the
     # test exercises a production-shaped parameterisation.

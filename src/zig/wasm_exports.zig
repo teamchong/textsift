@@ -1003,6 +1003,38 @@ export fn softmax_f32(
 }
 
 // --------------------------------------------------------------
+// Kernel: elementwise bf16 add
+// --------------------------------------------------------------
+//
+// out[i] = round_bf16(a[i] + b[i])
+// Used for residual connections in the block forward pass. Upstream's
+// `residual + hidden_states` is a bf16 + bf16 → bf16 with an implicit
+// f32 widen inside — matched here.
+
+export fn add_bf16(
+    a_ptr: [*]const u16,
+    b_ptr: [*]const u16,
+    out_ptr: [*]u16,
+    n: u32,
+) void {
+    const nz: usize = n;
+    const LANES: usize = 4;
+    var i: usize = 0;
+    while (i + LANES <= nz) : (i += LANES) {
+        const av: @Vector(4, u16) = a_ptr[i ..][0..LANES].*;
+        const bv: @Vector(4, u16) = b_ptr[i ..][0..LANES].*;
+        const sum: @Vector(4, f32) = bf16x4ToF32x4(av) + bf16x4ToF32x4(bv);
+        out_ptr[i + 0] = f32ToBf16(sum[0]);
+        out_ptr[i + 1] = f32ToBf16(sum[1]);
+        out_ptr[i + 2] = f32ToBf16(sum[2]);
+        out_ptr[i + 3] = f32ToBf16(sum[3]);
+    }
+    while (i < nz) : (i += 1) {
+        out_ptr[i] = f32ToBf16(bf16ToF32(a_ptr[i]) + bf16ToF32(b_ptr[i]));
+    }
+}
+
+// --------------------------------------------------------------
 // Kernel: gather bf16 rows by int32 index
 // --------------------------------------------------------------
 //

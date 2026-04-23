@@ -18,7 +18,7 @@ import type {
 } from "./abstract.js";
 
 /** Exports declared in `src/zig/wasm_exports.zig`. Keep in sync. */
-interface PiiWasmExports {
+export interface PiiWasmExports {
   readonly memory: WebAssembly.Memory;
   /** Idempotent. Explicit call is optional; `alloc`/`reset`/`heap_mark_now` lazy-init. */
   heap_init(): number;
@@ -50,6 +50,7 @@ interface PiiWasmExports {
     T: number, H_q: number, H_kv: number, head_dim: number, window: number,
   ): void;
   scale_bf16_inplace(x: number, scale: number, n: number): void;
+  add_bf16(a: number, b: number, out: number, n: number): void;
   gather_bf16(src: number, indices: number, dst: number, m: number, D: number): void;
   scatter_add_weighted_f32(
     target: number, values: number, indices: number, weights: number,
@@ -132,6 +133,7 @@ export async function loadPiiWasm(url: string | URL): Promise<PiiWasmExports> {
     "rope_apply",
     "banded_attention",
     "scale_bf16_inplace",
+    "add_bf16",
     "gather_bf16",
     "scatter_add_weighted_f32",
     "zero_f32",

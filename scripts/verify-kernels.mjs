@@ -15,6 +15,8 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { attentionForward } from "../src/js/inference/attention.ts";
 import { expertDispatch } from "../src/js/inference/expert.ts";
+import { blockForwardWithRouting } from "../src/js/inference/block.ts";
+import { modelForward } from "../src/js/inference/model.ts";
 import { buildRopeTables } from "../src/js/inference/rope.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -192,6 +194,167 @@ async function runEmbed(ex, weights, spec) {
   const outPtr = ex.alloc(expected.byteLength);
   ex.embed_lookup(embed.ptr, idsPtr, outPtr, spec.T, spec.V, spec.D);
   return compareU16(ex, outPtr, expected);
+}
+
+async function runModelForward(ex, weights, spec) {
+  const ids = await loadFixture(spec.input_ids);
+  const expected = await loadFixture(spec.expected);
+  const idsPtr = allocAndCopy(ex, ids);
+  const logitsPtr = ex.alloc(expected.byteLength);
+
+  const w = (n) => {
+    const t = weights.get(n);
+    if (!t) throw new Error(`missing: ${n}`);
+    return t;
+  };
+
+  const blockWeights = {
+    inputLayernorm: w("model.layers.0.input_layernorm.weight"),
+    postAttentionLayernorm: w("model.layers.0.post_attention_layernorm.weight"),
+    attn: {
+      qProj: w("model.layers.0.self_attn.q_proj.weight"),
+      qProjBias: w("model.layers.0.self_attn.q_proj.bias"),
+      kProj: w("model.layers.0.self_attn.k_proj.weight"),
+      kProjBias: w("model.layers.0.self_attn.k_proj.bias"),
+      vProj: w("model.layers.0.self_attn.v_proj.weight"),
+      vProjBias: w("model.layers.0.self_attn.v_proj.bias"),
+      oProj: w("model.layers.0.self_attn.o_proj.weight"),
+      oProjBias: w("model.layers.0.self_attn.o_proj.bias"),
+      sinks: w("model.layers.0.self_attn.sinks"),
+    },
+    routerW: w("model.layers.0.mlp.router.weight"),
+    routerB: w("model.layers.0.mlp.router.bias"),
+    experts: {
+      gateUp: w("model.layers.0.mlp.experts.gate_up_proj"),
+      gateUpBias: w("model.layers.0.mlp.experts.gate_up_proj_bias"),
+      down: w("model.layers.0.mlp.experts.down_proj"),
+      downBias: w("model.layers.0.mlp.experts.down_proj_bias"),
+    },
+  };
+
+  modelForward(
+    ex, idsPtr, logitsPtr,
+    {
+      embedTokens: w("model.embed_tokens.weight"),
+      blocks: [blockWeights],  // single layer for truncated test
+      finalLayernorm: w("model.norm.weight"),
+      classifierW: w("score.weight"),
+      classifierB: w("score.bias"),
+    },
+    {
+      hiddenSize: spec.hidden_size,
+      numHeads: spec.H_q,
+      numKvHeads: spec.H_kv,
+      headDim: spec.head_dim,
+      slidingWindow: spec.window,
+      intermediateSize: spec.intermediate_size,
+      numExperts: spec.num_experts,
+      numExpertsPerTok: spec.num_experts_per_tok,
+      rmsNormEps: spec.rms_norm_eps,
+      numExpertsInBlob: spec.num_experts,
+      vocabSize: spec.vocab_size,
+      numClasses: spec.num_classes,
+      rope: {
+        headDim: spec.head_dim,
+        theta: spec.rope.theta,
+        factor: spec.rope.factor,
+        originalMaxPositionEmbeddings: spec.rope.original_max_position_embeddings,
+        betaFast: spec.rope.beta_fast,
+        betaSlow: spec.rope.beta_slow,
+        truncate: spec.rope.truncate,
+      },
+    },
+    spec.T,
+  );
+
+  return {
+    tolerance: { relTol: spec.rel_tol, absTol: spec.abs_tol ?? 0 },
+    ...compareBf16Tolerance(ex, logitsPtr, expected, {
+      relTol: spec.rel_tol, absTol: spec.abs_tol ?? 0,
+    }),
+  };
+}
+
+async function runBlockForward(ex, weights, spec) {
+  const hidden = await loadFixture(spec.hidden);
+  const routingIdx = await loadFixture(spec.routing_idx);
+  const routingScores = await loadFixture(spec.routing_scores);
+  const expected = await loadFixture(spec.expected);
+  const hiddenPtr = allocAndCopy(ex, hidden);
+  const routingIdxPtr = allocAndCopy(ex, routingIdx);
+  const routingScoresPtr = allocAndCopy(ex, routingScores);
+
+  // Precompute rope tables for this seq len via the TS helper.
+  const { cos, sin } = buildRopeTables(
+    {
+      headDim: spec.head_dim,
+      theta: spec.rope.theta,
+      factor: spec.rope.factor,
+      originalMaxPositionEmbeddings: spec.rope.original_max_position_embeddings,
+      betaFast: spec.rope.beta_fast,
+      betaSlow: spec.rope.beta_slow,
+      truncate: spec.rope.truncate,
+    },
+    spec.T,
+  );
+  const cosPtr = allocAndCopy(ex, new Uint8Array(cos.buffer, cos.byteOffset, cos.byteLength));
+  const sinPtr = allocAndCopy(ex, new Uint8Array(sin.buffer, sin.byteOffset, sin.byteLength));
+
+  const outPtr = ex.alloc(expected.byteLength);
+
+  const w = (n) => {
+    const t = weights.get(n);
+    if (!t) throw new Error(`missing: ${n}`);
+    return t;
+  };
+
+  blockForwardWithRouting(
+    ex, hiddenPtr, outPtr, routingIdxPtr, routingScoresPtr,
+    {
+      inputLayernorm: w("model.layers.0.input_layernorm.weight"),
+      postAttentionLayernorm: w("model.layers.0.post_attention_layernorm.weight"),
+      attn: {
+        qProj: w("model.layers.0.self_attn.q_proj.weight"),
+        qProjBias: w("model.layers.0.self_attn.q_proj.bias"),
+        kProj: w("model.layers.0.self_attn.k_proj.weight"),
+        kProjBias: w("model.layers.0.self_attn.k_proj.bias"),
+        vProj: w("model.layers.0.self_attn.v_proj.weight"),
+        vProjBias: w("model.layers.0.self_attn.v_proj.bias"),
+        oProj: w("model.layers.0.self_attn.o_proj.weight"),
+        oProjBias: w("model.layers.0.self_attn.o_proj.bias"),
+        sinks: w("model.layers.0.self_attn.sinks"),
+      },
+      routerW: w("model.layers.0.mlp.router.weight"),
+      routerB: w("model.layers.0.mlp.router.bias"),
+      experts: {
+        gateUp: w("model.layers.0.mlp.experts.gate_up_proj"),
+        gateUpBias: w("model.layers.0.mlp.experts.gate_up_proj_bias"),
+        down: w("model.layers.0.mlp.experts.down_proj"),
+        downBias: w("model.layers.0.mlp.experts.down_proj_bias"),
+      },
+    },
+    { ropeCosPtr: cosPtr, ropeSinPtr: sinPtr },
+    {
+      hiddenSize: spec.hidden_size,
+      numHeads: spec.H_q,
+      numKvHeads: spec.H_kv,
+      headDim: spec.head_dim,
+      slidingWindow: spec.window,
+      intermediateSize: spec.intermediate_size,
+      numExperts: spec.num_experts,
+      numExpertsPerTok: spec.num_experts_per_tok,
+      rmsNormEps: spec.rms_norm_eps,
+      numExpertsInBlob: spec.num_experts,
+    },
+    spec.T,
+  );
+
+  return {
+    tolerance: { relTol: spec.rel_tol, absTol: spec.abs_tol ?? 0 },
+    ...compareBf16Tolerance(ex, outPtr, expected, {
+      relTol: spec.rel_tol, absTol: spec.abs_tol ?? 0,
+    }),
+  };
 }
 
 async function runExpertDispatch(ex, weights, spec) {
@@ -525,6 +688,8 @@ const RUNNERS = {
   banded_attention: runBandedAttention,
   attention_forward: runAttentionForward,
   expert_dispatch: runExpertDispatch,
+  block_forward: runBlockForward,
+  model_forward: runModelForward,
 };
 
 async function main() {

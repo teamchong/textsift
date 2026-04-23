@@ -430,6 +430,128 @@ export fn matmul_bf16(
 }
 
 // --------------------------------------------------------------
+// Kernel: bf16 × int4-blockwise matmul with bias
+// --------------------------------------------------------------
+//
+// out = x @ dequant(W).T + bias     // PyTorch F.linear convention
+//   x:    bf16                [T, D]
+//   W:    int4 blockwise sym  [N, D]      (logical shape)
+//   bias: bf16                [N]
+//   out:  bf16                [T, N]
+//
+// Weight encoding (matches the "int4_block32_sym" dtype from
+// scripts/convert-weights.py):
+//   - Block size 32 along D.
+//   - Signed int4 values, packed two per byte (low nibble = even d,
+//     high nibble = odd d), layout [N, D/2].
+//   - Per-block fp16 scale, layout [N, D/32], appended immediately
+//     after the packed data in the same tensor blob.
+//   - Dequant: x_fp = int4_sign_extend(q) * fp16_to_f32(scale).
+//     No zero-point (scale set so the most-negative int4 value -8
+//     is not required — max_abs maps to +7).
+//
+// Accumulate semantics:
+//   per block: 4-wide SIMD load of 4 x-bf16 lanes + extract 4 int4
+//     nibbles from 2 bytes, upcast both to f32, multiply. Drain lanes
+//     into a scalar `block_sum` so the per-block sum order matches a
+//     reference implementation. Then `acc += block_sum * scale_f32`.
+//   across blocks: scalar accumulate into `acc` (each block has its
+//     own scale; can't hoist).
+// Final `acc + bias` rounded to bf16 via RNE.
+
+inline fn unpackInt4Lo(b: u8) i8 {
+    const n: u4 = @truncate(b);
+    return @as(i8, @bitCast(@as(i8, @as(i4, @bitCast(n)))));
+}
+
+inline fn unpackInt4Hi(b: u8) i8 {
+    const n: u4 = @truncate(b >> 4);
+    return @as(i8, @bitCast(@as(i8, @as(i4, @bitCast(n)))));
+}
+
+/// Load 4 consecutive int4 values (2 packed bytes) as a 4-lane f32 vector.
+/// Used inside the D-axis inner loop; each call advances by 4 elements.
+inline fn int4x4LoadF32(w_int4: [*]const u8, nibble_index: usize) @Vector(4, f32) {
+    // nibble_index is the index of the FIRST int4 element we want.
+    // It must be even (4-element chunks start on byte boundaries).
+    const byte_index = nibble_index >> 1;
+    const b0 = w_int4[byte_index];
+    const b1 = w_int4[byte_index + 1];
+    const q: @Vector(4, i32) = .{
+        @as(i32, unpackInt4Lo(b0)),
+        @as(i32, unpackInt4Hi(b0)),
+        @as(i32, unpackInt4Lo(b1)),
+        @as(i32, unpackInt4Hi(b1)),
+    };
+    // i32 → f32 elementwise. `@floatFromInt` on vectors works.
+    return @floatFromInt(q);
+}
+
+/// Read a fp16 scale as f32 (same lossless widening trick as bf16, but with
+/// fp16 semantics — we upcast via Zig's native f16 → f32 cast since fp16
+/// has real exponent/mantissa bits).
+inline fn fp16ToF32(bits: u16) f32 {
+    const h: f16 = @bitCast(bits);
+    return @floatCast(h);
+}
+
+export fn matmul_bf16_x_int4block(
+    x_ptr: [*]const u16,   // bf16 [T, D]
+    w_ptr: [*]const u8,    // packed [N, D/2] int4 followed by [N, D/32] fp16
+    bias_ptr: [*]const u16, // bf16 [N]
+    out_ptr: [*]u16,       // bf16 [T, N]
+    T: u32,
+    N: u32,
+    D: u32,
+) void {
+    const Tz: usize = T;
+    const Nz: usize = N;
+    const Dz: usize = D;
+    const BLOCK: usize = 32;
+    const LANES: usize = 4;
+
+    const w_int4_stride: usize = Dz / 2;
+    const w_scale_stride: usize = Dz / BLOCK;
+    const scales_base: [*]const u16 = @ptrCast(@alignCast(w_ptr + Nz * w_int4_stride));
+
+    var t: usize = 0;
+    while (t < Tz) : (t += 1) {
+        const x_base = t * Dz;
+        const out_base = t * Nz;
+
+        var n: usize = 0;
+        while (n < Nz) : (n += 1) {
+            const w_int4_row = w_ptr + n * w_int4_stride;
+            const w_scale_row = scales_base + n * w_scale_stride;
+
+            var acc: f32 = 0.0;
+            var b: usize = 0;
+            while (b < w_scale_stride) : (b += 1) {
+                const scale = fp16ToF32(w_scale_row[b]);
+                const block_d = b * BLOCK;
+
+                var block_sum: f32 = 0.0;
+                var j: usize = 0;
+                while (j < BLOCK) : (j += LANES) {
+                    const xu: @Vector(4, u16) = x_ptr[x_base + block_d + j ..][0..LANES].*;
+                    const xf: @Vector(4, f32) = bf16x4ToF32x4(xu);
+                    const qf: @Vector(4, f32) = int4x4LoadF32(w_int4_row, block_d + j);
+                    const prod: @Vector(4, f32) = xf * qf;
+                    block_sum += prod[0];
+                    block_sum += prod[1];
+                    block_sum += prod[2];
+                    block_sum += prod[3];
+                }
+                acc += block_sum * scale;
+            }
+
+            acc += bf16ToF32(bias_ptr[n]);
+            out_ptr[out_base + n] = f32ToBf16(acc);
+        }
+    }
+}
+
+// --------------------------------------------------------------
 // Kernel: embedding lookup
 // --------------------------------------------------------------
 //

@@ -39,10 +39,11 @@ interface PiiWasmExports {
   weights_name(idx: number, out: number): number;
   rms_norm(x: number, gamma: number, out: number, T: number, D: number, eps: number): void;
   matmul_bf16(x: number, w: number, bias: number, out: number, T: number, N: number, D: number): void;
+  matmul_bf16_x_int4block(x: number, w: number, bias: number, out: number, T: number, N: number, D: number): void;
   embed_lookup(embed: number, ids: number, out: number, T: number, V: number, D: number): void;
 }
 
-/** Dtype codes emitted by `scripts/convert-weights.py`. */
+/** Dtype codes emitted by `scripts/convert_weights.py`. */
 export enum WeightDType {
   F32 = 0,
   F16 = 1,
@@ -50,6 +51,13 @@ export enum WeightDType {
   I8 = 3,
   U8 = 4,
   I32 = 5,
+  /**
+   * Signed symmetric int4, blockwise along the last dim (block=32),
+   * per-block fp16 scale, no zero-point. Layout per tensor:
+   *   [N, D/2] packed u8 (low nibble = even d index, high = odd)
+   *   then [N, D/32] fp16 scales.
+   */
+  I4_BLOCK32_SYM = 6,
 }
 
 export interface WeightTensorInfo {
@@ -97,6 +105,7 @@ export async function loadPiiWasm(url: string | URL): Promise<PiiWasmExports> {
     "weights_name",
     "rms_norm",
     "matmul_bf16",
+    "matmul_bf16_x_int4block",
     "embed_lookup",
   ];
   for (const name of required) {

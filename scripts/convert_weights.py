@@ -56,7 +56,13 @@ DTYPE_CODES = {
     "int8": 3,
     "uint8": 4,
     "int32": 5,
+    # Custom: signed int4, blockwise along the last dim, block size 32,
+    # per-block fp16 scale, no zero-point. Data layout per tensor is
+    # [N, D/2] packed int4 (low nibble = even index) followed by
+    # [N, D/32] fp16 scales, back-to-back.
+    "int4_block32_sym": 6,
 }
+INT4_BLOCK_SIZE = 32
 
 
 # Small subset sufficient to prove the end-to-end weight pipeline.
@@ -84,6 +90,8 @@ def parse_args() -> argparse.Namespace:
                    help="Extra tensor name to include (on top of the default subset). Repeatable.")
     p.add_argument("--embed-rows", type=int, default=0,
                    help="If >0 and embed_tokens.weight is in the selection, truncate it to the first N rows. Lets tests exercise the embedding kernel without shipping 128 MB.")
+    p.add_argument("--quant", action="append", default=None, metavar="PATTERN",
+                   help="Quantize tensors whose name contains PATTERN to int4-blockwise-32. Repeatable. Example: --quant mlp.experts.gate_up_proj --quant mlp.experts.down_proj")
     p.add_argument("--list", action="store_true",
                    help="Enumerate available tensor names and exit.")
     p.add_argument("--hash", type=Path, default=None,
@@ -133,6 +141,54 @@ def tensor_bytes(tensor: object) -> bytes:
     return t.numpy().tobytes()
 
 
+def quantize_int4_block32_sym(tensor: object) -> tuple[bytes, tuple[int, ...]]:
+    """
+    Signed symmetric int4, block size 32 along the last dim, per-block fp16 scale.
+    Data layout: [..., N, D/2] packed int4 (low nibble = even d index, high nibble =
+    odd d index), concatenated with [..., N, D/32] fp16 scales.
+    Returns (packed_bytes, shape). Shape is the LOGICAL shape (unchanged).
+    """
+    import torch
+    t = tensor.detach().contiguous().cpu().to(torch.float32)
+    shape = tuple(t.shape)
+    if len(shape) < 2:
+        raise ValueError(f"int4-block32 needs >=2 dims; got {shape}")
+    D = shape[-1]
+    if D % INT4_BLOCK_SIZE != 0:
+        raise ValueError(f"last dim {D} not divisible by {INT4_BLOCK_SIZE}")
+
+    leading = t.shape[:-1]          # flatten everything except last dim
+    t2 = t.reshape(-1, D)            # [R, D] where R = prod(leading)
+    R = t2.shape[0]
+    n_blocks = D // INT4_BLOCK_SIZE
+    blocks = t2.view(R, n_blocks, INT4_BLOCK_SIZE)
+
+    max_abs = blocks.abs().amax(dim=-1, keepdim=True)
+    # Scale = max_abs / 7 (not /8) so max_abs maps to +7 (int4 positive max).
+    # Prevents the most-negative int4 value (-8) from being required for
+    # symmetric range, keeping decode trivially `int8(q) * scale`.
+    scale = torch.where(max_abs > 0, max_abs / 7.0, torch.ones_like(max_abs))
+    q = torch.round(blocks / scale).clamp(-8, 7).to(torch.int8)
+
+    # Pack: q is [R, n_blocks, 32] int8. Flatten last two dims, take pairs.
+    q_flat = q.reshape(R, D)
+    low = (q_flat[:, 0::2] & 0x0F).to(torch.uint8)
+    high = (q_flat[:, 1::2] & 0x0F).to(torch.uint8)
+    packed = (low | (high << 4)).contiguous()              # [R, D/2] u8
+
+    scale_fp16 = scale.squeeze(-1).to(torch.float16).reshape(R, n_blocks)
+
+    int4_bytes = packed.numpy().tobytes()
+    scale_bytes = scale_fp16.view(torch.uint16).numpy().tobytes()
+    return int4_bytes + scale_bytes, shape
+
+
+def should_quantize(name: str, patterns: Sequence[str] | None) -> bool:
+    if not patterns:
+        return False
+    return any(p in name for p in patterns)
+
+
 def truncate_embedding(tensor: object, rows: int) -> object:
     import torch
     if rows <= 0:
@@ -148,6 +204,7 @@ def write_blob(
     state_dict: dict,
     names: Sequence[str],
     output: Path,
+    quant_patterns: Sequence[str] | None = None,
 ) -> tuple[int, str]:
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -160,11 +217,15 @@ def write_blob(
     cursor = data_offset
     for name in names:
         tensor = state_dict[name]
-        dtype_code = dtype_code_from_torch(tensor.dtype)
-        shape = tuple(tensor.shape)
+        if should_quantize(name, quant_patterns):
+            payload, shape = quantize_int4_block32_sym(tensor)
+            dtype_code = DTYPE_CODES["int4_block32_sym"]
+        else:
+            dtype_code = dtype_code_from_torch(tensor.dtype)
+            shape = tuple(tensor.shape)
+            payload = tensor_bytes(tensor)
         if len(shape) > 4:
             raise ValueError(f"tensor {name} has ndim={len(shape)}; max supported is 4")
-        payload = tensor_bytes(tensor)
         aligned_cursor = align_up(cursor, ALIGN)
         entries.append((name, dtype_code, shape, aligned_cursor, len(payload), payload))
         cursor = aligned_cursor + len(payload)
@@ -256,7 +317,7 @@ def main() -> int:
         t = state_dict[name]
         print(f"  {name:60s} shape={tuple(t.shape)} dtype={t.dtype}", file=sys.stderr)
 
-    total_size, sha256 = write_blob(state_dict, names, args.output)
+    total_size, sha256 = write_blob(state_dict, names, args.output, args.quant)
     print(f"[convert-weights] wrote {total_size} bytes ({total_size / 1024 / 1024:.2f} MiB)", file=sys.stderr)
     print(f"[convert-weights] sha256: {sha256}", file=sys.stderr)
 

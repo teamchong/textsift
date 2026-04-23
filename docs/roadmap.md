@@ -90,7 +90,7 @@ Target: 1.5–2× faster than Stage 0 Chrome warm-inference
 
 ### Phase B — weight conversion + loading (done, plumbing only)
 
-- [x] Python converter `scripts/convert-weights.py`. Phase-B1 scope:
+- [x] Python converter `scripts/convert_weights.py`. Phase-B1 scope:
       a 4-tensor subset (classifier head + 2 RMSNorm weights, ~87 KB
       in bf16). `--full` flag emits all 140 tensors (~2.8 GB).
       Int4 blockwise quantization deferred to Phase C (where the int4
@@ -129,11 +129,19 @@ Target: 1.5–2× faster than Stage 0 Chrome warm-inference
 - [x] Embedding lookup — pure gather. **5120/5120 bit-exact** on
       [T=8, D=640] with a 1024-row truncated embed table. 0.06 ms.
       OOB ids zero-fill rather than crash.
-- [ ] Int4 blockwise matmul with `@Vector` FMA chains. Requires
-      Phase B update to emit int4 blocks (block size, scale format,
-      symmetric vs asymmetric). Deferred until the kernel needs
-      defining — specifically, when we've assembled enough kernels
-      that size-on-disk becomes the next constraint.
+- [x] Int4 blockwise matmul (`matmul_bf16_x_int4block`). Block size 32
+      along D, signed symmetric int4 (range −8..7, scale = max_abs/7 so
+      the −8 slot goes unused), per-block fp16 scale. Layout per
+      tensor: `[N, D/2]` packed u8 followed by `[N, D/32]` fp16 scales.
+      Matches ONNX MatMulNBits semantics so ONNX exports could in
+      principle share the format. Kernel: 4-wide SIMD over 32-element
+      blocks (bf16 widen + int4 nibble unpack + vector multiply +
+      lane-drain into `block_sum`), scalar accumulate across blocks
+      (each block has its own scale, can't hoist). **Bit-exact** on
+      the fixture (maxAbs=0, maxRel=0 vs `F.linear(x, dequant(W), b)`
+      at bf16 output precision). Manifest tolerance set to 1e-3
+      relative / 1e-4 absolute — tight for the bf16+int4 combination;
+      anything looser would hide a kernel bug.
 
 **Allocator bug caught during Phase C4.** Initial design hardcoded
 `heap_base = 64 KiB`, assuming Zig's static data + shadow stack fit

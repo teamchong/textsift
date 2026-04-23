@@ -36,6 +36,19 @@
       "D": 640,
       "baseline_matches": 5120,
       "baseline_total": 5120
+    },
+    {
+      "name": "matmul_bf16_x_int4block",
+      "x": "int4_matmul_x.bf16",
+      "w": "int4_matmul_w.i4block",
+      "bias": "int4_matmul_bias.bf16",
+      "expected": "int4_matmul_y.bf16",
+      "T": 8,
+      "N": 33,
+      "D": 640,
+      "rel_tol": 1e-3,
+      "abs_tol": 1e-4,
+      "note": "bf16 output of an fp32 matmul over dequantized int4 (block 32, sym, fp16 scale). Expected bounded by bf16 ULP (~4e-3 rel for unit-ish values) plus int4 quant error; 1e-3 rel is tight for this combo."
     }
   ]
 }

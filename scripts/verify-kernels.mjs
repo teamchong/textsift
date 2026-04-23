@@ -109,6 +109,51 @@ function bf16ToF32(u) {
   return new DataView(buf).getFloat32(0, true);
 }
 
+/**
+ * Tolerance-based comparison for kernels where bit-exact is not the
+ * contract (e.g. int4 dequant + matmul, where PyTorch's fp32 linear
+ * uses a different accumulation order than our per-block kernel).
+ * Returns {total, maxAbs, maxRel, rms, fails}. fails = # lanes where
+ * |got - want| > max(abs_tol, rel_tol * |want|).
+ */
+function compareBf16Tolerance(ex, outPtr, expectedBytes, { absTol = 0, relTol }) {
+  const got = new Uint16Array(ex.memory.buffer, outPtr, expectedBytes.byteLength >>> 1);
+  const want = new Uint16Array(
+    expectedBytes.buffer,
+    expectedBytes.byteOffset,
+    expectedBytes.byteLength >>> 1,
+  );
+  let maxAbs = 0;
+  let maxRel = 0;
+  let sumSq = 0;
+  let fails = 0;
+  let firstFail = -1;
+  for (let i = 0; i < want.length; i++) {
+    const g = bf16ToF32(got[i]);
+    const w = bf16ToF32(want[i]);
+    const abs = Math.abs(g - w);
+    const rel = Math.abs(w) > 0 ? abs / Math.abs(w) : abs;
+    if (abs > maxAbs) maxAbs = abs;
+    if (rel > maxRel) maxRel = rel;
+    sumSq += abs * abs;
+    const tol = Math.max(absTol, relTol * Math.abs(w));
+    if (abs > tol) {
+      fails++;
+      if (firstFail === -1) firstFail = i;
+    }
+  }
+  return {
+    total: want.length,
+    fails,
+    firstFail,
+    maxAbs,
+    maxRel,
+    rms: Math.sqrt(sumSq / want.length),
+    got,
+    want,
+  };
+}
+
 async function runRmsNorm(ex, weights, spec) {
   const x = await loadFixture(spec.x);
   const gamma = weights.get(spec.gamma_tensor);
@@ -143,10 +188,34 @@ async function runEmbed(ex, weights, spec) {
   return compareU16(ex, outPtr, expected);
 }
 
+async function runMatmulInt4(ex, _weights, spec) {
+  // int4 matmul uses a standalone packed-weight fixture rather than a
+  // tensor from the weight blob, because our blob only carries bf16 of
+  // score.weight — the quantized equivalent is generated specifically
+  // for this test.
+  const x = await loadFixture(spec.x);
+  const w = await loadFixture(spec.w);
+  const bias = await loadFixture(spec.bias);
+  const expected = await loadFixture(spec.expected);
+  const xPtr = allocAndCopy(ex, x);
+  const wPtr = allocAndCopy(ex, w);
+  const bPtr = allocAndCopy(ex, bias);
+  const outPtr = ex.alloc(expected.byteLength);
+  ex.matmul_bf16_x_int4block(xPtr, wPtr, bPtr, outPtr, spec.T, spec.N, spec.D);
+  return {
+    tolerance: { relTol: spec.rel_tol, absTol: spec.abs_tol ?? 0 },
+    ...compareBf16Tolerance(ex, outPtr, expected, {
+      relTol: spec.rel_tol,
+      absTol: spec.abs_tol ?? 0,
+    }),
+  };
+}
+
 const RUNNERS = {
   rms_norm: runRmsNorm,
   matmul_bf16: runMatmul,
   embed_lookup: runEmbed,
+  matmul_bf16_x_int4block: runMatmulInt4,
 };
 
 async function main() {
@@ -163,25 +232,49 @@ async function main() {
       failures++;
       continue;
     }
-    const { total, matches, firstMismatch, got, want } = await runner(ex, weights, spec);
-    const pass =
-      matches === total ||
-      (matches >= spec.baseline_matches && total === spec.baseline_total);
-    const tag = pass ? `${GREEN}PASS${RESET}` : `${RED}FAIL${RESET}`;
-    const baseline =
-      spec.baseline_matches === spec.baseline_total
-        ? "bit-exact"
-        : `${spec.baseline_matches}/${spec.baseline_total}`;
-    let detail = `${matches}/${total}  (baseline ${baseline})`;
-    if (!pass && firstMismatch >= 0) {
-      const g = got[firstMismatch];
-      const w = want[firstMismatch];
-      const gf = bf16ToF32(g).toPrecision(6);
-      const wf = bf16ToF32(w).toPrecision(6);
-      detail += `\n    first mismatch @ ${firstMismatch}: got 0x${g.toString(16).padStart(4, "0")} (${gf}), want 0x${w.toString(16).padStart(4, "0")} (${wf})`;
+    const result = await runner(ex, weights, spec);
+    const label = spec.name.padEnd(24);
+
+    if (result.tolerance !== undefined) {
+      // Tolerance-based comparison.
+      const { fails, total, maxAbs, maxRel, rms, firstFail, got, want } = result;
+      const pass = fails === 0;
+      const tag = pass ? `${GREEN}PASS${RESET}` : `${RED}FAIL${RESET}`;
+      let detail =
+        `tol rel<${result.tolerance.relTol}  ` +
+        `fails=${fails}/${total}  maxAbs=${maxAbs.toExponential(2)}  ` +
+        `maxRel=${maxRel.toExponential(2)}  rms=${rms.toExponential(2)}`;
+      if (!pass && firstFail >= 0) {
+        const g = got[firstFail];
+        const w = want[firstFail];
+        const gf = bf16ToF32(g).toPrecision(6);
+        const wf = bf16ToF32(w).toPrecision(6);
+        detail += `\n    first fail @ ${firstFail}: got ${gf}, want ${wf}`;
+      }
+      console.log(`${tag}  ${label} ${detail}`);
+      if (!pass) failures++;
+    } else {
+      // Bit-count comparison (baseline-gated).
+      const { total, matches, firstMismatch, got, want } = result;
+      const pass =
+        matches === total ||
+        (matches >= spec.baseline_matches && total === spec.baseline_total);
+      const tag = pass ? `${GREEN}PASS${RESET}` : `${RED}FAIL${RESET}`;
+      const baseline =
+        spec.baseline_matches === spec.baseline_total
+          ? "bit-exact"
+          : `${spec.baseline_matches}/${spec.baseline_total}`;
+      let detail = `${matches}/${total}  (baseline ${baseline})`;
+      if (!pass && firstMismatch >= 0) {
+        const g = got[firstMismatch];
+        const w = want[firstMismatch];
+        const gf = bf16ToF32(g).toPrecision(6);
+        const wf = bf16ToF32(w).toPrecision(6);
+        detail += `\n    first mismatch @ ${firstMismatch}: got 0x${g.toString(16).padStart(4, "0")} (${gf}), want 0x${w.toString(16).padStart(4, "0")} (${wf})`;
+      }
+      console.log(`${tag}  ${label} ${detail}`);
+      if (!pass) failures++;
     }
-    console.log(`${tag}  ${spec.name.padEnd(14)} ${detail}`);
-    if (!pass) failures++;
     // Per-kernel scratch drops off on next reset; weights survive.
     ex.reset();
   }

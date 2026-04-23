@@ -23,7 +23,20 @@ export default defineConfig({
   projects: [
     {
       name: "chromium",
-      use: { browserName: "chromium" },
+      use: {
+        browserName: "chromium",
+        launchOptions: {
+          args: [
+            // Required for WebGPU in Chromium — both in headless and headed
+            // modes. On macOS with ANGLE-over-Metal this surfaces the real
+            // GPU; on Linux CI you'd want swiftshader or vulkan instead.
+            "--enable-unsafe-webgpu",
+            "--enable-features=Vulkan",
+            "--use-angle=metal",
+            "--enable-webgpu-developer-features",
+          ],
+        },
+      },
     },
   ],
 });

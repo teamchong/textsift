@@ -1,0 +1,110 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>pii-wasm — browser perf bench</title>
+  </head>
+  <body>
+    <pre id="out">starting</pre>
+    <script type="module">
+      // Run both backends in a real browser; measure warm-forward
+      // medians at several T. Playwright reads window.__result.
+      //
+      // Assumes the full blob is at /tests/fixtures/pii-weights-full.bin
+      // (symlink to /tmp/pii-wasm-e2e/pii-weights-full.bin). Without it
+      // the WasmBackend will fail to load.
+      import {
+        PrivacyFilter,
+        WasmBackend,
+      } from "/dist/index.js";
+
+      const $out = document.getElementById("out");
+      const log = (m) => { $out.textContent += "\n" + m; };
+
+      const SEEDS = [
+        "Hi, my name is John Smith.",
+        "Please email me at jane.doe@example.com about invoice 4511 or call (555) 123-4567.",
+        "My SSN is 123-45-6789 and my bank account is 9876543210. I live at 456 Oak Avenue, " +
+          "Boston, MA 02134. Call me at (617) 555-0199 or text my cell at 617.555.0123.",
+      ];
+      const WARMUP = 2;
+      const ITERS = 5;
+
+      function median(xs) {
+        const s = [...xs].sort((a, b) => a - b);
+        return s[Math.floor(s.length / 2)];
+      }
+
+      async function measure(label, filter, text) {
+        for (let i = 0; i < WARMUP; i++) await filter.detect(text);
+        const samples = [];
+        for (let i = 0; i < ITERS; i++) {
+          const t = performance.now();
+          await filter.detect(text);
+          samples.push(performance.now() - t);
+        }
+        const med = median(samples);
+        log(`  ${label.padEnd(18)} median=${med.toFixed(1)}ms`);
+        return med;
+      }
+
+      try {
+        const hasWebGPU = !!navigator.gpu;
+        log(`WebGPU available: ${hasWebGPU}`);
+
+        log("transformers.js: create + warmup");
+        const t0 = performance.now();
+        const tjs = await PrivacyFilter.create({
+          onProgress: (ev) => {
+            if (ev.stage === "download") {
+              const pct = ev.total ? Math.round((ev.loaded / ev.total) * 100) : 0;
+              log(`  download ${ev.url.split("/").pop()}: ${pct}%`);
+            } else {
+              log(`  ${ev.stage}` + (ev.backend ? ` (${ev.backend})` : ""));
+            }
+          },
+        });
+        const tjsWarmup = performance.now() - t0;
+        log(`transformers.js ready in ${tjsWarmup.toFixed(0)}ms`);
+
+        log("wasm backend: create + warmup");
+        const t1 = performance.now();
+        const wasm = await PrivacyFilter.create({
+          backend: "wasm",
+          wasmWeightsUrl: "/tests/fixtures/pii-weights-full.bin",
+          wasmModuleUrl: "/dist/pii.wasm",
+        });
+        const wasmWarmup = performance.now() - t1;
+        log(`wasm ready in ${wasmWarmup.toFixed(0)}ms`);
+
+        const rows = [];
+        for (const text of SEEDS) {
+          log(`\ntext: "${text.slice(0, 60)}${text.length > 60 ? "…" : ""}"`);
+          const tjsMs = await measure("transformers.js", tjs, text);
+          const wasmMs = await measure("wasm (Stage 1)", wasm, text);
+          rows.push({
+            text: text.slice(0, 80),
+            tjsMs, wasmMs,
+            speedup: tjsMs / wasmMs,
+          });
+        }
+
+        tjs.dispose();
+        wasm.dispose();
+
+        window.__result = {
+          ok: true,
+          hasWebGPU,
+          tjsWarmupMs: tjsWarmup,
+          wasmWarmupMs: wasmWarmup,
+          rows,
+        };
+        log("\ndone");
+      } catch (e) {
+        window.__result = { ok: false, error: String(e), stack: e.stack };
+        log("ERROR: " + e);
+        throw e;
+      }
+    </script>
+  </body>
+</html>

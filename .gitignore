@@ -18,3 +18,4 @@ __pycache__/
 # lives in docs/stage3-gate-measurement.md.
 data/
 measurements/
+tests/fixtures/pii-weights-full.bin

@@ -48,12 +48,26 @@ Target: 1.5–2× faster, 30–50% lower peak memory.
       within 1e-5 relative error.
 - [ ] Benchmark vs Stage 0.
 
-## Stage 2 — WebGPU with hand-tuned WGSL
+## Stage 2 — WebGPU with hand-tuned WGSL (deferred)
 
-**Goal:** faster still on capable browsers.
+**Deferred until post-shipping customer demand justifies it. The WASM
+path from Stage 1 is the minimum viable product.**
 
-Target: 2× Stage 1 on Apple Silicon / modern discrete GPUs.
+Rationale: GPU advantage for this model (50M active, single-pass
+classifier) is ~3× over CPU, not the 30-100× seen with large
+autoregressive models. Stage 1 alone delivers 200-400 ms per typical
+input — usable for every product shape we plan to ship (form
+submission, browser extension, ETL pre-processing). WGSL doubles the
+maintenance surface (conformance tests, browser-compat branches) for a
+polish win that doesn't unlock new use cases.
 
+Revisit if:
+- A customer has a long-document redaction workload (10k+ tokens per
+  request) where N²-attention on CPU becomes a real bottleneck.
+- Batch throughput (hundreds of documents / second) becomes a
+  real requirement. Desktop GPU shines at batched inference.
+
+Rough design if we end up building it:
 - [ ] WGSL kernels: int4 matmul, MoE dispatch, attention, norm.
 - [ ] JS backend (`src/js/backends/webgpu.ts`).
 - [ ] Subgroup-free reductions so Firefox works.

@@ -1,0 +1,15 @@
+node_modules/
+dist/
+zig-out/
+zig-cache/
+.zig-cache/
+*.log
+.DS_Store
+*.wasm
+!dist/*.wasm
+.env
+.env.local
+test-results/
+playwright-report/
+coverage/
+.claude/

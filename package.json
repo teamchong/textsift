@@ -1,0 +1,65 @@
+{
+  "name": "@yourorg/pii-wasm",
+  "version": "0.0.1",
+  "description": "Browser-native PII detection and redaction — runs openai/privacy-filter locally via WebGPU or WebAssembly.",
+  "type": "module",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "browser": "./dist/index.browser.js",
+      "node": "./dist/index.node.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/",
+    "LICENSE",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "pii",
+    "privacy",
+    "redaction",
+    "webgpu",
+    "webassembly",
+    "wasm",
+    "browser",
+    "openai",
+    "privacy-filter",
+    "token-classification",
+    "ner"
+  ],
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "bun build src/js/index.ts --outdir dist --target browser --format esm --sourcemap=external && bun x tsc --emitDeclarationOnly",
+    "build:zig": "zig build-exe -target wasm32-freestanding -mcpu=generic+simd128+relaxed_simd -O ReleaseFast -fstrip src/zig/wasm_exports.zig --name pii -fno-entry -rdynamic && mv pii.wasm dist/",
+    "typecheck": "bun x tsc --noEmit",
+    "test": "bun x playwright test",
+    "measure:experts": "python3 scripts/measure-experts.py",
+    "format": "bun x prettier --write src/js/",
+    "format:check": "bun x prettier --check src/js/"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^3.0.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.0",
+    "@types/node": "^22.0.0",
+    "prettier": "^3.3.0",
+    "typescript": "^5.6.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yourorg/pii-wasm.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yourorg/pii-wasm/issues"
+  },
+  "homepage": "https://github.com/yourorg/pii-wasm#readme"
+}

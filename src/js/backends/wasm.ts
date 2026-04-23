@@ -47,6 +47,7 @@ interface PiiWasmExports {
     q: number, k: number, v: number, sinks: number, out: number,
     T: number, H_q: number, H_kv: number, head_dim: number, window: number,
   ): void;
+  scale_bf16_inplace(x: number, scale: number, n: number): void;
   softmax_f32(x: number, out: number, rows: number, cols: number): void;
   swiglu_clamp_f32(gate_up: number, out: number, T: number, D: number): void;
   embed_lookup(embed: number, ids: number, out: number, T: number, V: number, D: number): void;
@@ -119,6 +120,7 @@ export async function loadPiiWasm(url: string | URL): Promise<PiiWasmExports> {
     "topk_partial_f32",
     "rope_apply",
     "banded_attention",
+    "scale_bf16_inplace",
     "softmax_f32",
     "swiglu_clamp_f32",
     "embed_lookup",

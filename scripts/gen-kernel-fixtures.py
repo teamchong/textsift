@@ -97,16 +97,42 @@ def main() -> int:
 
     cw = _load_convert_weights()
 
-    # ----- 1. Weight blob (5 tensors, with embed table truncated to V_TEST rows) -----
+    # Load the RoPE layer once — reused by several fixtures below.
+    from transformers.models.openai_privacy_filter.modeling_openai_privacy_filter import (
+        OpenAIPrivacyFilterRotaryEmbedding,
+        _apply_rotary_emb,
+    )
+    rope_layer = OpenAIPrivacyFilterRotaryEmbedding(model.config)
+
+    # ----- 1. Weight blob -----
+    #
+    # Starts from the Phase-B subset (classifier head + 2 RMSNorms) +
+    # embed table truncated to V_TEST rows. Extended with layer 0's
+    # attention weights so the attention-forward composition test can
+    # run against real, not random, parameters.
     print("[gen] building weight blob via scripts/convert_weights.py …", file=sys.stderr)
     convert = REPO_ROOT / "scripts" / "convert_weights.py"
     output_blob = FIXTURES_DIR / "pii-weights.bin"
+    attn_tensors = [
+        "model.embed_tokens.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.q_proj.bias",
+        "model.layers.0.self_attn.k_proj.weight",
+        "model.layers.0.self_attn.k_proj.bias",
+        "model.layers.0.self_attn.v_proj.weight",
+        "model.layers.0.self_attn.v_proj.bias",
+        "model.layers.0.self_attn.o_proj.weight",
+        "model.layers.0.self_attn.o_proj.bias",
+        "model.layers.0.self_attn.sinks",
+        "model.layers.0.post_attention_layernorm.weight",
+    ]
     cmd = [
         sys.executable, str(convert),
         "--output", str(output_blob),
-        "--include", "model.embed_tokens.weight",
         "--embed-rows", str(V_TEST),
     ]
+    for name in attn_tensors:
+        cmd += ["--include", name]
     subprocess.check_call(cmd)
 
     # ----- 2. RMSNorm fixture -----
@@ -192,7 +218,7 @@ def main() -> int:
     Q_in = torch.randn(att_T, att_Hq, att_hd, dtype=torch.bfloat16)
     K_in = torch.randn(att_T, att_Hkv, att_hd, dtype=torch.bfloat16)
     V_in = torch.randn(att_T, att_Hkv, att_hd, dtype=torch.bfloat16)
-    sinks = torch.randn(att_Hq, dtype=torch.bfloat16) * 0.5
+    sinks = torch.randn(att_Hq, dtype=torch.float32) * 0.5
     Q_scaled = (Q_in.float() * scale).to(torch.bfloat16)
     K_scaled = (K_in.float() * scale).to(torch.bfloat16)
 
@@ -225,7 +251,7 @@ def main() -> int:
     write(FIXTURES_DIR / "attn_q.bf16", bf16_bytes(Q_scaled.view(att_T, att_Hq * att_hd)))
     write(FIXTURES_DIR / "attn_k.bf16", bf16_bytes(K_scaled.view(att_T, att_Hkv * att_hd)))
     write(FIXTURES_DIR / "attn_v.bf16", bf16_bytes(V_in.view(att_T, att_Hkv * att_hd)))
-    write(FIXTURES_DIR / "attn_sinks.bf16", bf16_bytes(sinks))
+    write(FIXTURES_DIR / "attn_sinks.f32", sinks.numpy().tobytes())
     write(FIXTURES_DIR / "attn_out.bf16", bf16_bytes(out_ref.view(att_T, att_Hq * att_hd)))
 
     # ----- Softmax fixture (attention-shape) -----
@@ -244,16 +270,38 @@ def main() -> int:
     write(FIXTURES_DIR / "softmax_topk_x.f32", x_sm_top.numpy().tobytes())
     write(FIXTURES_DIR / "softmax_topk_y.f32", y_sm_top.numpy().tobytes())
 
+    # ----- Attention forward fixture (layer 0) -----
+    # Uses the real attention submodule with layer-0 weights so the
+    # test exercises a production-shaped parameterisation.
+    torch.manual_seed(SEED + 10)
+    att_fwd_T = 32
+    d_model = model.config.hidden_size
+    sliding = model.config.sliding_window  # 128 upstream
+
+    hidden_att = torch.randn(1, att_fwd_T, d_model, dtype=torch.bfloat16)
+    pos_ids_att = torch.arange(att_fwd_T, dtype=torch.long).unsqueeze(0)
+    cos_att, sin_att = rope_layer(hidden_att, pos_ids_att)   # each: [1, T, head_dim/2], bf16
+
+    attn_mod = model.model.layers[0].self_attn.eval()
+    # Build sliding window mask manually — additive, bf16. Mirrors what
+    # upstream's masking helpers produce for an encoder layer.
+    neg_inf = torch.finfo(torch.float32).min
+    mask = torch.zeros(att_fwd_T, att_fwd_T, dtype=torch.float32)
+    for i in range(att_fwd_T):
+        for j in range(att_fwd_T):
+            if abs(i - j) > sliding:
+                mask[i, j] = neg_inf
+    mask_4d = mask.view(1, 1, att_fwd_T, att_fwd_T).to(torch.bfloat16)
+
+    with torch.no_grad():
+        attn_out, _ = attn_mod(hidden_att, (cos_att, sin_att), attention_mask=mask_4d)
+    # attn_out: [1, T, d_model] bf16
+    attn_out = attn_out.squeeze(0).contiguous()
+
+    write(FIXTURES_DIR / "attn_fwd_hidden.bf16", bf16_bytes(hidden_att.squeeze(0).contiguous()))
+    write(FIXTURES_DIR / "attn_fwd_out.bf16", bf16_bytes(attn_out))
+
     # ----- RoPE yarn apply fixture -----
-    #
-    # Runs the upstream `OpenAIPrivacyFilterRotaryEmbedding` layer once
-    # to get cos/sin tables with yarn scaling + attention_factor baked
-    # in, then applies `_apply_rotary_emb` for the expected output.
-    from transformers.models.openai_privacy_filter.modeling_openai_privacy_filter import (
-        OpenAIPrivacyFilterRotaryEmbedding,
-        _apply_rotary_emb,
-    )
-    rope_layer = OpenAIPrivacyFilterRotaryEmbedding(model.config)
     position_ids = torch.arange(T, dtype=torch.long).unsqueeze(0)
     dummy = torch.empty(1, T, model.config.hidden_size, dtype=torch.bfloat16)
     cos_full, sin_full = rope_layer(dummy, position_ids)         # each: [1, T, head_dim/2], bf16

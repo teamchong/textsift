@@ -936,6 +936,36 @@ export fn softmax_f32(
 }
 
 // --------------------------------------------------------------
+// Kernel: in-place bf16 scale
+// --------------------------------------------------------------
+//
+// `x[i] = bf16(bf16(x[i]) * scale)` for i in 0..n.
+// Used by the attention composition to multiply Q and K by
+// `head_dim^-0.25` after RoPE. Upstream applies this as an explicit
+// Python multiply, one rounding per element — we match.
+
+export fn scale_bf16_inplace(
+    x_ptr: [*]u16,
+    scale: f32,
+    n: u32,
+) void {
+    const Nz: usize = n;
+    const scale_vec: @Vector(4, f32) = @splat(scale);
+    var i: usize = 0;
+    while (i + 4 <= Nz) : (i += 4) {
+        const xu: @Vector(4, u16) = x_ptr[i ..][0..4].*;
+        const scaled: @Vector(4, f32) = bf16x4ToF32x4(xu) * scale_vec;
+        x_ptr[i + 0] = f32ToBf16(scaled[0]);
+        x_ptr[i + 1] = f32ToBf16(scaled[1]);
+        x_ptr[i + 2] = f32ToBf16(scaled[2]);
+        x_ptr[i + 3] = f32ToBf16(scaled[3]);
+    }
+    while (i < Nz) : (i += 1) {
+        x_ptr[i] = f32ToBf16(bf16ToF32(x_ptr[i]) * scale);
+    }
+}
+
+// --------------------------------------------------------------
 // Kernel: banded GQA attention with sinks
 // --------------------------------------------------------------
 //
@@ -961,7 +991,7 @@ export fn softmax_f32(
 //   q:     bf16 [T, H_q * head_dim]
 //   k:     bf16 [T, H_kv * head_dim]
 //   v:     bf16 [T, H_kv * head_dim]
-//   sinks: bf16 [H_q]
+//   sinks: f32  [H_q]                 (upstream keeps sinks in fp32)
 //   out:   bf16 [T, H_q * head_dim]
 //
 // Constraint: `H_q % H_kv == 0` (GQA). Window is one-sided — `window=128`
@@ -1026,7 +1056,7 @@ export fn banded_attention(
     q_ptr: [*]const u16,
     k_ptr: [*]const u16,
     v_ptr: [*]const u16,
-    sinks_ptr: [*]const u16,
+    sinks_ptr: [*]const f32,
     out_ptr: [*]u16,
     T: u32,
     H_q: u32,
@@ -1060,7 +1090,7 @@ export fn banded_attention(
             const we: usize = if (t_q + Wz + 1 < Tz) t_q + Wz + 1 else Tz;
             const n_keys: usize = we - ws;
 
-            const sink_logit: f32 = bf16ToF32(sinks_ptr[h_q]);
+            const sink_logit: f32 = sinks_ptr[h_q];
             var row_max: f32 = sink_logit;
 
             var t_k: usize = 0;

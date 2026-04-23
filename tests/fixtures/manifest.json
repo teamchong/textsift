@@ -101,11 +101,33 @@
       "abs_tol": 1e-7
     },
     {
+      "name": "attention_forward",
+      "hidden": "attn_fwd_hidden.bf16",
+      "expected": "attn_fwd_out.bf16",
+      "T": 32,
+      "H_q": 14,
+      "H_kv": 2,
+      "head_dim": 64,
+      "hidden_size": 640,
+      "window": 128,
+      "rope": {
+        "theta": 150000.0,
+        "factor": 32.0,
+        "original_max_position_embeddings": 4096,
+        "beta_fast": 32.0,
+        "beta_slow": 1.0,
+        "truncate": false
+      },
+      "rel_tol": 5e-2,
+      "abs_tol": 5e-2,
+      "note": "End-to-end attention: Q/K/V projections + RoPE + scale + banded attention + O projection. Tolerance is loose (10% rel, 5% abs) because our matmul chain accumulates in f32 through to the final bf16 round, while PyTorch rounds to bf16 between every op — drift compounds across 4 matmuls. Real layer-0 weights from openai/privacy-filter."
+    },
+    {
       "name": "banded_attention",
       "q": "attn_q.bf16",
       "k": "attn_k.bf16",
       "v": "attn_v.bf16",
-      "sinks": "attn_sinks.bf16",
+      "sinks": "attn_sinks.f32",
       "expected": "attn_out.bf16",
       "T": 32,
       "H_q": 14,

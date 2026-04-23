@@ -13,6 +13,8 @@
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { attentionForward } from "../src/js/inference/attention.ts";
+import { buildRopeTables } from "../src/js/inference/rope.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, "..");
@@ -66,9 +68,12 @@ async function loadWeights(ex) {
     const name = dec.decode(new Uint8Array(ex.memory.buffer, nameBuf, nameLen));
     map.set(name, {
       ptr: ex.weights_data_ptr(i),
+      dataOffset: ex.weights_data_ptr(i),
       size: ex.weights_data_size(i),
+      dataSize: ex.weights_data_size(i),
       shape,
       dtype: ex.weights_dtype(i),
+      name,
     });
   }
   // Drop parsing scratch; weights stay below the mark.
@@ -186,6 +191,69 @@ async function runEmbed(ex, weights, spec) {
   const outPtr = ex.alloc(expected.byteLength);
   ex.embed_lookup(embed.ptr, idsPtr, outPtr, spec.T, spec.V, spec.D);
   return compareU16(ex, outPtr, expected);
+}
+
+async function runAttentionForward(ex, weights, spec) {
+  const hidden = await loadFixture(spec.hidden);
+  const expected = await loadFixture(spec.expected);
+  const hiddenPtr = allocAndCopy(ex, hidden);
+
+  // RoPE tables: compute via the JS rope helper, copy into WASM memory.
+  const { cos, sin } = buildRopeTables(
+    {
+      headDim: spec.head_dim,
+      theta: spec.rope.theta,
+      factor: spec.rope.factor,
+      originalMaxPositionEmbeddings: spec.rope.original_max_position_embeddings,
+      betaFast: spec.rope.beta_fast,
+      betaSlow: spec.rope.beta_slow,
+      truncate: spec.rope.truncate,
+    },
+    spec.T,
+  );
+  const cosBytes = new Uint8Array(cos.buffer, cos.byteOffset, cos.byteLength);
+  const sinBytes = new Uint8Array(sin.buffer, sin.byteOffset, sin.byteLength);
+  const cosPtr = allocAndCopy(ex, cosBytes);
+  const sinPtr = allocAndCopy(ex, sinBytes);
+
+  const outPtr = ex.alloc(expected.byteLength);
+
+  const w = (name) => {
+    const t = weights.get(name);
+    if (!t) throw new Error(`missing tensor: ${name}`);
+    return t;
+  };
+
+  attentionForward(
+    ex, hiddenPtr, outPtr,
+    {
+      qProj: w("model.layers.0.self_attn.q_proj.weight"),
+      qProjBias: w("model.layers.0.self_attn.q_proj.bias"),
+      kProj: w("model.layers.0.self_attn.k_proj.weight"),
+      kProjBias: w("model.layers.0.self_attn.k_proj.bias"),
+      vProj: w("model.layers.0.self_attn.v_proj.weight"),
+      vProjBias: w("model.layers.0.self_attn.v_proj.bias"),
+      oProj: w("model.layers.0.self_attn.o_proj.weight"),
+      oProjBias: w("model.layers.0.self_attn.o_proj.bias"),
+      sinks: w("model.layers.0.self_attn.sinks"),
+    },
+    {
+      hiddenSize: spec.hidden_size,
+      numHeads: spec.H_q,
+      numKvHeads: spec.H_kv,
+      headDim: spec.head_dim,
+      slidingWindow: spec.window,
+    },
+    { ropeCosPtr: cosPtr, ropeSinPtr: sinPtr },
+    spec.T,
+  );
+
+  return {
+    tolerance: { relTol: spec.rel_tol, absTol: spec.abs_tol ?? 0 },
+    ...compareBf16Tolerance(ex, outPtr, expected, {
+      relTol: spec.rel_tol, absTol: spec.abs_tol ?? 0,
+    }),
+  };
 }
 
 async function runBandedAttention(ex, _weights, spec) {
@@ -410,6 +478,7 @@ const RUNNERS = {
   matmul_bf16_out_f32: runMatmulOutF32,
   topk_partial_f32: runTopk,
   banded_attention: runBandedAttention,
+  attention_forward: runAttentionForward,
 };
 
 async function main() {

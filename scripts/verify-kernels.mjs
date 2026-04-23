@@ -188,6 +188,51 @@ async function runEmbed(ex, weights, spec) {
   return compareU16(ex, outPtr, expected);
 }
 
+async function runSoftmaxF32(ex, _weights, spec) {
+  const x = await loadFixture(spec.x);
+  const expected = await loadFixture(spec.expected);
+  const xPtr = allocAndCopy(ex, x);
+  const outPtr = ex.alloc(expected.byteLength);
+  ex.softmax_f32(xPtr, outPtr, spec.rows, spec.cols);
+  // Compare as f32 with tolerance — exp has >1 ULP drift vs libm.
+  const got = new Float32Array(ex.memory.buffer, outPtr, expected.byteLength >>> 2);
+  const want = new Float32Array(
+    expected.buffer,
+    expected.byteOffset,
+    expected.byteLength >>> 2,
+  );
+  let maxAbs = 0;
+  let maxRel = 0;
+  let sumSq = 0;
+  let fails = 0;
+  let firstFail = -1;
+  for (let i = 0; i < want.length; i++) {
+    const g = got[i];
+    const w = want[i];
+    const abs = Math.abs(g - w);
+    const rel = Math.abs(w) > 0 ? abs / Math.abs(w) : abs;
+    if (abs > maxAbs) maxAbs = abs;
+    if (rel > maxRel) maxRel = rel;
+    sumSq += abs * abs;
+    const tol = Math.max(spec.abs_tol ?? 0, spec.rel_tol * Math.abs(w));
+    if (abs > tol) {
+      fails++;
+      if (firstFail === -1) firstFail = i;
+    }
+  }
+  return {
+    tolerance: { relTol: spec.rel_tol, absTol: spec.abs_tol ?? 0 },
+    total: want.length,
+    fails,
+    firstFail,
+    maxAbs,
+    maxRel,
+    rms: Math.sqrt(sumSq / want.length),
+    got: new Uint16Array(0),
+    want: new Uint16Array(0),
+  };
+}
+
 async function runRopeApply(ex, _weights, spec) {
   const qkIn = await loadFixture(spec.qk_in);
   const cos = await loadFixture(spec.cos);
@@ -229,6 +274,7 @@ const RUNNERS = {
   embed_lookup: runEmbed,
   matmul_bf16_x_int4block: runMatmulInt4,
   rope_apply: runRopeApply,
+  softmax_f32: runSoftmaxF32,
 };
 
 async function main() {

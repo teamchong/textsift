@@ -134,6 +134,22 @@ def main() -> int:
     write(FIXTURES_DIR / "embed_ids.i32", ids.numpy().tobytes())
     write(FIXTURES_DIR / "embed_out.bf16", bf16_bytes(y_embed))
 
+    # ----- Softmax fixture (attention-shape) -----
+    #
+    # Shape picked to exercise both the "long" row (attention scores +
+    # sink = window*2 + 1 cells) and a small even one (router top-k).
+    torch.manual_seed(SEED + 5)
+    x_sm_att = torch.randn(8, 257, dtype=torch.float32) * 3.0  # spread logits
+    y_sm_att = F.softmax(x_sm_att, dim=-1)
+    write(FIXTURES_DIR / "softmax_att_x.f32", x_sm_att.numpy().tobytes())
+    write(FIXTURES_DIR / "softmax_att_y.f32", y_sm_att.numpy().tobytes())
+
+    torch.manual_seed(SEED + 6)
+    x_sm_top = torch.randn(16, 4, dtype=torch.float32)
+    y_sm_top = F.softmax(x_sm_top, dim=-1)
+    write(FIXTURES_DIR / "softmax_topk_x.f32", x_sm_top.numpy().tobytes())
+    write(FIXTURES_DIR / "softmax_topk_y.f32", y_sm_top.numpy().tobytes())
+
     # ----- RoPE yarn apply fixture -----
     #
     # Runs the upstream `OpenAIPrivacyFilterRotaryEmbedding` layer once

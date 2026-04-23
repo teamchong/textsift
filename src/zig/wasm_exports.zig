@@ -677,6 +677,61 @@ export fn matmul_bf16_x_int4block(
 }
 
 // --------------------------------------------------------------
+// Kernel: row-wise softmax, f32 in / f32 out, numerically stable
+// --------------------------------------------------------------
+//
+// out[r, c] = exp(x[r, c] - max_c(x[r, :])) / sum_c(exp(...))
+//
+// Used by attention (scores + sink, softmax over the last axis in f32
+// per the upstream `dtype=torch.float32` argument) and by the router
+// (top-4 scores).
+//
+// Three passes over each row: max, exp+sum, normalize. Exp is scalar
+// per lane — WASM has no vector exp; Zig's `@exp` compiles to its
+// freestanding software implementation.
+
+export fn softmax_f32(
+    x_ptr: [*]const f32,
+    out_ptr: [*]f32,
+    rows: u32,
+    cols: u32,
+) void {
+    const Rz: usize = rows;
+    const Cz: usize = cols;
+
+    var r: usize = 0;
+    while (r < Rz) : (r += 1) {
+        const row_base = r * Cz;
+
+        // Pass 1: max over the row.
+        var row_max: f32 = x_ptr[row_base];
+        var c: usize = 1;
+        while (c < Cz) : (c += 1) {
+            const v = x_ptr[row_base + c];
+            if (v > row_max) row_max = v;
+        }
+
+        // Pass 2: exp(x - max), accumulate sum.
+        var sum: f32 = 0.0;
+        c = 0;
+        while (c < Cz) : (c += 1) {
+            const e = @exp(x_ptr[row_base + c] - row_max);
+            out_ptr[row_base + c] = e;
+            sum += e;
+        }
+
+        // Pass 3: divide by sum. If sum is zero (shouldn't happen with
+        // max-subtract, but defensive), emit 1/C as a uniform distribution
+        // so downstream ops don't NaN.
+        const inv_sum: f32 = if (sum > 0.0) 1.0 / sum else 1.0 / @as(f32, @floatFromInt(Cz));
+        c = 0;
+        while (c < Cz) : (c += 1) {
+            out_ptr[row_base + c] *= inv_sum;
+        }
+    }
+}
+
+// --------------------------------------------------------------
 // Kernel: RoPE apply (interleaved layout)
 // --------------------------------------------------------------
 //

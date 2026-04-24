@@ -1,10 +1,10 @@
 /**
  * Runtime backend selection.
  *
- * Stage 0 ships a single backend — transformers.js, running the quantized
- * ONNX model via ORT Web's WebGPU execution provider. Stage 1 adds a
- * Zig+WASM path; this module picks between them based on the
- * caller-declared backend.
+ * Stage 0 ships the transformers.js backend (ORT Web WebGPU EP). Stage 1
+ * adds a custom Zig+WASM path. Stage 2 adds a custom WGSL path. All three
+ * consume the same `onnx/model_q4f16.onnx` + `.onnx_data` and produce the
+ * same logit shape; the selection is purely an execution-engine choice.
  */
 
 import type { InferenceBackend } from "./abstract.js";
@@ -16,12 +16,20 @@ export interface SelectOptions {
   device: "auto" | "wasm" | "webgpu";
   bundle: LoadedModelBundle;
   /** Explicit backend selection. Defaults to the transformers.js path. */
-  backend?: "auto" | "transformers-js" | "wasm";
+  backend?: "auto" | "transformers-js" | "wasm" | "webgpu";
   /** Override for the `pii.wasm` module URL. Defaults to the bytes inlined into the JS bundle. */
   wasmModuleUrl?: string | URL;
 }
 
 export async function selectBackend(opts: SelectOptions): Promise<InferenceBackend> {
+  if (opts.backend === "webgpu") {
+    const { WebGpuBackend } = await import("./webgpu.js");
+    return new WebGpuBackend({
+      bundle: opts.bundle,
+      quantization: opts.quantization,
+      device: opts.device,
+    });
+  }
   if (opts.backend === "wasm") {
     const { WasmBackend } = await import("./wasm.js");
     return new WasmBackend({

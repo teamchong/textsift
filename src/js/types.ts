@@ -100,9 +100,11 @@ export interface CreateOptions {
    *     `onnx/model_q4f16.onnx` + `.onnx_data` from `modelSource` as
    *     the transformers.js path; both backends share one download and
    *     one HTTP cache entry per browser.
-   * WebGPU (custom WGSL) is deferred — see `docs/roadmap.md`.
+   *   - `"webgpu"`: Stage-2 custom WGSL backend. Same ONNX weights,
+   *     same HTTP cache. Requires `shader-f16`; throws if the adapter
+   *     can't enable it — caller should fall back to `"wasm"`.
    */
-  backend?: "auto" | "wasm";
+  backend?: "auto" | "wasm" | "webgpu";
 
   /**
    * Override the URL of the `pii.wasm` module. Defaults to a sibling of

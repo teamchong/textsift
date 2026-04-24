@@ -174,25 +174,26 @@ export class PrivacyFilter {
       const calibration = loadCalibration(bundle.calibrationJson);
       const tokenizer = await Tokenizer.fromBundle(bundle);
 
-      // Stage-1 Zig+WASM backend is requested explicitly via
-      // `backend: "wasm"`. Anything else routes to
-      // transformers.js. In browsers, transformers.js wants WebGPU
-      // (q4f16 needs MatMulNBits / GatherBlockQuantized with no WASM
-      // CPU kernel); in Node, onnxruntime-node picks CPU automatically
-      // and doesn't accept a "wasm" device string.
+      // Stage-1 (Zig+WASM) and Stage-2 (WGSL) backends are requested
+      // explicitly via `backend: "wasm"` / `backend: "webgpu"`. Anything
+      // else routes to transformers.js. In browsers transformers.js
+      // wants WebGPU (q4f16 needs MatMulNBits / GatherBlockQuantized,
+      // neither of which has an ORT-Web WASM kernel); in Node,
+      // onnxruntime-node picks CPU automatically and doesn't accept
+      // a "wasm" device string.
       const wantsStage1 = this.opts.backend === "wasm";
+      const wantsStage2 = this.opts.backend === "webgpu";
       const hasWebGPU = typeof navigator !== "undefined"
         && !!(navigator as { gpu?: unknown }).gpu;
       const device: "auto" | "wasm" | "webgpu" = hasWebGPU ? "webgpu" : "auto";
-      progress?.({
-        stage: "compile",
-        backend: wantsStage1 ? "wasm" : (device === "webgpu" ? "webgpu" : "wasm"),
-      });
+      const compileBackend: "webgpu" | "wasm" =
+        wantsStage2 || (!wantsStage1 && device === "webgpu") ? "webgpu" : "wasm";
+      progress?.({ stage: "compile", backend: compileBackend });
       const backend = await selectBackend({
         quantization: this.opts.quantization ?? "int8",
         device,
         bundle,
-        backend: wantsStage1 ? "wasm" : "transformers-js",
+        backend: wantsStage2 ? "webgpu" : wantsStage1 ? "wasm" : "transformers-js",
         wasmModuleUrl: this.opts.wasmModuleUrl,
       });
 

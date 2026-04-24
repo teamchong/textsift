@@ -1,0 +1,72 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>pii-wasm — WebGPU span smoke</title>
+  </head>
+  <body>
+    <pre id="out">starting</pre>
+    <script type="module">
+      // Cross-backend span parity for the Stage-2 WebGPU backend: run
+      // the same English sentence through the transformers.js backend
+      // and the custom WGSL backend via the public API, and assert
+      // span-for-span agreement. Both read the same ONNX model, so any
+      // divergence is a kernel port bug.
+      import { PrivacyFilter } from "/dist/index.js";
+
+      const $out = document.getElementById("out");
+      const log = (m) => { $out.textContent += "\n" + m; };
+
+      const TEXT = "Hi, my name is John Smith and my email is john@example.com.";
+
+      try {
+        log("create transformers.js backend");
+        const tjs = await PrivacyFilter.create({});
+        log("create webgpu backend");
+        const t0 = performance.now();
+        const gpu = await PrivacyFilter.create({ backend: "webgpu" });
+        const tWarmup = performance.now() - t0;
+        log(`webgpu backend warmup=${tWarmup.toFixed(0)}ms`);
+
+        log(`detect("${TEXT.slice(0, 40)}…")`);
+        const t1 = performance.now();
+        const [tjsDet, gpuDet] = await Promise.all([
+          tjs.detect(TEXT),
+          gpu.detect(TEXT),
+        ]);
+        const tForward = performance.now() - t1;
+
+        const sameCount = tjsDet.spans.length === gpuDet.spans.length;
+        const spanPairs = [];
+        const n = Math.min(tjsDet.spans.length, gpuDet.spans.length);
+        let agreeAll = sameCount;
+        for (let i = 0; i < n; i++) {
+          const a = tjsDet.spans[i];
+          const b = gpuDet.spans[i];
+          const ok = a.start === b.start && a.end === b.end && a.label === b.label;
+          if (!ok) agreeAll = false;
+          spanPairs.push({ tjs: a, gpu: b, ok });
+        }
+
+        tjs.dispose();
+        gpu.dispose();
+
+        window.__result = {
+          ok: agreeAll,
+          text: TEXT,
+          tjsSpans: tjsDet.spans,
+          gpuSpans: gpuDet.spans,
+          sameCount,
+          spanPairs,
+          tWarmupMs: tWarmup,
+          tForwardMs: tForward,
+        };
+        log(`done: agree=${agreeAll} tjs=${tjsDet.spans.length} gpu=${gpuDet.spans.length}`);
+      } catch (e) {
+        window.__result = { ok: false, error: String(e), stack: e.stack };
+        log("ERROR: " + e);
+        throw e;
+      }
+    </script>
+  </body>
+</html>

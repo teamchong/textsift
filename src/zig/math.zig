@@ -106,6 +106,13 @@ pub inline fn alignUp(x: usize, a: usize) usize {
     return (x + (a - 1)) & ~@as(usize, a - 1);
 }
 
+// Imported from src/c/fma.c (always_inline), built via `zig build-exe`
+// with `-flto`. Emits a single `f32x4.relaxed_madd` op inlined into
+// every caller. Zig's own `@mulAdd(@Vector(4, f32), …)` falls back to
+// scalar per-lane software FMA on wasm. Returns `a * b + c` with
+// fused-or-unfused rounding at V8's choice.
+pub extern fn relaxed_madd_f32x4(a: @Vector(4, f32), b: @Vector(4, f32), c: @Vector(4, f32)) @Vector(4, f32);
+
 // --------------------------------------------------------------
 // Tests
 // --------------------------------------------------------------

@@ -29,6 +29,7 @@ const fp16ToF32 = math.fp16ToF32;
 const f32ToFp16 = math.f32ToFp16;
 const fp16x4ToF32x4 = math.fp16x4ToF32x4;
 const alignUp = math.alignUp;
+const fma4 = math.relaxed_madd_f32x4;
 
 // --------------------------------------------------------------
 // Bump allocator
@@ -483,22 +484,22 @@ inline fn matmulInt4BlockImpl(
                     const j = k * 8;
                     const qf0 = q_chunks[k * 2];
                     const qf1 = q_chunks[k * 2 + 1];
-                    v0 += loadX4(XType, x_ptr, (tt + 0) * Dz + block_d + j) * qf0;
-                    v0 += loadX4(XType, x_ptr, (tt + 0) * Dz + block_d + j + 4) * qf1;
-                    v1 += loadX4(XType, x_ptr, (tt + 1) * Dz + block_d + j) * qf0;
-                    v1 += loadX4(XType, x_ptr, (tt + 1) * Dz + block_d + j + 4) * qf1;
-                    v2 += loadX4(XType, x_ptr, (tt + 2) * Dz + block_d + j) * qf0;
-                    v2 += loadX4(XType, x_ptr, (tt + 2) * Dz + block_d + j + 4) * qf1;
-                    v3 += loadX4(XType, x_ptr, (tt + 3) * Dz + block_d + j) * qf0;
-                    v3 += loadX4(XType, x_ptr, (tt + 3) * Dz + block_d + j + 4) * qf1;
-                    v4 += loadX4(XType, x_ptr, (tt + 4) * Dz + block_d + j) * qf0;
-                    v4 += loadX4(XType, x_ptr, (tt + 4) * Dz + block_d + j + 4) * qf1;
-                    v5 += loadX4(XType, x_ptr, (tt + 5) * Dz + block_d + j) * qf0;
-                    v5 += loadX4(XType, x_ptr, (tt + 5) * Dz + block_d + j + 4) * qf1;
-                    v6 += loadX4(XType, x_ptr, (tt + 6) * Dz + block_d + j) * qf0;
-                    v6 += loadX4(XType, x_ptr, (tt + 6) * Dz + block_d + j + 4) * qf1;
-                    v7 += loadX4(XType, x_ptr, (tt + 7) * Dz + block_d + j) * qf0;
-                    v7 += loadX4(XType, x_ptr, (tt + 7) * Dz + block_d + j + 4) * qf1;
+                    v0 = fma4(loadX4(XType, x_ptr, (tt + 0) * Dz + block_d + j),     qf0, v0);
+                    v0 = fma4(loadX4(XType, x_ptr, (tt + 0) * Dz + block_d + j + 4), qf1, v0);
+                    v1 = fma4(loadX4(XType, x_ptr, (tt + 1) * Dz + block_d + j),     qf0, v1);
+                    v1 = fma4(loadX4(XType, x_ptr, (tt + 1) * Dz + block_d + j + 4), qf1, v1);
+                    v2 = fma4(loadX4(XType, x_ptr, (tt + 2) * Dz + block_d + j),     qf0, v2);
+                    v2 = fma4(loadX4(XType, x_ptr, (tt + 2) * Dz + block_d + j + 4), qf1, v2);
+                    v3 = fma4(loadX4(XType, x_ptr, (tt + 3) * Dz + block_d + j),     qf0, v3);
+                    v3 = fma4(loadX4(XType, x_ptr, (tt + 3) * Dz + block_d + j + 4), qf1, v3);
+                    v4 = fma4(loadX4(XType, x_ptr, (tt + 4) * Dz + block_d + j),     qf0, v4);
+                    v4 = fma4(loadX4(XType, x_ptr, (tt + 4) * Dz + block_d + j + 4), qf1, v4);
+                    v5 = fma4(loadX4(XType, x_ptr, (tt + 5) * Dz + block_d + j),     qf0, v5);
+                    v5 = fma4(loadX4(XType, x_ptr, (tt + 5) * Dz + block_d + j + 4), qf1, v5);
+                    v6 = fma4(loadX4(XType, x_ptr, (tt + 6) * Dz + block_d + j),     qf0, v6);
+                    v6 = fma4(loadX4(XType, x_ptr, (tt + 6) * Dz + block_d + j + 4), qf1, v6);
+                    v7 = fma4(loadX4(XType, x_ptr, (tt + 7) * Dz + block_d + j),     qf0, v7);
+                    v7 = fma4(loadX4(XType, x_ptr, (tt + 7) * Dz + block_d + j + 4), qf1, v7);
                 }
 
                 const block_contribs: @Vector(8, f32) = .{
@@ -555,8 +556,8 @@ inline fn matmulInt4BlockImpl(
                         const j = k * 8;
                         const xu0 = loadX4(XType, x_ptr, (tt + ti) * Dz + block_d + j);
                         const xu1 = loadX4(XType, x_ptr, (tt + ti) * Dz + block_d + j + 4);
-                        a0 += xu0 * q_chunks[k * 2];
-                        a1 += xu1 * q_chunks[k * 2 + 1];
+                        a0 = fma4(xu0, q_chunks[k * 2],     a0);
+                        a1 = fma4(xu1, q_chunks[k * 2 + 1], a1);
                     }
                     const combined: @Vector(4, f32) = a0 + a1;
                     accs[ti] += ((combined[0] + combined[1]) + (combined[2] + combined[3])) * scale;

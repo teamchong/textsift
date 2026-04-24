@@ -52,29 +52,22 @@ pub inline fn f32ToFp16(f: f32) u16 {
 
 pub inline fn fp16x4ToF32x4(u: @Vector(4, u16)) @Vector(4, f32) {
     // Zig/LLVM doesn't vectorise `@floatCast(@Vector(4, f16))` on wasm
-    // (emits an invalid cast). Inline an integer-ops widening: build the
-    // f32 bit pattern from the fp16 bits and reinterpret. Handles the
-    // finite-normal + zero cases model weights actually see. Subnormals
-    // and inf/NaN fall through to a non-IEEE result, which is fine for
-    // trained-model tensors.
+    // (emits an invalid cast). Widen via integer bit-ops directly on
+    // the v128 register: for any finite non-zero fp16, the f32 bit
+    // pattern is `sign<<16 | ((bits & 0x7fff) << 13) + (112<<23)`.
+    // Zero input must stay zero; mask the exp/mantissa word by
+    // `non_sign != 0`. Subnormals and inf/NaN fall through to a
+    // non-IEEE result, which is fine for trained-model tensors.
     const u32v: @Vector(4, u32) = u;
-    const sign_shifted: @Vector(4, u32) =
-        (u32v & @as(@Vector(4, u32), @splat(0x8000))) << @splat(16);
-    const exp_nib: @Vector(4, u32) =
-        (u32v >> @splat(10)) & @as(@Vector(4, u32), @splat(0x1f));
-    const mant_nib: @Vector(4, u32) =
-        u32v & @as(@Vector(4, u32), @splat(0x3ff));
-    // exp==0 → zero (for non-subnormals). exp+112 is the rebase from
-    // fp16 bias 15 to f32 bias 127. Subnormals would need normalization
-    // — we accept the drift (trained weights ≫ 2^-14).
-    const exp_mask: @Vector(4, u32) =
-        @select(u32, exp_nib == @as(@Vector(4, u32), @splat(0)),
-            @as(@Vector(4, u32), @splat(0)),
-            @as(@Vector(4, u32), @splat(0xFFFF_FFFF)));
-    const f32_exp: @Vector(4, u32) =
-        ((exp_nib + @as(@Vector(4, u32), @splat(112))) << @splat(23)) & exp_mask;
-    const f32_mant: @Vector(4, u32) = (mant_nib << @splat(13)) & exp_mask;
-    const bits: @Vector(4, u32) = sign_shifted | f32_exp | f32_mant;
+    const SIGN_MASK: @Vector(4, u32) = @splat(0x8000);
+    const REST_MASK: @Vector(4, u32) = @splat(0x7fff);
+    const EXP_BIAS: @Vector(4, u32) = @splat(112 << 23);
+    const ZERO: @Vector(4, u32) = @splat(0);
+    const sign_shifted = (u32v & SIGN_MASK) << @splat(16);
+    const non_sign = u32v & REST_MASK;
+    const biased = (non_sign << @splat(13)) +% EXP_BIAS;
+    const biased_safe = @select(u32, non_sign != ZERO, biased, ZERO);
+    const bits: @Vector(4, u32) = sign_shifted | biased_safe;
     return @bitCast(bits);
 }
 

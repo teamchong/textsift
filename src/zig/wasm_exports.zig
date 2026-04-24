@@ -523,19 +523,20 @@ inline fn matmulInt4BlockImpl(
         }
     }
 
-    // T tail for T not divisible by 4. One row at a time, same decode
-    // pattern without the cross-row amortization.
-    while (tt < Tz) : (tt += 1) {
-        const x_base = tt * Dz;
-        const out_base = tt * Nz;
-
+    // T tail for T not divisible by 4 (hot for expert dispatch — each
+    // expert sees m ∈ {1..K×T/E} tokens, often 1-3). Walk blocks in the
+    // outer loop so one decode serves all m_tail tokens instead of
+    // re-decoding per token. Accumulators are a small stack array
+    // (m_tail ≤ TR-1 = 3).
+    const m_tail: usize = Tz - tt;
+    if (m_tail > 0) {
         var n: usize = 0;
         while (n < Nz) : (n += 1) {
             const w_int4_row = w_ptr + n * w_int4_stride;
             const w_scale_row = scales_base + n * w_scale_stride;
             const w_zp_row: ?[*]const u8 = if (w_zp_ptr) |p| p + n * w_zp_stride else null;
 
-            var acc: f32 = 0.0;
+            var accs: [TR - 1]f32 = .{ 0.0, 0.0, 0.0 };
             var b: usize = 0;
             while (b < w_scale_stride) : (b += 1) {
                 const scale = fp16ToF32(w_scale_row[b]);
@@ -543,23 +544,27 @@ inline fn matmulInt4BlockImpl(
                 const zp: u8 = if (w_zp_row) |p| extractZp(p, b) else 0;
                 const q_chunks = int4BlockDecode(w_int4_row, block_d, zp);
 
-                var a0: @Vector(4, f32) = @splat(0);
-                var a1: @Vector(4, f32) = @splat(0);
-                inline for (0..4) |k| {
-                    const j = k * 8;
-                    const xu0 = loadX4(XType, x_ptr, x_base + block_d + j);
-                    const xu1 = loadX4(XType, x_ptr, x_base + block_d + j + 4);
-                    a0 += xu0 * q_chunks[k * 2];
-                    a1 += xu1 * q_chunks[k * 2 + 1];
+                var ti: usize = 0;
+                while (ti < m_tail) : (ti += 1) {
+                    var a0: @Vector(4, f32) = @splat(0);
+                    var a1: @Vector(4, f32) = @splat(0);
+                    inline for (0..4) |k| {
+                        const j = k * 8;
+                        const xu0 = loadX4(XType, x_ptr, (tt + ti) * Dz + block_d + j);
+                        const xu1 = loadX4(XType, x_ptr, (tt + ti) * Dz + block_d + j + 4);
+                        a0 += xu0 * q_chunks[k * 2];
+                        a1 += xu1 * q_chunks[k * 2 + 1];
+                    }
+                    const combined: @Vector(4, f32) = a0 + a1;
+                    accs[ti] += ((combined[0] + combined[1]) + (combined[2] + combined[3])) * scale;
                 }
-                const combined: @Vector(4, f32) = a0 + a1;
-                const block_sum: f32 =
-                    (combined[0] + combined[1]) + (combined[2] + combined[3]);
-                acc += block_sum * scale;
             }
 
-            acc += fp16ToF32(bias_ptr[n]);
-            storeOut(OutType, out_ptr, out_base + n, acc);
+            const b_val = fp16ToF32(bias_ptr[n]);
+            var ti: usize = 0;
+            while (ti < m_tail) : (ti += 1) {
+                storeOut(OutType, out_ptr, (tt + ti) * Nz + n, accs[ti] + b_val);
+            }
         }
     }
 }

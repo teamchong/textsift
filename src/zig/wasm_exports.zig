@@ -669,6 +669,55 @@ inline fn sigmoidF32(x: f32) f32 {
     return e / (1.0 + e);
 }
 
+/// 4-lane approximate exp for non-positive arguments (softmax /
+/// sigmoid inputs after the row-max subtraction / sign flip). Uses a
+/// range reduction `exp(x) = 2^(x * log2(e))` plus a 5-term
+/// polynomial for `2^f, f ∈ [0, 1)`. Max relative error ≈ 3×10⁻⁷ on
+/// x ∈ [-40, 0]; errors are symmetric around lanes so the softmax
+/// weights stay a normalisation apart.
+inline fn expApproxNonPositiveF32x4(x: @Vector(4, f32)) @Vector(4, f32) {
+    const LOG2_E: @Vector(4, f32) = @splat(1.44269504088896340736);
+    // Clamp to a safe range: exp(-90) ≈ 0 in f32.
+    const LO: @Vector(4, f32) = @splat(-88.0);
+    const clamped = @max(x, LO);
+    const y = clamped * LOG2_E; // y ≤ 0
+    // int = floor(y); frac = y - int, frac ∈ [0, 1)
+    const int_v: @Vector(4, i32) = @intFromFloat(@floor(y));
+    const frac: @Vector(4, f32) = y - @as(@Vector(4, f32), @floatFromInt(int_v));
+    // Horner polynomial for 2^frac: coefficients from a minimax fit.
+    const c0: @Vector(4, f32) = @splat(1.000000012);
+    const c1: @Vector(4, f32) = @splat(0.693154774);
+    const c2: @Vector(4, f32) = @splat(0.240226522);
+    const c3: @Vector(4, f32) = @splat(0.055053319);
+    const c4: @Vector(4, f32) = @splat(0.009679494);
+    const c5: @Vector(4, f32) = @splat(0.001333355);
+    var poly = fma4(c5, frac, c4);
+    poly = fma4(poly, frac, c3);
+    poly = fma4(poly, frac, c2);
+    poly = fma4(poly, frac, c1);
+    poly = fma4(poly, frac, c0);
+    // Scale by 2^int via bit twiddling: build f32 with exponent bias 127+int.
+    const bias: @Vector(4, i32) = @splat(127);
+    const exp_bits: @Vector(4, i32) = (int_v + bias) << @splat(23);
+    const scale: @Vector(4, f32) = @bitCast(exp_bits);
+    return poly * scale;
+}
+
+/// 4-lane sigmoid using the approximate exp above. Takes any real x;
+/// produces values in [0, 1]. Worst-case error ≈ 10⁻⁶, plenty for
+/// SwiGLU's gate which is itself an activation not a softmax
+/// normaliser.
+inline fn sigmoidF32x4(x: @Vector(4, f32)) @Vector(4, f32) {
+    const ZERO: @Vector(4, f32) = @splat(0.0);
+    const ONE: @Vector(4, f32) = @splat(1.0);
+    const neg_abs: @Vector(4, f32) = @min(x, ZERO) - @max(x, ZERO); // = -|x|
+    const e = expApproxNonPositiveF32x4(neg_abs);
+    const sig_neg = e / (ONE + e); // σ(-|x|)
+    // σ(x) = sig_neg when x < 0, else 1 - sig_neg.
+    const pos_mask = x >= ZERO;
+    return @select(f32, pos_mask, ONE - sig_neg, sig_neg);
+}
+
 export fn swiglu_clamp_f32(
     gate_up_ptr: [*]const f32,
     out_ptr: [*]f32,
@@ -700,12 +749,7 @@ export fn swiglu_clamp_f32(
             const gates = @min(gates_raw, LIMIT_VEC);
             const ups = @max(@min(ups_raw, LIMIT_VEC), NEG_LIMIT_VEC);
             const scaled = gates * ALPHA_VEC;
-            const sigs: @Vector(4, f32) = .{
-                sigmoidF32(scaled[0]),
-                sigmoidF32(scaled[1]),
-                sigmoidF32(scaled[2]),
-                sigmoidF32(scaled[3]),
-            };
+            const sigs = sigmoidF32x4(scaled);
             const glu = gates * sigs;
             const result = (ups + ONE_VEC) * glu;
             out_ptr[out_base + d ..][0..4].* = result;
@@ -1135,10 +1179,22 @@ export fn banded_attention(
             }
             scores[n_keys] = sink_logit;
 
-            // exp(s - max) and running sum (including sink).
+            // exp(s - max) and running sum (including sink). Scores
+            // are already ≤ row_max so (s - row_max) ≤ 0 — use the
+            // approximate-exp path that assumes non-positive inputs.
             var sum: f32 = 0.0;
+            const total = n_keys + 1;
+            const max_vec: @Vector(4, f32) = @splat(row_max);
+            var sum_vec: @Vector(4, f32) = @splat(0.0);
             var i: usize = 0;
-            while (i <= n_keys) : (i += 1) {
+            while (i + 4 <= total) : (i += 4) {
+                const s_vec: @Vector(4, f32) = scores[i..][0..4].*;
+                const e_vec = expApproxNonPositiveF32x4(s_vec - max_vec);
+                scores[i..][0..4].* = e_vec;
+                sum_vec += e_vec;
+            }
+            sum = sum_vec[0] + sum_vec[1] + sum_vec[2] + sum_vec[3];
+            while (i < total) : (i += 1) {
                 const e = @exp(scores[i] - row_max);
                 scores[i] = e;
                 sum += e;

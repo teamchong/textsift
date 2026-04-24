@@ -1105,6 +1105,13 @@ export class WebGpuBackend implements InferenceBackend {
         ),
       },
     });
+    // Surface any WebGPU validation or OOM errors as console errors so the
+    // caller's diagnostics pick them up — WGSL is tricky enough that we
+    // want every uncapturedevent visible.
+    device.addEventListener("uncapturederror", (ev) => {
+      const anyEv = ev as unknown as { error: { message: string } };
+      console.error("WebGPU error: " + anyEv.error.message);
+    });
     this.device = device;
 
     this.weights = await loadOnnxWeightsGpu(device, this.opts.bundle.modelSource);
@@ -1689,10 +1696,10 @@ export class WebGpuBackend implements InferenceBackend {
       entries: [
         { binding: 0, resource: { buffer: dimsBuf } },
         { binding: 1, resource: { buffer: xBuf } },
-        { binding: 2, resource: { buffer: w_int4.buffer, offset: w_int4.byteOffset, size: w_int4.byteSize } },
-        { binding: 3, resource: { buffer: w_scales.buffer, offset: w_scales.byteOffset, size: w_scales.byteSize } },
-        { binding: 4, resource: { buffer: w_zp.buffer, offset: w_zp.byteOffset, size: w_zp.byteSize } },
-        { binding: 5, resource: { buffer: bias.buffer, offset: bias.byteOffset, size: bias.byteSize } },
+        resBinding(2, w_int4),
+        resBinding(3, w_scales),
+        resBinding(4, w_zp),
+        resBinding(5, bias),
         { binding: 6, resource: { buffer: yBuf } },
       ],
     });
@@ -1904,9 +1911,15 @@ async function createPipelines(
 // ---------- helpers ----------
 
 function resBinding(binding: number, t: GpuTensor): GPUBindGroupEntry {
+  // WebGPU rejects storage-buffer bindings whose size isn't a multiple of
+  // 4. Round up to the next 4-byte boundary; shader reads are element-
+  // indexed (f16 / u32 / f32) so the trailing padding bytes are never
+  // touched. The underlying buffer was already sized to this rounding at
+  // upload time.
+  const alignedSize = (t.byteSize + 3) & ~3;
   return {
     binding,
-    resource: { buffer: t.buffer, offset: t.byteOffset, size: t.byteSize },
+    resource: { buffer: t.buffer, offset: t.byteOffset, size: alignedSize },
   };
 }
 

@@ -1,0 +1,133 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>pii-wasm — WebGPU full-forward parity</title>
+  </head>
+  <body>
+    <pre id="out">starting</pre>
+    <script type="module">
+      // Runs the same token sequence through both the WebGPU backend
+      // and the WASM backend. Compares the logit matrices elementwise.
+      // Any large divergence is a kernel port bug.
+      import {
+        WasmBackend,
+        WebGpuBackend,
+        ModelLoader,
+      } from "/dist/index.js";
+
+      const $out = document.getElementById("out");
+      const log = (m) => { $out.textContent += "\n" + m; };
+
+      try {
+        if (!navigator.gpu) throw new Error("navigator.gpu is not available");
+
+        const loader = new ModelLoader({ source: "openai/privacy-filter" });
+        const bundle = await loader.load();
+
+        log("warmup WebGPU backend");
+        const gpu = new WebGpuBackend({ bundle, quantization: "int4", device: "auto" });
+        const tg0 = performance.now();
+        await gpu.warmup();
+        log(`gpu warmup ${(performance.now() - tg0).toFixed(0)}ms`);
+
+        log("warmup WASM backend");
+        const wasm = new WasmBackend({ bundle, quantization: "int4", device: "wasm" });
+        const tw0 = performance.now();
+        await wasm.warmup();
+        log(`wasm warmup ${(performance.now() - tw0).toFixed(0)}ms`);
+
+        // Build a deterministic token sequence. Keep T small so each
+        // forward finishes in well under the test timeout.
+        const T = 32;
+        const tokens = new Int32Array(T);
+        for (let i = 0; i < T; i++) tokens[i] = (i * 37 + 11) % 50000;
+        const mask = new Uint8Array(T).fill(1);
+
+        log(`dispatch GPU forward T=${T}`);
+        const tf0 = performance.now();
+        const gpuLogits = await gpu.forward(tokens, mask);
+        const tGpu = performance.now() - tf0;
+
+        log(`dispatch WASM forward T=${T}`);
+        const tf1 = performance.now();
+        const wasmLogits = await wasm.forward(tokens, mask);
+        const tWasm = performance.now() - tf1;
+
+        if (gpuLogits.sequenceLength !== wasmLogits.sequenceLength ||
+            gpuLogits.numClasses     !== wasmLogits.numClasses) {
+          throw new Error(
+            `shape mismatch: gpu=[${gpuLogits.sequenceLength}, ${gpuLogits.numClasses}] ` +
+            `wasm=[${wasmLogits.sequenceLength}, ${wasmLogits.numClasses}]`,
+          );
+        }
+
+        const g = gpuLogits.data;
+        const w = wasmLogits.data;
+        let maxAbs = 0, maxRel = 0, rms = 0, outlierIdx = -1;
+        for (let i = 0; i < g.length; i++) {
+          const d = Math.abs(g[i] - w[i]);
+          if (d > maxAbs) { maxAbs = d; outlierIdx = i; }
+          if (Math.abs(w[i]) > 0.5) {
+            const rel = d / Math.abs(w[i]);
+            if (rel > maxRel) maxRel = rel;
+          }
+          rms += d * d;
+        }
+        rms = Math.sqrt(rms / g.length);
+
+        // Argmax-per-token agreement is the downstream-meaningful check.
+        // Logits may drift a few percent and still decode the same BIOES
+        // tag per token.
+        const numClasses = gpuLogits.numClasses;
+        let argmaxAgree = 0;
+        for (let t = 0; t < T; t++) {
+          let gMax = -Infinity, gArg = 0;
+          let wMax = -Infinity, wArg = 0;
+          for (let c = 0; c < numClasses; c++) {
+            const gv = g[t * numClasses + c];
+            const wv = w[t * numClasses + c];
+            if (gv > gMax) { gMax = gv; gArg = c; }
+            if (wv > wMax) { wMax = wv; wArg = c; }
+          }
+          if (gArg === wArg) argmaxAgree++;
+        }
+
+        gpu.dispose();
+        wasm.dispose();
+
+        // Sample the first token's logits row to see magnitude pattern.
+        const row0Gpu  = Array.from(g.slice(0, numClasses));
+        const row0Wasm = Array.from(w.slice(0, numClasses));
+
+        window.__result = {
+          // argmax agreement is the downstream-meaningful check — Viterbi
+          // and span decode run on argmax / softmax differences, not
+          // absolute magnitudes. maxAbs/rms caps catch gross regressions
+          // without tripping on fp16 drift compounding over 8 layers.
+          ok: argmaxAgree === T && maxAbs < 3.0 && rms < 0.5,
+          T, numClasses,
+          maxAbs, maxRel, rms, outlierIdx,
+          outlierGpu: g[outlierIdx],
+          outlierWasm: w[outlierIdx],
+          outlierRowT: Math.floor(outlierIdx / numClasses),
+          outlierRowC: outlierIdx % numClasses,
+          argmaxAgree,
+          row0Gpu,
+          row0Wasm,
+          tGpuMs: tGpu,
+          tWasmMs: tWasm,
+        };
+        log(
+          `done: argmax ${argmaxAgree}/${T}  ` +
+          `maxAbs=${maxAbs.toExponential(2)}  rms=${rms.toExponential(2)}  ` +
+          `gpu=${tGpu.toFixed(0)}ms wasm=${tWasm.toFixed(0)}ms`,
+        );
+      } catch (e) {
+        window.__result = { ok: false, error: String(e), stack: e.stack };
+        log("ERROR: " + e);
+        throw e;
+      }
+    </script>
+  </body>
+</html>

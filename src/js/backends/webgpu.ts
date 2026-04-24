@@ -4,18 +4,23 @@
  * Uploads the same `onnx/model_q4f16.onnx` + `.onnx_data` the other two
  * backends consume and runs the full forward on the GPU. No per-kernel
  * round-trip through JS — input token IDs + attention mask go in, logits
- * come out, everything else is a storage buffer on the device.
+ * come out; everything in between lives in storage buffers on the device.
  *
- * Requires `shader-f16`. We feature-detect during `warmup()` and throw
- * if the adapter can't enable it; callers (selectBackend) should fall
- * back to the WASM path in that case.
+ * Requires `shader-f16`. `warmup()` throws if the adapter can't enable
+ * it; callers (selectBackend) should fall back to the WASM path.
  *
- * This file is scaffolding + the hottest kernel (int4 matmul). Remaining
- * kernels (rms_norm, rope, banded_attention, swiglu, router, MoE, embed,
- * classifier) land in follow-up passes; each one gets a matching WGSL
- * shader + bind-group layout + pipeline. Forward composition lives in
- * JS — same shape as `modelForward` / `blockForward`, just dispatching
- * GPU compute passes instead of wasm kernel calls.
+ * Kernel set mirrors the WASM backend's forward pipeline:
+ *   embed_lookup_int4 · rms_norm · matmul_int4 (f32→f16 and f32→f32)
+ *   · rope_apply (interleaved pairs, native f16 arithmetic) · banded_attention
+ *   · add_fp16 · cast_fp16_to_f32 · cast_f32_to_fp16_scaled
+ *   · zero_f32 · router_topk · swiglu_clamp
+ *   · qmoe_gate_up · qmoe_down_scatter (atomic f32 CAS scatter-add)
+ *
+ * MoE expert dispatch is token-major: one workgroup per (token, k_pick)
+ * runs its own expert-sliced matmul and scatter-adds (weight × out) into
+ * the per-token accumulator via a u32 CAS atomic-add on reinterpreted
+ * f32 bits. This avoids the GPU-to-CPU readback the expert-major WASM
+ * path uses to group by expert.
  */
 
 import type {
@@ -23,7 +28,8 @@ import type {
   InferenceBackend,
   Logits,
 } from "./abstract.js";
-import { parseOnnxGraph, resolveTensorBytes, type OnnxTensorRef } from "../model/onnx-reader.js";
+import { parseOnnxGraph, resolveTensorBytes } from "../model/onnx-reader.js";
+import { buildRopeTables } from "../inference/rope.js";
 
 // ---------- tensor record ----------
 
@@ -40,51 +46,58 @@ export interface GpuTensor {
   readonly shape: readonly number[];
 }
 
-// ---------- WGSL ----------
+// ---------- shared int4 helpers (WGSL) ----------
+
+/**
+ * Byte/nibble accessors reused by every int4 kernel. Each kernel inlines
+ * this preamble so we don't need an import graph in WGSL. `array<u32>`
+ * is the canonical storage container for packed uint8/uint4 data —
+ * storage buffers can't be declared as array<u8> directly.
+ */
+const INT4_ACCESS_WGSL = /* wgsl */ `
+fn load_byte(arr: ptr<storage, array<u32>, read>, byte_idx: u32) -> u32 {
+    let word = (*arr)[byte_idx >> 2u];
+    let shift = (byte_idx & 3u) * 8u;
+    return (word >> shift) & 0xFFu;
+}
+
+fn load_nibble(arr: ptr<storage, array<u32>, read>, nibble_idx: u32) -> u32 {
+    let byte_val = load_byte(arr, nibble_idx >> 1u);
+    let hi = (nibble_idx & 1u) == 1u;
+    return select(byte_val & 0xFu, (byte_val >> 4u) & 0xFu, hi);
+}
+`;
+
+// ---------- WGSL: int4 matmul, f32 x → f32 out ----------
 
 /**
  * int4-block32 matmul: f32 x [T, K] × packed-uint4 W [N, K] → f32 y [T, N].
- * Dequant: `(q_nibble - zp_nibble) * scale_block`.
+ * Dequant: `(q_nibble - zp_nibble) * scale_block`. Used for router matmul
+ * and classifier head (upstream keeps router and head in fp32 accum).
  *
- * Weight layout matches our on-device storage (same as WASM memory):
- *   `w_int4`: [N, K/2] u8 — byte j of row n packs `(w[n, 2j])` in the
- *             low nibble and `(w[n, 2j+1])` in the high nibble.
- *   `w_scales`: [N, K/32] f16 — one scale per 32-weight block.
- *   `w_zp`: [N, ceil(K/32/2)] u8 — uint4 zero-points packed 2/byte,
- *           same even/odd scheme as the weights.
+ * Weight layout matches WASM byte-for-byte:
+ *   `w_int4`: [N, K/2] u8 — byte j of row n packs `(w[n, 2j])` low nibble,
+ *             `(w[n, 2j+1])` high nibble.
+ *   `w_scales`: [N, K/32] f16.
+ *   `w_zp`: [N, ceil(K/32/2)] u8 — uint4 zero-points, 2/byte.
  *   `bias`: [N] f16.
- *
- * One thread per output element. Workgroup size 64 covers a single row
- * stride cleanly. D = K = 640 / 896 in this model → 20-28 blocks per
- * dot, within reach of a scalar loop.
  */
-const MATMUL_INT4_WGSL = /* wgsl */ `
+const MATMUL_INT4_F32_F32_WGSL = /* wgsl */ `
 enable f16;
 
 struct Dims { T: u32, N: u32, K: u32, _pad: u32 };
 
 @group(0) @binding(0) var<uniform> dims: Dims;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
-@group(0) @binding(2) var<storage, read> w_int4: array<u32>;    // bytes packed 4/word
+@group(0) @binding(2) var<storage, read> w_int4: array<u32>;
 @group(0) @binding(3) var<storage, read> w_scales: array<f16>;
-@group(0) @binding(4) var<storage, read> w_zp: array<u32>;      // bytes packed 4/word
+@group(0) @binding(4) var<storage, read> w_zp: array<u32>;
 @group(0) @binding(5) var<storage, read> bias: array<f16>;
 @group(0) @binding(6) var<storage, read_write> y: array<f32>;
 
 const BLOCK: u32 = 32u;
 
-fn load_byte(arr: ptr<storage, array<u32>, read>, idx: u32) -> u32 {
-    let word = (*arr)[idx >> 2u];
-    let shift = (idx & 3u) * 8u;
-    return (word >> shift) & 0xFFu;
-}
-
-fn load_nibble_u32(arr: ptr<storage, array<u32>, read>, nibble_idx: u32) -> u32 {
-    let byte_idx = nibble_idx >> 1u;
-    let byte = load_byte(arr, byte_idx);
-    let hi = (nibble_idx & 1u);
-    return select(byte & 0xFu, (byte >> 4u) & 0xFu, hi == 1u);
-}
+${INT4_ACCESS_WGSL}
 
 @compute @workgroup_size(64, 1, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -97,17 +110,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n_blocks = K / BLOCK;
     let zp_per_row = (n_blocks + 1u) >> 1u;
 
-    let int4_nibble_base = n * K;           // K nibbles per row
-    let scale_row = n * n_blocks;           // f16 elements per row
-    let zp_row_nibble = n * n_blocks;       // nibble index (n_blocks nibbles per row, packed 2/byte into zp_per_row bytes)
-    // Byte indices into the packed u32 storage arrays.
+    let int4_nibble_base = n * K;
+    let scale_row = n * n_blocks;
     let x_row = t * K;
 
     var acc: f32 = 0.0;
     for (var b: u32 = 0u; b < n_blocks; b = b + 1u) {
         let scale: f32 = f32(w_scales[scale_row + b]);
-        // zp packing: byte (n * zp_per_row + b/2); low nibble = even b,
-        // high nibble = odd b.
         let zp_byte_idx = n * zp_per_row + (b >> 1u);
         let zp_byte = load_byte(&w_zp, zp_byte_idx);
         let zp_nib = select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (b & 1u) == 1u);
@@ -115,13 +124,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         let base_nibble = int4_nibble_base + b * BLOCK;
         var block_sum: f32 = 0.0;
-        // 32 weights per block. Unroll by 4.
         for (var k: u32 = 0u; k < BLOCK; k = k + 4u) {
-            // Decode 4 nibbles.
-            let q0 = f32(load_nibble_u32(&w_int4, base_nibble + k + 0u)) - zp_f;
-            let q1 = f32(load_nibble_u32(&w_int4, base_nibble + k + 1u)) - zp_f;
-            let q2 = f32(load_nibble_u32(&w_int4, base_nibble + k + 2u)) - zp_f;
-            let q3 = f32(load_nibble_u32(&w_int4, base_nibble + k + 3u)) - zp_f;
+            let q0 = f32(load_nibble(&w_int4, base_nibble + k + 0u)) - zp_f;
+            let q1 = f32(load_nibble(&w_int4, base_nibble + k + 1u)) - zp_f;
+            let q2 = f32(load_nibble(&w_int4, base_nibble + k + 2u)) - zp_f;
+            let q3 = f32(load_nibble(&w_int4, base_nibble + k + 3u)) - zp_f;
             let x0 = x[x_row + b * BLOCK + k + 0u];
             let x1 = x[x_row + b * BLOCK + k + 1u];
             let x2 = x[x_row + b * BLOCK + k + 2u];
@@ -138,16 +145,931 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 `;
 
-// ---------- backend ----------
+// ---------- WGSL: int4 matmul, f32 x → f16 out ----------
+
+/**
+ * Same dequant + MAC chain as MATMUL_INT4_F32_F32, but rounds the final
+ * result to fp16 on store. Used for Q/K/V/O projections (outputs feed
+ * fp16 RoPE + fp16 banded attention) and the classifier head's fp16
+ * baseline — though the classifier here returns f32 directly since the
+ * backend contract is f32 logits.
+ */
+const MATMUL_INT4_F32_F16_WGSL = /* wgsl */ `
+enable f16;
+
+struct Dims { T: u32, N: u32, K: u32, _pad: u32 };
+
+@group(0) @binding(0) var<uniform> dims: Dims;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> w_int4: array<u32>;
+@group(0) @binding(3) var<storage, read> w_scales: array<f16>;
+@group(0) @binding(4) var<storage, read> w_zp: array<u32>;
+@group(0) @binding(5) var<storage, read> bias: array<f16>;
+@group(0) @binding(6) var<storage, read_write> y: array<f16>;
+
+const BLOCK: u32 = 32u;
+
+${INT4_ACCESS_WGSL}
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let tn = gid.x;
+    let total = dims.T * dims.N;
+    if (tn >= total) { return; }
+    let t = tn / dims.N;
+    let n = tn % dims.N;
+    let K = dims.K;
+    let n_blocks = K / BLOCK;
+    let zp_per_row = (n_blocks + 1u) >> 1u;
+
+    let int4_nibble_base = n * K;
+    let scale_row = n * n_blocks;
+    let x_row = t * K;
+
+    var acc: f32 = 0.0;
+    for (var b: u32 = 0u; b < n_blocks; b = b + 1u) {
+        let scale: f32 = f32(w_scales[scale_row + b]);
+        let zp_byte_idx = n * zp_per_row + (b >> 1u);
+        let zp_byte = load_byte(&w_zp, zp_byte_idx);
+        let zp_nib = select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (b & 1u) == 1u);
+        let zp_f: f32 = f32(zp_nib);
+
+        let base_nibble = int4_nibble_base + b * BLOCK;
+        var block_sum: f32 = 0.0;
+        for (var k: u32 = 0u; k < BLOCK; k = k + 4u) {
+            let q0 = f32(load_nibble(&w_int4, base_nibble + k + 0u)) - zp_f;
+            let q1 = f32(load_nibble(&w_int4, base_nibble + k + 1u)) - zp_f;
+            let q2 = f32(load_nibble(&w_int4, base_nibble + k + 2u)) - zp_f;
+            let q3 = f32(load_nibble(&w_int4, base_nibble + k + 3u)) - zp_f;
+            let x0 = x[x_row + b * BLOCK + k + 0u];
+            let x1 = x[x_row + b * BLOCK + k + 1u];
+            let x2 = x[x_row + b * BLOCK + k + 2u];
+            let x3 = x[x_row + b * BLOCK + k + 3u];
+            block_sum = fma(q0, x0, block_sum);
+            block_sum = fma(q1, x1, block_sum);
+            block_sum = fma(q2, x2, block_sum);
+            block_sum = fma(q3, x3, block_sum);
+        }
+        acc = fma(block_sum, scale, acc);
+    }
+    acc = acc + f32(bias[n]);
+    y[t * dims.N + n] = f16(acc);
+}
+`;
+
+// ---------- WGSL: GatherBlockQuantized embedding ----------
+
+/**
+ * Embedding table lookup with inline int4 dequant. Matches ONNX
+ * GatherBlockQuantized semantics (block_size=32, uint4 weights, uint4
+ * zero-points, fp16 scales). Output is fp16 so downstream rmsnorm +
+ * matmul see their usual input dtype.
+ *
+ * OOB ids zero-fill, same as WASM `embed_lookup_int4`.
+ */
+const EMBED_LOOKUP_INT4_WGSL = /* wgsl */ `
+enable f16;
+
+struct Dims { T: u32, V: u32, D: u32, _pad: u32 };
+
+@group(0) @binding(0) var<uniform> dims: Dims;
+@group(0) @binding(1) var<storage, read> embed_int4: array<u32>;
+@group(0) @binding(2) var<storage, read> embed_scales: array<f16>;
+@group(0) @binding(3) var<storage, read> embed_zp: array<u32>;
+@group(0) @binding(4) var<storage, read> ids: array<i32>;
+@group(0) @binding(5) var<storage, read_write> out: array<f16>;
+
+const EMBED_BLOCK: u32 = 32u;
+
+${INT4_ACCESS_WGSL}
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let td = gid.x;
+    let D = dims.D;
+    let total = dims.T * D;
+    if (td >= total) { return; }
+    let t = td / D;
+    let d = td % D;
+
+    let id = ids[t];
+    if (id < 0 || u32(id) >= dims.V) {
+        out[td] = f16(0.0);
+        return;
+    }
+    let row = u32(id);
+    let n_blocks = D / EMBED_BLOCK;
+    let zp_per_row = (n_blocks + 1u) >> 1u;
+
+    let b = d / EMBED_BLOCK;
+    let scale = f32(embed_scales[row * n_blocks + b]);
+    let zp_byte = load_byte(&embed_zp, row * zp_per_row + (b >> 1u));
+    let zp_nib: u32 = select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (b & 1u) == 1u);
+    let nib_idx = row * D + d;
+    let nib = load_nibble(&embed_int4, nib_idx);
+    let q = f32(nib) - f32(zp_nib);
+    out[td] = f16(q * scale);
+}
+`;
+
+// ---------- WGSL: RMSNorm ----------
+
+/**
+ * y[t, d] = x[t, d] * gamma[d] / sqrt(mean_d(x[t, :]^2) + eps)
+ *
+ * One workgroup per row (T rows). 64 threads per workgroup, each walks
+ * a strided slice of the hidden axis. Sum-of-squares reduction via
+ * workgroup memory tree (6 rounds for 64 threads). All accumulation in
+ * f32 — 640-wide fp16 would lose bits.
+ */
+const RMS_NORM_WGSL = /* wgsl */ `
+enable f16;
+
+struct Dims { T: u32, D: u32, eps: f32, _pad: u32 };
+
+@group(0) @binding(0) var<uniform> dims: Dims;
+@group(0) @binding(1) var<storage, read> x: array<f16>;
+@group(0) @binding(2) var<storage, read> gamma: array<f16>;
+@group(0) @binding(3) var<storage, read_write> y: array<f16>;
+
+var<workgroup> wg_sum: array<f32, 64>;
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let t = wg.x;
+    if (t >= dims.T) { return; }
+    let D = dims.D;
+    let row = t * D;
+    let tid = lid.x;
+
+    var ssq: f32 = 0.0;
+    var d = tid;
+    loop {
+        if (d >= D) { break; }
+        let v = f32(x[row + d]);
+        ssq = ssq + v * v;
+        d = d + 64u;
+    }
+    wg_sum[tid] = ssq;
+    workgroupBarrier();
+
+    var stride: u32 = 32u;
+    loop {
+        if (tid < stride) {
+            wg_sum[tid] = wg_sum[tid] + wg_sum[tid + stride];
+        }
+        workgroupBarrier();
+        if (stride == 1u) { break; }
+        stride = stride / 2u;
+    }
+
+    let inv_rms = inverseSqrt(wg_sum[0] / f32(D) + dims.eps);
+
+    d = tid;
+    loop {
+        if (d >= D) { break; }
+        let g = f32(gamma[d]);
+        let xv = f32(x[row + d]);
+        y[row + d] = f16(xv * inv_rms * g);
+        d = d + 64u;
+    }
+}
+`;
+
+// ---------- WGSL: dtype casts ----------
+
+const CAST_FP16_TO_F32_WGSL = /* wgsl */ `
+enable f16;
+
+struct Dims { n: u32, _pad0: u32, _pad1: u32, _pad2: u32 };
+@group(0) @binding(0) var<uniform> dims: Dims;
+@group(0) @binding(1) var<storage, read> src: array<f16>;
+@group(0) @binding(2) var<storage, read_write> dst: array<f32>;
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= dims.n) { return; }
+    dst[i] = f32(src[i]);
+}
+`;
+
+const CAST_F32_TO_FP16_SCALED_WGSL = /* wgsl */ `
+enable f16;
+
+struct Dims { n: u32, _pad0: u32, _pad1: u32, _pad2: u32 };
+struct Scale { v: f32 };
+@group(0) @binding(0) var<uniform> dims: Dims;
+@group(0) @binding(1) var<uniform> scale: Scale;
+@group(0) @binding(2) var<storage, read> src: array<f32>;
+@group(0) @binding(3) var<storage, read_write> dst: array<f16>;
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= dims.n) { return; }
+    dst[i] = f16(src[i] * scale.v);
+}
+`;
+
+// ---------- WGSL: elementwise add, zero ----------
+
+const ADD_FP16_WGSL = /* wgsl */ `
+enable f16;
+
+struct Dims { n: u32, _pad0: u32, _pad1: u32, _pad2: u32 };
+@group(0) @binding(0) var<uniform> dims: Dims;
+@group(0) @binding(1) var<storage, read> a: array<f16>;
+@group(0) @binding(2) var<storage, read> b: array<f16>;
+@group(0) @binding(3) var<storage, read_write> out: array<f16>;
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= dims.n) { return; }
+    // Widen to f32 for the add, then round once — matches WASM add_fp16
+    // semantics: f32ToFp16(fp16ToF32(a) + fp16ToF32(b)).
+    out[i] = f16(f32(a[i]) + f32(b[i]));
+}
+`;
+
+/**
+ * Zeros the MoE accumulator before each block's scatter pass. Declared
+ * as plain u32 here; the scatter kernel rebinds the same buffer as
+ * array<atomic<u32>>. WebGPU permits different shader views of the same
+ * buffer as long as usage flags (STORAGE) cover both.
+ */
+const ZERO_F32_WGSL = /* wgsl */ `
+struct Dims { n: u32, _pad0: u32, _pad1: u32, _pad2: u32 };
+@group(0) @binding(0) var<uniform> dims: Dims;
+@group(0) @binding(1) var<storage, read_write> buf: array<u32>;
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= dims.n) { return; }
+    buf[i] = 0u;
+}
+`;
+
+// ---------- WGSL: RoPE apply (interleaved) ----------
+
+/**
+ * In-place rotary position embedding apply. Interleaved-pair layout:
+ * for each (t, h, p), rotate (qk[t, h, 2p], qk[t, h, 2p+1]) by cos/sin.
+ * cos/sin are precomputed by JS as fp16 with YARN's attention_scaling
+ * folded in, matching the WASM path.
+ *
+ * Three-rounding semantics: `a * c - b * s` uses WGSL f16 arithmetic.
+ * Per the WGSL spec, each f16 op produces an f16 result, so the mul
+ * rounds, then the subtract rounds — three roundings per output,
+ * matching PyTorch eager fp16.
+ */
+const ROPE_APPLY_WGSL = /* wgsl */ `
+enable f16;
+
+struct Dims { T: u32, H: u32, head_dim: u32, _pad: u32 };
+
+@group(0) @binding(0) var<uniform> dims: Dims;
+@group(0) @binding(1) var<storage, read_write> qk: array<f16>;
+@group(0) @binding(2) var<storage, read> cos_tab: array<f16>;
+@group(0) @binding(3) var<storage, read> sin_tab: array<f16>;
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let half_dim = dims.head_dim / 2u;
+    let idx = gid.x;
+    let tp_total = dims.T * dims.H * half_dim;
+    if (idx >= tp_total) { return; }
+
+    let p = idx % half_dim;
+    let th = idx / half_dim;
+    let h = th % dims.H;
+    let t = th / dims.H;
+
+    let c: f16 = cos_tab[t * half_dim + p];
+    let s: f16 = sin_tab[t * half_dim + p];
+
+    let head_base = (t * dims.H + h) * dims.head_dim;
+    let a: f16 = qk[head_base + 2u * p];
+    let b: f16 = qk[head_base + 2u * p + 1u];
+
+    let ac: f16 = a * c;
+    let bs: f16 = b * s;
+    let bc: f16 = b * c;
+    let as_: f16 = a * s;
+
+    qk[head_base + 2u * p]      = ac - bs;
+    qk[head_base + 2u * p + 1u] = bc + as_;
+}
+`;
+
+// ---------- WGSL: banded GQA attention with sinks ----------
+
+/**
+ * Sliding-window attention with attention sinks, fp16 QKV in, fp16 out.
+ * One workgroup per (t_query, h_query) — 64 threads per workgroup.
+ * Threads share score/softmax scratch via workgroup memory.
+ *
+ * Flow per (t_q, h_q):
+ *   1. Each thread computes a strided subset of scores (Q·K dot).
+ *   2. Workgroup reduces `row_max` across scores ∪ {sink}.
+ *   3. Threads exp(score - max), workgroup reduces `sum`.
+ *   4. Normalize softmax (divide by sum).
+ *   5. Each thread owns one head_dim lane (head_dim == 64 == wg size),
+ *      accumulates softmax_i · V[t_k_i, h_kv, lane] across keys in
+ *      window.
+ *   6. Thread writes its lane to out[t_q, h_q, lane].
+ *
+ * `sink` contributes to the softmax denominator but not to the AV
+ * combine — the 0-dim "sink key" with no value vector.
+ */
+const BANDED_ATTENTION_WGSL = /* wgsl */ `
+enable f16;
+
+struct Dims {
+    T: u32, H_q: u32, H_kv: u32, head_dim: u32,
+    window: u32, use_mask: u32, _pad0: u32, _pad1: u32,
+};
+
+@group(0) @binding(0) var<uniform> dims: Dims;
+@group(0) @binding(1) var<storage, read> q: array<f16>;
+@group(0) @binding(2) var<storage, read> k: array<f16>;
+@group(0) @binding(3) var<storage, read> v: array<f16>;
+@group(0) @binding(4) var<storage, read> sinks: array<f32>;
+@group(0) @binding(5) var<storage, read> mask: array<u32>;
+@group(0) @binding(6) var<storage, read_write> out: array<f16>;
+
+const MAX_WINDOW_TOTAL: u32 = 257u;
+const NEG_INF: f32 = -1e30;
+
+var<workgroup> wg_scores: array<f32, MAX_WINDOW_TOTAL>;
+var<workgroup> wg_tmp: array<f32, 64>;
+var<workgroup> wg_broadcast: array<f32, 2>;  // [0] = row_max, [1] = inv_sum
+
+fn read_mask_byte(i: u32) -> u32 {
+    let word = mask[i >> 2u];
+    return (word >> ((i & 3u) * 8u)) & 0xFFu;
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn main(
+    @builtin(workgroup_id) wg_id: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let tid = lid.x;
+    let t_q_h_q = wg_id.x;
+    let H_q = dims.H_q;
+    if (t_q_h_q >= dims.T * H_q) { return; }
+    let t_q = t_q_h_q / H_q;
+    let h_q = t_q_h_q % H_q;
+    let head_dim = dims.head_dim;
+    let kv_group = H_q / dims.H_kv;
+    let h_kv = h_q / kv_group;
+
+    let q_stride_t = H_q * head_dim;
+    let k_stride_t = dims.H_kv * head_dim;
+    let q_base = t_q * q_stride_t + h_q * head_dim;
+
+    let window = dims.window;
+    var ws: u32 = 0u;
+    if (t_q > window) { ws = t_q - window; }
+    var we: u32 = dims.T;
+    if (t_q + window + 1u < dims.T) { we = t_q + window + 1u; }
+    let n_keys = we - ws;
+
+    // Pass 1: each thread computes scores for its strided keys and
+    // writes them into workgroup memory.
+    var thread_max: f32 = NEG_INF;
+    var idx = tid;
+    loop {
+        if (idx >= n_keys) { break; }
+        let abs_k = ws + idx;
+        var is_valid: bool = true;
+        if (dims.use_mask == 1u) {
+            is_valid = read_mask_byte(abs_k) != 0u;
+        }
+        var s: f32 = NEG_INF;
+        if (is_valid) {
+            let k_base = abs_k * k_stride_t + h_kv * head_dim;
+            var dot: f32 = 0.0;
+            for (var d: u32 = 0u; d < head_dim; d = d + 1u) {
+                dot = fma(f32(q[q_base + d]), f32(k[k_base + d]), dot);
+            }
+            s = dot;
+        }
+        wg_scores[idx] = s;
+        if (s > thread_max) { thread_max = s; }
+        idx = idx + 64u;
+    }
+    // Include sink in max comparison (thread 0 seeds with sink).
+    if (tid == 0u) {
+        let sink_s = sinks[h_q];
+        if (sink_s > thread_max) { thread_max = sink_s; }
+    }
+    wg_tmp[tid] = thread_max;
+    workgroupBarrier();
+
+    // Tree reduce max across 64 threads.
+    var stride: u32 = 32u;
+    loop {
+        if (tid < stride) {
+            wg_tmp[tid] = max(wg_tmp[tid], wg_tmp[tid + stride]);
+        }
+        workgroupBarrier();
+        if (stride == 1u) { break; }
+        stride = stride / 2u;
+    }
+    if (tid == 0u) { wg_broadcast[0] = wg_tmp[0]; }
+    workgroupBarrier();
+    let row_max = wg_broadcast[0];
+
+    // Pass 2: exp(score - max), accumulate sum.
+    var thread_sum: f32 = 0.0;
+    idx = tid;
+    loop {
+        if (idx >= n_keys) { break; }
+        let e = exp(wg_scores[idx] - row_max);
+        wg_scores[idx] = e;
+        thread_sum = thread_sum + e;
+        idx = idx + 64u;
+    }
+    // Sink contributes to denominator.
+    if (tid == 0u) {
+        thread_sum = thread_sum + exp(sinks[h_q] - row_max);
+    }
+    wg_tmp[tid] = thread_sum;
+    workgroupBarrier();
+
+    stride = 32u;
+    loop {
+        if (tid < stride) {
+            wg_tmp[tid] = wg_tmp[tid] + wg_tmp[tid + stride];
+        }
+        workgroupBarrier();
+        if (stride == 1u) { break; }
+        stride = stride / 2u;
+    }
+    if (tid == 0u) {
+        let s = wg_tmp[0];
+        wg_broadcast[1] = select(0.0, 1.0 / s, s > 0.0);
+    }
+    workgroupBarrier();
+    let inv_sum = wg_broadcast[1];
+
+    // Pass 3: normalize softmax in-place so pass 4 reads a single value.
+    idx = tid;
+    loop {
+        if (idx >= n_keys) { break; }
+        wg_scores[idx] = wg_scores[idx] * inv_sum;
+        idx = idx + 64u;
+    }
+    workgroupBarrier();
+
+    // Pass 4: each thread owns one head_dim lane and combines V across
+    // all keys in the window. Requires workgroup_size >= head_dim; our
+    // head_dim is 64 so each of 64 threads handles exactly one lane.
+    if (tid < head_dim) {
+        var acc: f32 = 0.0;
+        for (var i: u32 = 0u; i < n_keys; i = i + 1u) {
+            let abs_k = ws + i;
+            let v_base = abs_k * k_stride_t + h_kv * head_dim;
+            acc = fma(wg_scores[i], f32(v[v_base + tid]), acc);
+        }
+        let out_base = t_q * q_stride_t + h_q * head_dim;
+        out[out_base + tid] = f16(acc);
+    }
+}
+`;
+
+// ---------- WGSL: router top-K + softmax / K ----------
+
+/**
+ * One thread per T row. Scans the full expert-logits row, maintains a
+ * K-slot insertion-sorted top-K buffer in registers, then softmax over
+ * the K values and divides by K — same post-processing as the WASM
+ * block.routerForward. K is passed as a uniform for clarity but is
+ * always 4 for this model.
+ *
+ * K is bounded by a small compile-time constant (MAX_K = 8) so the
+ * top-K arrays fit in registers. For 128 experts × 8 slots = 1024
+ * compares per thread, comfortably within a single dispatch.
+ */
+const ROUTER_TOPK_WGSL = /* wgsl */ `
+struct Dims { T: u32, E: u32, K: u32, _pad: u32 };
+
+@group(0) @binding(0) var<uniform> dims: Dims;
+@group(0) @binding(1) var<storage, read> logits: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out_idx: array<i32>;
+@group(0) @binding(3) var<storage, read_write> out_scores: array<f32>;
+
+const MAX_K: u32 = 8u;
+const NEG_INF: f32 = -1e30;
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let t = gid.x;
+    if (t >= dims.T) { return; }
+    let K = dims.K;
+    let row = t * dims.E;
+
+    var top_val: array<f32, MAX_K>;
+    var top_idx: array<u32, MAX_K>;
+    for (var i: u32 = 0u; i < MAX_K; i = i + 1u) {
+        top_val[i] = NEG_INF;
+        top_idx[i] = 0u;
+    }
+
+    for (var e: u32 = 0u; e < dims.E; e = e + 1u) {
+        let v = logits[row + e];
+        // Locate slot with the smallest current value.
+        var min_k: u32 = 0u;
+        var min_v: f32 = top_val[0];
+        for (var k: u32 = 1u; k < K; k = k + 1u) {
+            if (top_val[k] < min_v) {
+                min_v = top_val[k];
+                min_k = k;
+            }
+        }
+        if (v > min_v) {
+            top_val[min_k] = v;
+            top_idx[min_k] = e;
+        }
+    }
+
+    // Softmax over top K.
+    var max_v: f32 = top_val[0];
+    for (var k: u32 = 1u; k < K; k = k + 1u) {
+        max_v = max(max_v, top_val[k]);
+    }
+    var sum: f32 = 0.0;
+    for (var k: u32 = 0u; k < K; k = k + 1u) {
+        let e = exp(top_val[k] - max_v);
+        top_val[k] = e;
+        sum = sum + e;
+    }
+    let inv_sum = select(0.0, 1.0 / sum, sum > 0.0);
+    let inv_K = 1.0 / f32(K);
+
+    let out_base = t * K;
+    for (var k: u32 = 0u; k < K; k = k + 1u) {
+        out_idx[out_base + k] = i32(top_idx[k]);
+        out_scores[out_base + k] = top_val[k] * inv_sum * inv_K;
+    }
+}
+`;
+
+// ---------- WGSL: SwiGLU with clamp (packed gate/up) ----------
+
+/**
+ * Packed SwiGLU matching upstream's `swiglu(packed=True)` and ORT
+ * QMoE's `swiglu_fusion=1`:
+ *   gate = gate_up[..., 0::2].clamp(max=7)
+ *   up   = gate_up[..., 1::2].clamp(-7, 7)
+ *   glu  = gate * sigmoid(gate * 1.702)
+ *   out  = (up + 1.0) * glu
+ *
+ * All compute in f32 — upstream's expert forward runs `.float()` the
+ * entire expert block.
+ */
+const SWIGLU_CLAMP_WGSL = /* wgsl */ `
+struct Dims { rows: u32, dff: u32, _pad0: u32, _pad1: u32 };
+
+@group(0) @binding(0) var<uniform> dims: Dims;
+@group(0) @binding(1) var<storage, read> gate_up: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+
+const LIMIT: f32 = 7.0;
+const ALPHA: f32 = 1.702;
+
+fn sigmoid_f32(x: f32) -> f32 {
+    // Numerically stable: σ(x) = 1/(1+exp(-|x|)) on both sides, flipped for
+    // negative x. Keeps the exp argument ≤ 0 so no intermediate overflow.
+    if (x >= 0.0) {
+        return 1.0 / (1.0 + exp(-x));
+    }
+    let e = exp(x);
+    return e / (1.0 + e);
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = dims.rows * dims.dff;
+    if (idx >= total) { return; }
+    let row = idx / dims.dff;
+    let col = idx % dims.dff;
+
+    let stride = 2u * dims.dff;
+    let gate_raw = gate_up[row * stride + 2u * col];
+    let up_raw   = gate_up[row * stride + 2u * col + 1u];
+    let gate = min(gate_raw, LIMIT);
+    let up   = clamp(up_raw, -LIMIT, LIMIT);
+    let glu  = gate * sigmoid_f32(gate * ALPHA);
+    out[idx] = (up + 1.0) * glu;
+}
+`;
+
+// ---------- WGSL: QMoE gate_up (per-expert int4 matmul) ----------
+
+/**
+ * MoE gate_up_proj: for each (tk_pair = t * K + k_pick), select expert
+ * via `routing_idx[tk_pair]`, run the int4 matmul slice of
+ * `gate_up[expert_idx]` against `x[t, :]`. Output shape: [T*K, 2*dff].
+ *
+ * Weight layout per expert:
+ *   int4:   [2*dff, D/2] bytes at offset `e * 2*dff * (D/2)` inside
+ *           the flat packed buffer.
+ *   scales: [2*dff, D/32] f16 at offset `e * 2*dff * (D/32)` elements.
+ *   zp:     [2*dff, ceil((D/32)/2)] bytes at offset
+ *           `e * 2*dff * zp_per_row`.
+ *   bias:   [2*dff] f16 at offset `e * 2*dff` elements.
+ *
+ * One thread per output element (tk_pair, n-in-2*dff). Each thread
+ * reads `routing_idx[tk_pair]` once and does the usual int4 MAC chain.
+ */
+const QMOE_GATE_UP_WGSL = /* wgsl */ `
+enable f16;
+
+struct Dims {
+    T: u32, K: u32, N: u32, D: u32,
+    _pad0: u32, _pad1: u32, _pad2: u32, _pad3: u32,
+};
+
+@group(0) @binding(0) var<uniform> dims: Dims;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> routing_idx: array<i32>;
+@group(0) @binding(3) var<storage, read> w_int4: array<u32>;
+@group(0) @binding(4) var<storage, read> w_scales: array<f16>;
+@group(0) @binding(5) var<storage, read> w_zp: array<u32>;
+@group(0) @binding(6) var<storage, read> bias: array<f16>;
+@group(0) @binding(7) var<storage, read_write> out: array<f32>;
+
+const BLOCK: u32 = 32u;
+
+${INT4_ACCESS_WGSL}
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let total = dims.T * dims.K * dims.N;
+    let idx = gid.x;
+    if (idx >= total) { return; }
+
+    let n = idx % dims.N;
+    let tk = idx / dims.N;
+    let t = tk / dims.K;
+
+    let e = u32(routing_idx[tk]);
+
+    let D = dims.D;
+    let N = dims.N;
+    let n_blocks = D / BLOCK;
+    let zp_per_row = (n_blocks + 1u) >> 1u;
+
+    // Per-expert nibble base, scale offset (in f16 elements), zp byte base,
+    // bias offset (in f16 elements).
+    let expert_nibble_base = e * N * D + n * D;
+    let expert_scale_base  = e * N * n_blocks + n * n_blocks;
+    let expert_zp_base     = e * N * zp_per_row + n * zp_per_row;
+    let expert_bias_base   = e * N + n;
+
+    let x_row = t * D;
+
+    var acc: f32 = 0.0;
+    for (var b: u32 = 0u; b < n_blocks; b = b + 1u) {
+        let scale: f32 = f32(w_scales[expert_scale_base + b]);
+        let zp_byte = load_byte(&w_zp, expert_zp_base + (b >> 1u));
+        let zp_nib = select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (b & 1u) == 1u);
+        let zp_f: f32 = f32(zp_nib);
+
+        let base_nibble = expert_nibble_base + b * BLOCK;
+        var block_sum: f32 = 0.0;
+        for (var k: u32 = 0u; k < BLOCK; k = k + 4u) {
+            let q0 = f32(load_nibble(&w_int4, base_nibble + k + 0u)) - zp_f;
+            let q1 = f32(load_nibble(&w_int4, base_nibble + k + 1u)) - zp_f;
+            let q2 = f32(load_nibble(&w_int4, base_nibble + k + 2u)) - zp_f;
+            let q3 = f32(load_nibble(&w_int4, base_nibble + k + 3u)) - zp_f;
+            let x0 = x[x_row + b * BLOCK + k + 0u];
+            let x1 = x[x_row + b * BLOCK + k + 1u];
+            let x2 = x[x_row + b * BLOCK + k + 2u];
+            let x3 = x[x_row + b * BLOCK + k + 3u];
+            block_sum = fma(q0, x0, block_sum);
+            block_sum = fma(q1, x1, block_sum);
+            block_sum = fma(q2, x2, block_sum);
+            block_sum = fma(q3, x3, block_sum);
+        }
+        acc = fma(block_sum, scale, acc);
+    }
+    acc = acc + f32(bias[expert_bias_base]);
+    out[tk * N + n] = acc;
+}
+`;
+
+// ---------- WGSL: QMoE down + atomic scatter-add ----------
+
+/**
+ * MoE down_proj: for each (tk_pair, output col in D), compute the int4
+ * matmul slice of `down[expert_idx]` against the corresponding row of
+ * `glu[tk_pair, :]`, then CAS-atomically add
+ * `routing_scores[tk_pair] * out` into `acc[token_idx(tk), out_col]`.
+ *
+ * Atomic-add on f32 storage: buffer declared as `array<atomic<u32>>`;
+ * the loop reads the current u32, bit-casts to f32, adds, bit-casts
+ * back, tries `atomicCompareExchangeWeak`, retries on failure.
+ */
+const QMOE_DOWN_SCATTER_WGSL = /* wgsl */ `
+enable f16;
+
+struct Dims {
+    T: u32, K: u32, N: u32, D: u32,
+    _pad0: u32, _pad1: u32, _pad2: u32, _pad3: u32,
+};
+
+@group(0) @binding(0) var<uniform> dims: Dims;
+@group(0) @binding(1) var<storage, read> glu: array<f32>;
+@group(0) @binding(2) var<storage, read> routing_idx: array<i32>;
+@group(0) @binding(3) var<storage, read> routing_scores: array<f32>;
+@group(0) @binding(4) var<storage, read> w_int4: array<u32>;
+@group(0) @binding(5) var<storage, read> w_scales: array<f16>;
+@group(0) @binding(6) var<storage, read> w_zp: array<u32>;
+@group(0) @binding(7) var<storage, read> bias: array<f16>;
+@group(0) @binding(8) var<storage, read_write> acc: array<atomic<u32>>;
+
+const BLOCK: u32 = 32u;
+
+${INT4_ACCESS_WGSL}
+
+fn atomic_add_f32(slot: u32, val: f32) {
+    var old_u = atomicLoad(&acc[slot]);
+    loop {
+        let new_f = bitcast<f32>(old_u) + val;
+        let new_u = bitcast<u32>(new_f);
+        let r = atomicCompareExchangeWeak(&acc[slot], old_u, new_u);
+        if (r.exchanged) { break; }
+        old_u = r.old_value;
+    }
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let total = dims.T * dims.K * dims.N;
+    let idx = gid.x;
+    if (idx >= total) { return; }
+
+    let n = idx % dims.N;
+    let tk = idx / dims.N;
+    let t  = tk / dims.K;
+
+    let e = u32(routing_idx[tk]);
+    let w = routing_scores[tk];
+
+    let D = dims.D;  // inner dim = dff
+    let N = dims.N;  // output dim = d_model
+    let n_blocks = D / BLOCK;
+    let zp_per_row = (n_blocks + 1u) >> 1u;
+
+    let expert_nibble_base = e * N * D + n * D;
+    let expert_scale_base  = e * N * n_blocks + n * n_blocks;
+    let expert_zp_base     = e * N * zp_per_row + n * zp_per_row;
+    let expert_bias_base   = e * N + n;
+
+    let glu_row = tk * D;
+
+    var acc_local: f32 = 0.0;
+    for (var b: u32 = 0u; b < n_blocks; b = b + 1u) {
+        let scale: f32 = f32(w_scales[expert_scale_base + b]);
+        let zp_byte = load_byte(&w_zp, expert_zp_base + (b >> 1u));
+        let zp_nib = select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (b & 1u) == 1u);
+        let zp_f: f32 = f32(zp_nib);
+
+        let base_nibble = expert_nibble_base + b * BLOCK;
+        var block_sum: f32 = 0.0;
+        for (var k: u32 = 0u; k < BLOCK; k = k + 4u) {
+            let q0 = f32(load_nibble(&w_int4, base_nibble + k + 0u)) - zp_f;
+            let q1 = f32(load_nibble(&w_int4, base_nibble + k + 1u)) - zp_f;
+            let q2 = f32(load_nibble(&w_int4, base_nibble + k + 2u)) - zp_f;
+            let q3 = f32(load_nibble(&w_int4, base_nibble + k + 3u)) - zp_f;
+            let x0 = glu[glu_row + b * BLOCK + k + 0u];
+            let x1 = glu[glu_row + b * BLOCK + k + 1u];
+            let x2 = glu[glu_row + b * BLOCK + k + 2u];
+            let x3 = glu[glu_row + b * BLOCK + k + 3u];
+            block_sum = fma(q0, x0, block_sum);
+            block_sum = fma(q1, x1, block_sum);
+            block_sum = fma(q2, x2, block_sum);
+            block_sum = fma(q3, x3, block_sum);
+        }
+        acc_local = fma(block_sum, scale, acc_local);
+    }
+    acc_local = acc_local + f32(bias[expert_bias_base]);
+
+    atomic_add_f32(t * N + n, w * acc_local);
+}
+`;
+
+// ---------- backend options ----------
 
 export interface WebGpuBackendOptions extends BackendConstructionOptions {}
+
+// ---------- pipeline bundle ----------
+
+interface Pipelines {
+  embed: GPUComputePipeline;
+  rmsNorm: GPUComputePipeline;
+  matmulF32F32: GPUComputePipeline;
+  matmulF32F16: GPUComputePipeline;
+  castFp16ToF32: GPUComputePipeline;
+  castF32ToFp16Scaled: GPUComputePipeline;
+  addFp16: GPUComputePipeline;
+  zero: GPUComputePipeline;
+  rope: GPUComputePipeline;
+  banded: GPUComputePipeline;
+  routerTopk: GPUComputePipeline;
+  swiglu: GPUComputePipeline;
+  qmoeGateUp: GPUComputePipeline;
+  qmoeDownScatter: GPUComputePipeline;
+}
+
+interface BindGroupLayouts {
+  embed: GPUBindGroupLayout;
+  rmsNorm: GPUBindGroupLayout;
+  matmul: GPUBindGroupLayout;
+  cast1to1: GPUBindGroupLayout;       // single in → single out (cast_fp16_to_f32)
+  castScaled: GPUBindGroupLayout;     // dims + scale + src + dst
+  add: GPUBindGroupLayout;
+  zero: GPUBindGroupLayout;
+  rope: GPUBindGroupLayout;
+  banded: GPUBindGroupLayout;
+  routerTopk: GPUBindGroupLayout;
+  swiglu: GPUBindGroupLayout;
+  qmoeGateUp: GPUBindGroupLayout;
+  qmoeDown: GPUBindGroupLayout;
+}
+
+// ---------- scratch buffer plan ----------
+
+interface Scratch {
+  allocatedT: number;
+  idsBuf: GPUBuffer;
+  maskBuf: GPUBuffer;
+  cosBuf: GPUBuffer;
+  sinBuf: GPUBuffer;
+  h0: GPUBuffer;
+  h1: GPUBuffer;
+  normed1: GPUBuffer;
+  normed2: GPUBuffer;
+  hiddenF32: GPUBuffer;
+  qBuf: GPUBuffer;
+  kBuf: GPUBuffer;
+  vBuf: GPUBuffer;
+  attnOut: GPUBuffer;
+  attnF32: GPUBuffer;
+  oOut: GPUBuffer;
+  routerLogits: GPUBuffer;
+  routingIdx: GPUBuffer;
+  routingScores: GPUBuffer;
+  acc: GPUBuffer;
+  gateUp: GPUBuffer;
+  glu: GPUBuffer;
+  moeOut: GPUBuffer;
+  logitsOut: GPUBuffer;
+  logitsReadback: GPUBuffer;
+}
+
+// ---------- model config (duplicated from wasm path) ----------
+
+const PF_CONFIG = {
+  hiddenSize: 640,
+  numHeads: 14,
+  numKvHeads: 2,
+  headDim: 64,
+  slidingWindow: 128,
+  intermediateSize: 640,
+  numExpertsPerTok: 4,
+  rmsNormEps: 1e-5,
+  numClasses: 33,
+  rope: {
+    headDim: 64,
+    theta: 150000.0,
+    factor: 32.0,
+    originalMaxPositionEmbeddings: 4096,
+    betaFast: 32.0,
+    betaSlow: 1.0,
+    truncate: false,
+  },
+} as const;
+
+// ---------- backend ----------
 
 export class WebGpuBackend implements InferenceBackend {
   readonly name = "webgpu" as const;
   private device: GPUDevice | null = null;
   private weights: Map<string, GpuTensor> | null = null;
-  private matmulPipeline: GPUComputePipeline | null = null;
-  private matmulBGL: GPUBindGroupLayout | null = null;
+  private pipelines: Pipelines | null = null;
+  private bgls: BindGroupLayouts | null = null;
+  private scratch: Scratch | null = null;
+  private numLayers = 0;
+  private numExperts = 0;
+  private vocabSize = 0;
   private readonly opts: WebGpuBackendOptions;
 
   constructor(opts: WebGpuBackendOptions) {
@@ -171,57 +1093,559 @@ export class WebGpuBackend implements InferenceBackend {
       requiredFeatures: ["shader-f16"],
       requiredLimits: {
         // Experts: 128 * 1280 * 320 bytes = 52 MiB per layer just for
-        // gate_up quant. Max storage buffer size needs to accommodate.
+        // gate_up quant. Max storage buffer size needs to fit that.
         maxStorageBufferBindingSize: Math.min(
           adapter.limits.maxStorageBufferBindingSize,
           1024 * 1024 * 1024,
         ),
         maxBufferSize: Math.min(adapter.limits.maxBufferSize, 1024 * 1024 * 1024),
+        maxStorageBuffersPerShaderStage: Math.min(
+          adapter.limits.maxStorageBuffersPerShaderStage,
+          10,
+        ),
       },
     });
     this.device = device;
 
     this.weights = await loadOnnxWeightsGpu(device, this.opts.bundle.modelSource);
+    this.numLayers = detectNumLayers(this.weights);
+    this.vocabSize = this.weights.get("embed.int4")!.shape[0]!;
+    const routerInt4 = this.weights.get("layers.0.router.int4");
+    if (!routerInt4) throw new Error("WebGpuBackend: missing router weights");
+    this.numExperts = routerInt4.shape[0]!;
 
-    this.matmulBGL = device.createBindGroupLayout({
-      label: "matmul_int4.bgl",
-      entries: [
-        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
-        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-        { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-        { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
-      ],
-    });
-
-    const module = device.createShaderModule({
-      label: "matmul_int4.wgsl",
-      code: MATMUL_INT4_WGSL,
-    });
-    this.matmulPipeline = await device.createComputePipelineAsync({
-      label: "matmul_int4.pipeline",
-      layout: device.createPipelineLayout({ bindGroupLayouts: [this.matmulBGL] }),
-      compute: { module, entryPoint: "main" },
-    });
+    this.bgls = createBindGroupLayouts(device);
+    this.pipelines = await createPipelines(device, this.bgls);
   }
 
-  async forward(_tokenIds: Int32Array, _attentionMask: Uint8Array): Promise<Logits> {
-    throw new Error("WebGpuBackend.forward: not yet implemented (scaffold only)");
+  async forward(
+    tokenIds: Int32Array,
+    attentionMask: Uint8Array,
+  ): Promise<Logits> {
+    if (!this.device || !this.weights || !this.pipelines || !this.bgls) {
+      throw new Error("WebGpuBackend.forward: call warmup() first");
+    }
+    const T = tokenIds.length;
+    if (attentionMask.length !== T) {
+      throw new Error(
+        `WebGpuBackend.forward: attentionMask length ${attentionMask.length} does not match tokenIds length ${T}`,
+      );
+    }
+    const device = this.device;
+    this.ensureScratch(T);
+    const scratch = this.scratch!;
+
+    // Upload token ids + mask (pad mask to 4-byte alignment).
+    device.queue.writeBuffer(
+      scratch.idsBuf, 0,
+      tokenIds.buffer as ArrayBuffer, tokenIds.byteOffset, T * 4,
+    );
+    const maskPadded = padTo4(attentionMask);
+    device.queue.writeBuffer(
+      scratch.maskBuf, 0,
+      maskPadded.buffer as ArrayBuffer, maskPadded.byteOffset, maskPadded.byteLength,
+    );
+    let useMask = 0;
+    for (let i = 0; i < T; i++) {
+      if (attentionMask[i] !== 1) { useMask = 1; break; }
+    }
+
+    // Build RoPE tables for this sequence length and upload.
+    const { cos, sin } = buildRopeTables(PF_CONFIG.rope, T);
+    const cosBytes = new Uint8Array(cos.buffer, cos.byteOffset, cos.byteLength);
+    const sinBytes = new Uint8Array(sin.buffer, sin.byteOffset, sin.byteLength);
+    const cosPadded = padTo4(cosBytes);
+    const sinPadded = padTo4(sinBytes);
+    device.queue.writeBuffer(
+      scratch.cosBuf, 0,
+      cosPadded.buffer as ArrayBuffer, cosPadded.byteOffset, cosPadded.byteLength,
+    );
+    device.queue.writeBuffer(
+      scratch.sinBuf, 0,
+      sinPadded.buffer as ArrayBuffer, sinPadded.byteOffset, sinPadded.byteLength,
+    );
+
+    const D = PF_CONFIG.hiddenSize;
+    const Hq = PF_CONFIG.numHeads;
+    const Hkv = PF_CONFIG.numKvHeads;
+    const hd = PF_CONFIG.headDim;
+    const dff = PF_CONFIG.intermediateSize;
+    const Kpick = PF_CONFIG.numExpertsPerTok;
+    const E = this.numExperts;
+
+    // Session-lived uniform buffers created per dispatch. We hold them in
+    // this array so they survive until queue.submit() returns.
+    const ownedResources: { destroy(): void }[] = [];
+    const u = (bytes: ArrayBuffer): GPUBuffer => {
+      const buf = device.createBuffer({
+        size: Math.max(16, bytes.byteLength),
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      device.queue.writeBuffer(buf, 0, bytes);
+      ownedResources.push(buf);
+      return buf;
+    };
+    const dims4 = (a: number, b: number, c: number, d: number): ArrayBuffer =>
+      new Uint32Array([a, b, c, d]).buffer as ArrayBuffer;
+    const dimsEps = (T_: number, D_: number, eps: number): ArrayBuffer => {
+      const buf = new ArrayBuffer(16);
+      new Uint32Array(buf, 0, 2).set([T_, D_]);
+      new Float32Array(buf, 8, 1).set([eps]);
+      return buf;
+    };
+    const dimsScale = (scale: number): ArrayBuffer => {
+      const buf = new ArrayBuffer(16);
+      new Float32Array(buf, 0, 1).set([scale]);
+      return buf;
+    };
+    const dims8 = (a: number, b: number, c: number, d: number,
+                   e: number, f: number, g: number, h: number): ArrayBuffer =>
+      new Uint32Array([a, b, c, d, e, f, g, h]).buffer as ArrayBuffer;
+
+    const encoder = device.createCommandEncoder({ label: "pii.forward" });
+    const pass = encoder.beginComputePass({ label: "pii.forward.pass" });
+
+    const dispatchThreads = (
+      pipeline: GPUComputePipeline,
+      bindGroup: GPUBindGroup,
+      totalThreads: number,
+    ): void => {
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.dispatchWorkgroups(Math.max(1, Math.ceil(totalThreads / 64)));
+    };
+    const dispatchGroups = (
+      pipeline: GPUComputePipeline,
+      bindGroup: GPUBindGroup,
+      numGroups: number,
+    ): void => {
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.dispatchWorkgroups(Math.max(1, numGroups));
+    };
+    const dispatch = dispatchThreads;
+
+    // Embed lookup → h0.
+    {
+      const dimsBuf = u(dims4(T, this.vocabSize, D, 0));
+      const embedInt4 = this.weights.get("embed.int4")!;
+      const embedScales = this.weights.get("embed.scales")!;
+      const embedZp = this.weights.get("embed.zp")!;
+      const bg = device.createBindGroup({
+        layout: this.bgls.embed,
+        entries: [
+          { binding: 0, resource: { buffer: dimsBuf } },
+          resBinding(1, embedInt4),
+          resBinding(2, embedScales),
+          resBinding(3, embedZp),
+          { binding: 4, resource: { buffer: scratch.idsBuf } },
+          { binding: 5, resource: { buffer: scratch.h0 } },
+        ],
+      });
+      dispatch(this.pipelines.embed, bg, T * D);
+    }
+
+    let hCur = scratch.h0;
+    let hAlt = scratch.h1;
+    for (let L = 0; L < this.numLayers; L++) {
+      const w = (suffix: string) => this.weights!.get(`layers.${L}.${suffix}`)!;
+
+      // input_layernorm(hCur) → normed1.
+      dispatchGroups(
+        this.pipelines.rmsNorm,
+        device.createBindGroup({
+          layout: this.bgls.rmsNorm,
+          entries: [
+            { binding: 0, resource: { buffer: u(dimsEps(T, D, PF_CONFIG.rmsNormEps)) } },
+            { binding: 1, resource: { buffer: hCur } },
+            resBinding(2, w("input_layernorm")),
+            { binding: 3, resource: { buffer: scratch.normed1 } },
+          ],
+        }),
+        T,
+      );
+
+      // Widen normed1 → hiddenF32 for Q/K/V matmul.
+      dispatch(
+        this.pipelines.castFp16ToF32,
+        device.createBindGroup({
+          layout: this.bgls.cast1to1,
+          entries: [
+            { binding: 0, resource: { buffer: u(dims4(T * D, 0, 0, 0)) } },
+            { binding: 1, resource: { buffer: scratch.normed1 } },
+            { binding: 2, resource: { buffer: scratch.hiddenF32 } },
+          ],
+        }),
+        T * D,
+      );
+
+      // Q/K/V projections.
+      const runMatmulF16 = (
+        weightsBase: string,
+        xBuf: GPUBuffer,
+        yBuf: GPUBuffer,
+        N: number, K: number,
+      ): void => {
+        const wq = this.weights!.get(`${weightsBase}.int4`)!;
+        const ws = this.weights!.get(`${weightsBase}.scales`)!;
+        const wz = this.weights!.get(`${weightsBase}.zp`)!;
+        const wb = this.weights!.get(`${weightsBase}.bias`)!;
+        const bg = device.createBindGroup({
+          layout: this.bgls!.matmul,
+          entries: [
+            { binding: 0, resource: { buffer: u(dims4(T, N, K, 0)) } },
+            { binding: 1, resource: { buffer: xBuf } },
+            resBinding(2, wq),
+            resBinding(3, ws),
+            resBinding(4, wz),
+            resBinding(5, wb),
+            { binding: 6, resource: { buffer: yBuf } },
+          ],
+        });
+        dispatch(this.pipelines!.matmulF32F16, bg, T * N);
+      };
+      runMatmulF16(`layers.${L}.attn.q_proj`, scratch.hiddenF32, scratch.qBuf, Hq * hd, D);
+      runMatmulF16(`layers.${L}.attn.k_proj`, scratch.hiddenF32, scratch.kBuf, Hkv * hd, D);
+      runMatmulF16(`layers.${L}.attn.v_proj`, scratch.hiddenF32, scratch.vBuf, Hkv * hd, D);
+
+      // RoPE on Q and K.
+      const runRope = (qkBuf: GPUBuffer, heads: number): void => {
+        const half = hd / 2;
+        const bg = device.createBindGroup({
+          layout: this.bgls!.rope,
+          entries: [
+            { binding: 0, resource: { buffer: u(dims4(T, heads, hd, 0)) } },
+            { binding: 1, resource: { buffer: qkBuf } },
+            { binding: 2, resource: { buffer: scratch.cosBuf } },
+            { binding: 3, resource: { buffer: scratch.sinBuf } },
+          ],
+        });
+        dispatch(this.pipelines!.rope, bg, T * heads * half);
+      };
+      runRope(scratch.qBuf, Hq);
+      runRope(scratch.kBuf, Hkv);
+
+      // Banded attention: one workgroup per (t_q, h_q), 64 threads each.
+      dispatchGroups(
+        this.pipelines.banded,
+        device.createBindGroup({
+          layout: this.bgls.banded,
+          entries: [
+            { binding: 0, resource: { buffer: u(dims8(T, Hq, Hkv, hd, PF_CONFIG.slidingWindow, useMask, 0, 0)) } },
+            { binding: 1, resource: { buffer: scratch.qBuf } },
+            { binding: 2, resource: { buffer: scratch.kBuf } },
+            { binding: 3, resource: { buffer: scratch.vBuf } },
+            resBinding(4, w("attn.sinks")),
+            { binding: 5, resource: { buffer: scratch.maskBuf } },
+            { binding: 6, resource: { buffer: scratch.attnOut } },
+          ],
+        }),
+        T * Hq,
+      );
+
+      // Widen attn_out → attnF32 for O-projection.
+      dispatch(
+        this.pipelines.castFp16ToF32,
+        device.createBindGroup({
+          layout: this.bgls.cast1to1,
+          entries: [
+            { binding: 0, resource: { buffer: u(dims4(T * Hq * hd, 0, 0, 0)) } },
+            { binding: 1, resource: { buffer: scratch.attnOut } },
+            { binding: 2, resource: { buffer: scratch.attnF32 } },
+          ],
+        }),
+        T * Hq * hd,
+      );
+
+      // O projection.
+      runMatmulF16(`layers.${L}.attn.o_proj`, scratch.attnF32, scratch.oOut, D, Hq * hd);
+
+      // Residual: hCur + oOut → h1 (scratch).
+      dispatch(
+        this.pipelines.addFp16,
+        device.createBindGroup({
+          layout: this.bgls.add,
+          entries: [
+            { binding: 0, resource: { buffer: u(dims4(T * D, 0, 0, 0)) } },
+            { binding: 1, resource: { buffer: hCur } },
+            { binding: 2, resource: { buffer: scratch.oOut } },
+            { binding: 3, resource: { buffer: scratch.normed1 } },  // reuse normed1 as h1
+          ],
+        }),
+        T * D,
+      );
+      // `normed1` now holds h1 (post-attention residual).
+
+      // post_attention_layernorm(h1) → normed2.
+      dispatchGroups(
+        this.pipelines.rmsNorm,
+        device.createBindGroup({
+          layout: this.bgls.rmsNorm,
+          entries: [
+            { binding: 0, resource: { buffer: u(dimsEps(T, D, PF_CONFIG.rmsNormEps)) } },
+            { binding: 1, resource: { buffer: scratch.normed1 } },
+            resBinding(2, w("post_attention_layernorm")),
+            { binding: 3, resource: { buffer: scratch.normed2 } },
+          ],
+        }),
+        T,
+      );
+
+      // Widen normed2 → hiddenF32 (reuse, overwriting the Q/K/V source).
+      dispatch(
+        this.pipelines.castFp16ToF32,
+        device.createBindGroup({
+          layout: this.bgls.cast1to1,
+          entries: [
+            { binding: 0, resource: { buffer: u(dims4(T * D, 0, 0, 0)) } },
+            { binding: 1, resource: { buffer: scratch.normed2 } },
+            { binding: 2, resource: { buffer: scratch.hiddenF32 } },
+          ],
+        }),
+        T * D,
+      );
+
+      // Router: f32-in, f32-out int4 matmul.
+      {
+        const wq = this.weights.get(`layers.${L}.router.int4`)!;
+        const ws = this.weights.get(`layers.${L}.router.scales`)!;
+        const wz = this.weights.get(`layers.${L}.router.zp`)!;
+        const wb = this.weights.get(`layers.${L}.router.bias`)!;
+        dispatch(
+          this.pipelines.matmulF32F32,
+          device.createBindGroup({
+            layout: this.bgls.matmul,
+            entries: [
+              { binding: 0, resource: { buffer: u(dims4(T, E, D, 0)) } },
+              { binding: 1, resource: { buffer: scratch.hiddenF32 } },
+              resBinding(2, wq),
+              resBinding(3, ws),
+              resBinding(4, wz),
+              resBinding(5, wb),
+              { binding: 6, resource: { buffer: scratch.routerLogits } },
+            ],
+          }),
+          T * E,
+        );
+      }
+
+      // Router top-K softmax / K.
+      dispatch(
+        this.pipelines.routerTopk,
+        device.createBindGroup({
+          layout: this.bgls.routerTopk,
+          entries: [
+            { binding: 0, resource: { buffer: u(dims4(T, E, Kpick, 0)) } },
+            { binding: 1, resource: { buffer: scratch.routerLogits } },
+            { binding: 2, resource: { buffer: scratch.routingIdx } },
+            { binding: 3, resource: { buffer: scratch.routingScores } },
+          ],
+        }),
+        T,
+      );
+
+      // Zero the MoE accumulator.
+      dispatch(
+        this.pipelines.zero,
+        device.createBindGroup({
+          layout: this.bgls.zero,
+          entries: [
+            { binding: 0, resource: { buffer: u(dims4(T * D, 0, 0, 0)) } },
+            { binding: 1, resource: { buffer: scratch.acc } },
+          ],
+        }),
+        T * D,
+      );
+
+      // QMoE gate_up: f32 hidden × int4 W[expert] → f32 [T*K, 2*dff].
+      {
+        const wq = this.weights.get(`layers.${L}.experts.gate_up.int4`)!;
+        const ws = this.weights.get(`layers.${L}.experts.gate_up.scales`)!;
+        const wz = this.weights.get(`layers.${L}.experts.gate_up.zp`)!;
+        const wb = this.weights.get(`layers.${L}.experts.gate_up.bias`)!;
+        dispatch(
+          this.pipelines.qmoeGateUp,
+          device.createBindGroup({
+            layout: this.bgls.qmoeGateUp,
+            entries: [
+              { binding: 0, resource: { buffer: u(dims8(T, Kpick, 2 * dff, D, 0, 0, 0, 0)) } },
+              { binding: 1, resource: { buffer: scratch.hiddenF32 } },
+              { binding: 2, resource: { buffer: scratch.routingIdx } },
+              resBinding(3, wq),
+              resBinding(4, ws),
+              resBinding(5, wz),
+              resBinding(6, wb),
+              { binding: 7, resource: { buffer: scratch.gateUp } },
+            ],
+          }),
+          T * Kpick * 2 * dff,
+        );
+      }
+
+      // SwiGLU-with-clamp: [T*K, 2*dff] → [T*K, dff].
+      dispatch(
+        this.pipelines.swiglu,
+        device.createBindGroup({
+          layout: this.bgls.swiglu,
+          entries: [
+            { binding: 0, resource: { buffer: u(dims4(T * Kpick, dff, 0, 0)) } },
+            { binding: 1, resource: { buffer: scratch.gateUp } },
+            { binding: 2, resource: { buffer: scratch.glu } },
+          ],
+        }),
+        T * Kpick * dff,
+      );
+
+      // QMoE down_proj + atomic scatter-add into acc.
+      {
+        const wq = this.weights.get(`layers.${L}.experts.down.int4`)!;
+        const ws = this.weights.get(`layers.${L}.experts.down.scales`)!;
+        const wz = this.weights.get(`layers.${L}.experts.down.zp`)!;
+        const wb = this.weights.get(`layers.${L}.experts.down.bias`)!;
+        dispatch(
+          this.pipelines.qmoeDownScatter,
+          device.createBindGroup({
+            layout: this.bgls.qmoeDown,
+            entries: [
+              { binding: 0, resource: { buffer: u(dims8(T, Kpick, D, dff, 0, 0, 0, 0)) } },
+              { binding: 1, resource: { buffer: scratch.glu } },
+              { binding: 2, resource: { buffer: scratch.routingIdx } },
+              { binding: 3, resource: { buffer: scratch.routingScores } },
+              resBinding(4, wq),
+              resBinding(5, ws),
+              resBinding(6, wz),
+              resBinding(7, wb),
+              { binding: 8, resource: { buffer: scratch.acc } },
+            ],
+          }),
+          T * Kpick * D,
+        );
+      }
+
+      // acc × K → moe_out (fp16). Matches the WASM final multiply by
+      // num_experts_per_tok (K cancels with the /K embedded in
+      // routing_scores so the net combine is sum_k softmax_k * out_k).
+      dispatch(
+        this.pipelines.castF32ToFp16Scaled,
+        device.createBindGroup({
+          layout: this.bgls.castScaled,
+          entries: [
+            { binding: 0, resource: { buffer: u(dims4(T * D, 0, 0, 0)) } },
+            { binding: 1, resource: { buffer: u(dimsScale(Kpick)) } },
+            { binding: 2, resource: { buffer: scratch.acc } },
+            { binding: 3, resource: { buffer: scratch.moeOut } },
+          ],
+        }),
+        T * D,
+      );
+
+      // Residual: h1 + moe_out → hAlt.
+      dispatch(
+        this.pipelines.addFp16,
+        device.createBindGroup({
+          layout: this.bgls.add,
+          entries: [
+            { binding: 0, resource: { buffer: u(dims4(T * D, 0, 0, 0)) } },
+            { binding: 1, resource: { buffer: scratch.normed1 } },  // h1
+            { binding: 2, resource: { buffer: scratch.moeOut } },
+            { binding: 3, resource: { buffer: hAlt } },
+          ],
+        }),
+        T * D,
+      );
+
+      // Ping-pong.
+      const tmp = hCur;
+      hCur = hAlt;
+      hAlt = tmp;
+    }
+
+    // Final rmsnorm on hCur → normed1.
+    dispatchGroups(
+      this.pipelines.rmsNorm,
+      device.createBindGroup({
+        layout: this.bgls.rmsNorm,
+        entries: [
+          { binding: 0, resource: { buffer: u(dimsEps(T, D, PF_CONFIG.rmsNormEps)) } },
+          { binding: 1, resource: { buffer: hCur } },
+          resBinding(2, this.weights.get("final_norm")!),
+          { binding: 3, resource: { buffer: scratch.normed1 } },
+        ],
+      }),
+      T,
+    );
+
+    // Widen final norm → hiddenF32.
+    dispatch(
+      this.pipelines.castFp16ToF32,
+      device.createBindGroup({
+        layout: this.bgls.cast1to1,
+        entries: [
+          { binding: 0, resource: { buffer: u(dims4(T * D, 0, 0, 0)) } },
+          { binding: 1, resource: { buffer: scratch.normed1 } },
+          { binding: 2, resource: { buffer: scratch.hiddenF32 } },
+        ],
+      }),
+      T * D,
+    );
+
+    // Classifier head: f32 hidden × int4 W → f32 logits.
+    {
+      const numClasses = PF_CONFIG.numClasses;
+      const wq = this.weights.get("score.int4")!;
+      const ws = this.weights.get("score.scales")!;
+      const wz = this.weights.get("score.zp")!;
+      const wb = this.weights.get("score.bias")!;
+      dispatch(
+        this.pipelines.matmulF32F32,
+        device.createBindGroup({
+          layout: this.bgls.matmul,
+          entries: [
+            { binding: 0, resource: { buffer: u(dims4(T, numClasses, D, 0)) } },
+            { binding: 1, resource: { buffer: scratch.hiddenF32 } },
+            resBinding(2, wq),
+            resBinding(3, ws),
+            resBinding(4, wz),
+            resBinding(5, wb),
+            { binding: 6, resource: { buffer: scratch.logitsOut } },
+          ],
+        }),
+        T * numClasses,
+      );
+    }
+
+    pass.end();
+
+    const logitsBytes = T * PF_CONFIG.numClasses * 4;
+    encoder.copyBufferToBuffer(scratch.logitsOut, 0, scratch.logitsReadback, 0, logitsBytes);
+    device.queue.submit([encoder.finish()]);
+
+    await scratch.logitsReadback.mapAsync(GPUMapMode.READ, 0, logitsBytes);
+    const readView = scratch.logitsReadback.getMappedRange(0, logitsBytes);
+    const f32 = new Float32Array(readView.slice(0));
+    scratch.logitsReadback.unmap();
+
+    // Release per-forward uniform buffers.
+    for (const r of ownedResources) r.destroy();
+
+    return {
+      data: f32,
+      sequenceLength: T,
+      numClasses: PF_CONFIG.numClasses,
+    };
   }
 
   dispose(): void {
-    // Individual GPUBuffer handles drop with the Map; nothing to release
-    // explicitly. GPUDevice.destroy() is available but optional.
     this.weights = null;
+    this.pipelines = null;
+    this.bgls = null;
+    if (this.scratch) destroyScratch(this.scratch);
+    this.scratch = null;
     this.device?.destroy();
     this.device = null;
-    this.matmulPipeline = null;
-    this.matmulBGL = null;
   }
 
-  // ---- test helper: run a single matmul via the WGSL kernel ----
+  // ---- test helper: single-matmul parity ----
 
   /**
    * Run `y[T, N] = x[T, K] @ dequant(W[n])^T + bias[n]` on the GPU
@@ -236,7 +1660,7 @@ export class WebGpuBackend implements InferenceBackend {
     N: number,
     K: number,
   ): Promise<Float32Array> {
-    if (!this.device || !this.weights || !this.matmulPipeline || !this.matmulBGL) {
+    if (!this.device || !this.weights || !this.pipelines || !this.bgls) {
       throw new Error("WebGpuBackend.matmulInt4Test: call warmup() first");
     }
     const d = this.device;
@@ -261,7 +1685,7 @@ export class WebGpuBackend implements InferenceBackend {
     d.queue.writeBuffer(dimsBuf, 0, new Uint32Array([T, N, K, 0]).buffer as ArrayBuffer);
 
     const bindGroup = d.createBindGroup({
-      layout: this.matmulBGL,
+      layout: this.bgls.matmul,
       entries: [
         { binding: 0, resource: { buffer: dimsBuf } },
         { binding: 1, resource: { buffer: xBuf } },
@@ -275,10 +1699,9 @@ export class WebGpuBackend implements InferenceBackend {
 
     const encoder = d.createCommandEncoder({ label: "matmul_int4.encoder" });
     const pass = encoder.beginComputePass();
-    pass.setPipeline(this.matmulPipeline);
+    pass.setPipeline(this.pipelines.matmulF32F32);
     pass.setBindGroup(0, bindGroup);
-    const total = T * N;
-    pass.dispatchWorkgroups(Math.ceil(total / 64));
+    pass.dispatchWorkgroups(Math.max(1, Math.ceil((T * N) / 64)));
     pass.end();
 
     const readBuf = d.createBuffer({ size: yBytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
@@ -294,6 +1717,230 @@ export class WebGpuBackend implements InferenceBackend {
     dimsBuf.destroy();
     return out;
   }
+
+  // ---- scratch management ----
+
+  private ensureScratch(T: number): void {
+    if (this.scratch && this.scratch.allocatedT >= T) return;
+    if (!this.device) throw new Error("WebGpuBackend.ensureScratch: no device");
+
+    if (this.scratch) destroyScratch(this.scratch);
+
+    const device = this.device;
+    const D = PF_CONFIG.hiddenSize;
+    const Hq = PF_CONFIG.numHeads;
+    const Hkv = PF_CONFIG.numKvHeads;
+    const hd = PF_CONFIG.headDim;
+    const dff = PF_CONFIG.intermediateSize;
+    const Kpick = PF_CONFIG.numExpertsPerTok;
+    const E = this.numExperts;
+    const numClasses = PF_CONFIG.numClasses;
+
+    const mk = (label: string, size: number, usage: GPUBufferUsageFlags): GPUBuffer =>
+      device.createBuffer({ label, size: Math.max(16, (size + 3) & ~3), usage });
+
+    const STORE = GPUBufferUsage.STORAGE;
+    const STORE_DST = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
+    const STORE_SRC = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC;
+
+    this.scratch = {
+      allocatedT: T,
+      idsBuf:        mk("ids", T * 4, STORE_DST),
+      maskBuf:       mk("mask", (T + 3) & ~3, STORE_DST),
+      cosBuf:        mk("cos", T * (hd / 2) * 2, STORE_DST),
+      sinBuf:        mk("sin", T * (hd / 2) * 2, STORE_DST),
+      h0:            mk("h0", T * D * 2, STORE),
+      h1:            mk("h1", T * D * 2, STORE),
+      normed1:       mk("normed1", T * D * 2, STORE),
+      normed2:       mk("normed2", T * D * 2, STORE),
+      hiddenF32:     mk("hiddenF32", T * D * 4, STORE),
+      qBuf:          mk("q", T * Hq * hd * 2, STORE),
+      kBuf:          mk("k", T * Hkv * hd * 2, STORE),
+      vBuf:          mk("v", T * Hkv * hd * 2, STORE),
+      attnOut:       mk("attnOut", T * Hq * hd * 2, STORE),
+      attnF32:       mk("attnF32", T * Hq * hd * 4, STORE),
+      oOut:          mk("oOut", T * D * 2, STORE),
+      routerLogits:  mk("routerLogits", T * E * 4, STORE),
+      routingIdx:    mk("routingIdx", T * Kpick * 4, STORE),
+      routingScores: mk("routingScores", T * Kpick * 4, STORE),
+      acc:           mk("acc", T * D * 4, STORE),
+      gateUp:        mk("gateUp", T * Kpick * 2 * dff * 4, STORE),
+      glu:           mk("glu", T * Kpick * dff * 4, STORE),
+      moeOut:        mk("moeOut", T * D * 2, STORE),
+      logitsOut:     mk("logitsOut", T * numClasses * 4, STORE_SRC),
+      logitsReadback: device.createBuffer({
+        label: "logitsReadback",
+        size: Math.max(16, (T * numClasses * 4 + 3) & ~3),
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      }),
+    };
+  }
+}
+
+// ---------- bind group layouts ----------
+
+function createBindGroupLayouts(device: GPUDevice): BindGroupLayouts {
+  const uniformEntry = (binding: number): GPUBindGroupLayoutEntry => ({
+    binding, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" },
+  });
+  const rEntry = (binding: number): GPUBindGroupLayoutEntry => ({
+    binding, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" },
+  });
+  const rwEntry = (binding: number): GPUBindGroupLayoutEntry => ({
+    binding, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" },
+  });
+
+  return {
+    embed: device.createBindGroupLayout({
+      label: "bgl.embed",
+      entries: [uniformEntry(0), rEntry(1), rEntry(2), rEntry(3), rEntry(4), rwEntry(5)],
+    }),
+    rmsNorm: device.createBindGroupLayout({
+      label: "bgl.rmsnorm",
+      entries: [uniformEntry(0), rEntry(1), rEntry(2), rwEntry(3)],
+    }),
+    matmul: device.createBindGroupLayout({
+      label: "bgl.matmul",
+      entries: [uniformEntry(0), rEntry(1), rEntry(2), rEntry(3), rEntry(4), rEntry(5), rwEntry(6)],
+    }),
+    cast1to1: device.createBindGroupLayout({
+      label: "bgl.cast1to1",
+      entries: [uniformEntry(0), rEntry(1), rwEntry(2)],
+    }),
+    castScaled: device.createBindGroupLayout({
+      label: "bgl.castScaled",
+      entries: [uniformEntry(0), uniformEntry(1), rEntry(2), rwEntry(3)],
+    }),
+    add: device.createBindGroupLayout({
+      label: "bgl.add",
+      entries: [uniformEntry(0), rEntry(1), rEntry(2), rwEntry(3)],
+    }),
+    zero: device.createBindGroupLayout({
+      label: "bgl.zero",
+      entries: [uniformEntry(0), rwEntry(1)],
+    }),
+    rope: device.createBindGroupLayout({
+      label: "bgl.rope",
+      entries: [uniformEntry(0), rwEntry(1), rEntry(2), rEntry(3)],
+    }),
+    banded: device.createBindGroupLayout({
+      label: "bgl.banded",
+      entries: [uniformEntry(0), rEntry(1), rEntry(2), rEntry(3), rEntry(4), rEntry(5), rwEntry(6)],
+    }),
+    routerTopk: device.createBindGroupLayout({
+      label: "bgl.routerTopk",
+      entries: [uniformEntry(0), rEntry(1), rwEntry(2), rwEntry(3)],
+    }),
+    swiglu: device.createBindGroupLayout({
+      label: "bgl.swiglu",
+      entries: [uniformEntry(0), rEntry(1), rwEntry(2)],
+    }),
+    qmoeGateUp: device.createBindGroupLayout({
+      label: "bgl.qmoeGateUp",
+      entries: [
+        uniformEntry(0), rEntry(1), rEntry(2),
+        rEntry(3), rEntry(4), rEntry(5), rEntry(6),
+        rwEntry(7),
+      ],
+    }),
+    qmoeDown: device.createBindGroupLayout({
+      label: "bgl.qmoeDown",
+      entries: [
+        uniformEntry(0), rEntry(1), rEntry(2), rEntry(3),
+        rEntry(4), rEntry(5), rEntry(6), rEntry(7),
+        rwEntry(8),
+      ],
+    }),
+  };
+}
+
+// ---------- pipeline compilation ----------
+
+async function createPipelines(
+  device: GPUDevice,
+  bgls: BindGroupLayouts,
+): Promise<Pipelines> {
+  const mk = async (
+    label: string,
+    wgsl: string,
+    bgl: GPUBindGroupLayout,
+  ): Promise<GPUComputePipeline> => {
+    const module = device.createShaderModule({ label: `${label}.wgsl`, code: wgsl });
+    return device.createComputePipelineAsync({
+      label: `${label}.pipeline`,
+      layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+      compute: { module, entryPoint: "main" },
+    });
+  };
+
+  const [
+    embed, rmsNorm, matmulF32F32, matmulF32F16, castFp16ToF32,
+    castF32ToFp16Scaled, addFp16, zero, rope, banded,
+    routerTopk, swiglu, qmoeGateUp, qmoeDownScatter,
+  ] = await Promise.all([
+    mk("embed",              EMBED_LOOKUP_INT4_WGSL,       bgls.embed),
+    mk("rmsnorm",            RMS_NORM_WGSL,                 bgls.rmsNorm),
+    mk("matmul_int4_f32_f32",MATMUL_INT4_F32_F32_WGSL,      bgls.matmul),
+    mk("matmul_int4_f32_f16",MATMUL_INT4_F32_F16_WGSL,      bgls.matmul),
+    mk("cast_fp16_to_f32",   CAST_FP16_TO_F32_WGSL,         bgls.cast1to1),
+    mk("cast_f32_to_fp16_scaled", CAST_F32_TO_FP16_SCALED_WGSL, bgls.castScaled),
+    mk("add_fp16",           ADD_FP16_WGSL,                 bgls.add),
+    mk("zero",               ZERO_F32_WGSL,                 bgls.zero),
+    mk("rope",               ROPE_APPLY_WGSL,               bgls.rope),
+    mk("banded",             BANDED_ATTENTION_WGSL,         bgls.banded),
+    mk("routerTopk",         ROUTER_TOPK_WGSL,              bgls.routerTopk),
+    mk("swiglu",             SWIGLU_CLAMP_WGSL,             bgls.swiglu),
+    mk("qmoeGateUp",         QMOE_GATE_UP_WGSL,             bgls.qmoeGateUp),
+    mk("qmoeDownScatter",    QMOE_DOWN_SCATTER_WGSL,        bgls.qmoeDown),
+  ]);
+
+  return {
+    embed, rmsNorm, matmulF32F32, matmulF32F16, castFp16ToF32,
+    castF32ToFp16Scaled, addFp16, zero, rope, banded,
+    routerTopk, swiglu, qmoeGateUp, qmoeDownScatter,
+  };
+}
+
+// ---------- helpers ----------
+
+function resBinding(binding: number, t: GpuTensor): GPUBindGroupEntry {
+  return {
+    binding,
+    resource: { buffer: t.buffer, offset: t.byteOffset, size: t.byteSize },
+  };
+}
+
+function destroyScratch(s: Scratch): void {
+  s.idsBuf.destroy(); s.maskBuf.destroy();
+  s.cosBuf.destroy(); s.sinBuf.destroy();
+  s.h0.destroy(); s.h1.destroy();
+  s.normed1.destroy(); s.normed2.destroy();
+  s.hiddenF32.destroy();
+  s.qBuf.destroy(); s.kBuf.destroy(); s.vBuf.destroy();
+  s.attnOut.destroy(); s.attnF32.destroy(); s.oOut.destroy();
+  s.routerLogits.destroy();
+  s.routingIdx.destroy(); s.routingScores.destroy();
+  s.acc.destroy();
+  s.gateUp.destroy(); s.glu.destroy(); s.moeOut.destroy();
+  s.logitsOut.destroy(); s.logitsReadback.destroy();
+}
+
+function padTo4(src: Uint8Array): Uint8Array {
+  const len = (src.byteLength + 3) & ~3;
+  if (len === src.byteLength) return src;
+  const out = new Uint8Array(len);
+  out.set(src);
+  return out;
+}
+
+function detectNumLayers(map: ReadonlyMap<string, GpuTensor>): number {
+  let max = -1;
+  for (const name of map.keys()) {
+    const m = /^layers\.(\d+)\.input_layernorm$/.exec(name);
+    if (m) max = Math.max(max, Number.parseInt(m[1]!, 10));
+  }
+  if (max < 0) throw new Error("WebGpuBackend: no transformer layers found in weight map");
+  return max + 1;
 }
 
 // ---------- weight upload ----------
@@ -301,8 +1948,7 @@ export class WebGpuBackend implements InferenceBackend {
 /**
  * Parse the ONNX graph + external data, convert each tensor into the
  * dtype/layout our WGSL kernels expect, and upload as a storage buffer.
- * Scales/zp/int4 layouts match the WASM path byte-for-byte so a single
- * name → buffer lookup covers both shader variants.
+ * Scales/zp/int4 layouts match the WASM path byte-for-byte.
  */
 async function loadOnnxWeightsGpu(
   device: GPUDevice,
@@ -326,11 +1972,10 @@ async function loadOnnxWeightsGpu(
     bytes: Uint8Array,
     shape: readonly number[],
   ): GpuTensor {
-    // WebGPU requires buffer size to be a multiple of 4.
     const paddedSize = (bytes.byteLength + 3) & ~3;
     const buffer = device.createBuffer({
       label: key,
-      size: paddedSize,
+      size: Math.max(16, paddedSize),
       usage: usage | GPUBufferUsage.COPY_DST,
       mappedAtCreation: true,
     });
@@ -449,15 +2094,15 @@ async function loadOnnxWeightsGpu(
       const scalesShape = shapeOf(`${eBase}_weight_scales`);
       const nBlocks = scalesShape[2]!;
       const zpPerRow = (nBlocks + 1) >>> 1;
-      const E = quantShape[0]!;
+      const Ect = quantShape[0]!;
       const Nrows = quantShape[1]!;
-      const zp = new Uint8Array(E * Nrows * zpPerRow);
+      const zp = new Uint8Array(Ect * Nrows * zpPerRow);
       zp.fill(0x88);
       upload(`${k}.int4`, STORAGE,
         bytesOf(`${eBase}_weight_quant`), quantShape);
       upload(`${k}.scales`, STORAGE,
         bytesOf(`${eBase}_weight_scales`), scalesShape);
-      upload(`${k}.zp`, STORAGE, zp, [E, Nrows, zpPerRow]);
+      upload(`${k}.zp`, STORAGE, zp, [Ect, Nrows, zpPerRow]);
       const biasName = `model.layers.${L}.moe.experts.${onnxProj}.bias`;
       upload(`${k}.bias`, STORAGE, bytesOf(biasName), shapeOf(biasName));
     }

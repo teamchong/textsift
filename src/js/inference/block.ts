@@ -15,16 +15,20 @@
  * between forward passes.
  */
 
-import type { PiiWasmExports, WeightTensorInfo } from "../backends/wasm.js";
+import type { Int4BlockWeight, PiiWasmExports, WeightTensorInfo } from "../backends/wasm.js";
 import { attentionForward, type AttentionWeights, type AttentionConfig, type AttentionTables } from "./attention.js";
 import { expertDispatch, type ExpertWeights, type ExpertConfig } from "./expert.js";
 
 export interface BlockWeights {
-  inputLayernorm: WeightTensorInfo;           // bf16 [D]
-  postAttentionLayernorm: WeightTensorInfo;   // bf16 [D]
+  inputLayernorm: WeightTensorInfo;           // fp16 [D]
+  postAttentionLayernorm: WeightTensorInfo;   // fp16 [D]
   attn: AttentionWeights;
-  routerW: WeightTensorInfo;                  // bf16 [num_experts, D]
-  routerB: WeightTensorInfo;                  // bf16 [num_experts]
+  /**
+   * MoE router: int4-block W [num_experts, D] + f16 scales + uint4 ZP + fp16 bias.
+   * Upstream does f32 matmul for routing stability; we consume fp16 input
+   * and produce f32 logits via `matmul_fp16_x_int4block_out_f32`.
+   */
+  router: Int4BlockWeight;
   experts: ExpertWeights;
 }
 
@@ -43,8 +47,7 @@ export function routerForward(
   hiddenPtr: number,
   routingIdxPtr: number,
   routingScoresPtr: number,
-  weightsW: WeightTensorInfo,
-  weightsB: WeightTensorInfo,
+  router: Int4BlockWeight,
   numExperts: number,
   K: number,
   T: number,
@@ -52,8 +55,10 @@ export function routerForward(
 ): void {
   // Logits in fp32 (upstream: `F.linear(hidden.float(), W.float(), b.float())`).
   const logitsPtr = wasm.alloc(T * numExperts * 4);
-  wasm.matmul_bf16_out_f32(
-    hiddenPtr, weightsW.dataOffset, weightsB.dataOffset, logitsPtr,
+  wasm.matmul_fp16_x_int4block_out_f32(
+    hiddenPtr,
+    router.int4.dataOffset, router.scales.dataOffset, router.zp.dataOffset,
+    router.bias.dataOffset, logitsPtr,
     T, numExperts, D,
   );
   const topValPtr = wasm.alloc(T * K * 4);
@@ -96,7 +101,7 @@ export function blockForwardWithRouting(
   attentionForward(wasm, normed1Ptr, attnOutPtr, weights.attn, config, tables, T, maskPtr);
 
   const h1Ptr = wasm.alloc(T * D * 2);
-  wasm.add_bf16(residualPtr, attnOutPtr, h1Ptr, T * D);
+  wasm.add_fp16(residualPtr, attnOutPtr, h1Ptr, T * D);
 
   const residual2Ptr = wasm.alloc(T * D * 2);
   new Uint8Array(wasm.memory.buffer, residual2Ptr, T * D * 2).set(
@@ -114,7 +119,7 @@ export function blockForwardWithRouting(
     T,
   );
 
-  wasm.add_bf16(residual2Ptr, moeOutPtr, outputPtr, T * D);
+  wasm.add_fp16(residual2Ptr, moeOutPtr, outputPtr, T * D);
 }
 
 /**
@@ -148,7 +153,7 @@ export function blockForward(
   attentionForward(wasm, normed1Ptr, attnOutPtr, weights.attn, config, tables, T, maskPtr);
 
   const h1Ptr = wasm.alloc(T * D * 2);
-  wasm.add_bf16(residualPtr, attnOutPtr, h1Ptr, T * D);
+  wasm.add_fp16(residualPtr, attnOutPtr, h1Ptr, T * D);
 
   const residual2Ptr = wasm.alloc(T * D * 2);
   new Uint8Array(wasm.memory.buffer, residual2Ptr, T * D * 2).set(
@@ -163,7 +168,7 @@ export function blockForward(
   const routingScoresPtr = wasm.alloc(T * K * 4);
   routerForward(
     wasm, normed2Ptr, routingIdxPtr, routingScoresPtr,
-    weights.routerW, weights.routerB, config.numExperts, K, T, D,
+    weights.router, config.numExperts, K, T, D,
   );
 
   const moeOutPtr = wasm.alloc(T * D * 2);
@@ -174,5 +179,5 @@ export function blockForward(
     T,
   );
 
-  wasm.add_bf16(residual2Ptr, moeOutPtr, outputPtr, T * D);
+  wasm.add_fp16(residual2Ptr, moeOutPtr, outputPtr, T * D);
 }

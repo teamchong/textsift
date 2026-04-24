@@ -10,22 +10,18 @@
       // Exercises the public `PrivacyFilter.create({ backend: "wasm" })`
       // path in a real browser — tokenizer + viterbi + chunking + the
       // Stage-1 WASM backend, wired together through the same entry
-      // point consumers use. The committed truncated-1-layer blob is
-      // deliberately NOT the real 8-layer model, so span-level output
-      // quality is degraded; the test asserts the pipeline runs end-to
-      // -end and returns a typed `RedactResult` shape, not specific spans.
+      // point consumers use. Reads the same ONNX files as transformers.js
+      // from `modelSource`.
       import { PrivacyFilter } from "/dist/index.js";
 
       const $out = document.getElementById("out");
       const log = (msg) => { $out.textContent += "\n" + msg; };
 
       try {
-        log("PrivacyFilter.create (backend=wasm, truncated blob)…");
+        log("PrivacyFilter.create (backend=wasm)…");
         const t0 = performance.now();
         const filter = await PrivacyFilter.create({
           backend: "wasm",
-          wasmWeightsUrl: "/tests/fixtures/pii-weights.bin",
-          wasmModuleUrl: "/dist/pii.wasm",
         });
         const tCreate = performance.now() - t0;
         log(`created in ${tCreate.toFixed(1)}ms`);

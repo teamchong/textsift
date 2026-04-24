@@ -22,12 +22,13 @@
 
 const std = @import("std");
 const math = @import("math.zig");
-const bf16ToF32 = math.bf16ToF32;
-const f32ToBf16 = math.f32ToBf16;
-const bf16x4ToF32x4 = math.bf16x4ToF32x4;
+// Activations + biases + norms are all fp16 throughout. matches what
+// ORT Web runs for `model_q4f16.onnx` — same 10-bit mantissa, same
+// decision boundaries.
+const fp16ToF32 = math.fp16ToF32;
+const f32ToFp16 = math.f32ToFp16;
+const fp16x4ToF32x4 = math.fp16x4ToF32x4;
 const alignUp = math.alignUp;
-const readU32LE = math.readU32LE;
-const readU64LE = math.readU64LE;
 
 // --------------------------------------------------------------
 // Bump allocator
@@ -168,162 +169,17 @@ export fn sum_i32(ptr: [*]const i32, len: usize) i32 {
 }
 
 // --------------------------------------------------------------
-// Weight blob parser (pii-weights.bin v1)
-// --------------------------------------------------------------
-//
-// Format produced by `scripts/convert-weights.py`. See that script for
-// the full layout. Summary:
-//   Header (16  B): magic "PIIW" | version u32 | num_tensors u32 | data_offset u32
-//   Entry  (104 B): name[64] | dtype u32 | ndim u32 | shape[4] u32 | data_off u64 | data_size u64
-//   Data          : each tensor 64-byte aligned
-//
-// The parser validates magic + version, walks the table, and records
-// each tensor's `(data_ptr, data_size, shape, dtype)`. Kernels read
-// the stored pointers directly — no copying, no dynamic allocation.
-
-const WEIGHTS_MAGIC: u32 = 0x5749_4950; // "PIIW" little-endian
-const WEIGHTS_VERSION: u32 = 1;
-const MAX_TENSORS: usize = 256;
-const NAME_FIELD: usize = 64;
-const HEADER_SIZE: usize = 16;
-const ENTRY_SIZE: usize = 104;
-
-const TensorRecord = struct {
-    data_ptr: [*]const u8,
-    data_size: usize,
-    name: [NAME_FIELD]u8,
-    dtype: u32,
-    ndim: u32,
-    shape: [4]u32,
-};
-
-var g_tensors: [MAX_TENSORS]TensorRecord = undefined;
-var g_num_tensors: u32 = 0;
-
-const WEIGHTS_ERR_MAGIC: i32 = -1;
-const WEIGHTS_ERR_VERSION: i32 = -2;
-const WEIGHTS_ERR_TOO_MANY: i32 = -3;
-const WEIGHTS_ERR_BAD_OFFSET: i32 = -4;
-
-/// Parse a weight blob already copied into WASM linear memory.
-/// Returns 0 on success, negative error code otherwise. Safe to call
-/// multiple times — replaces any prior state.
-export fn weights_load(ptr: [*]const u8, size: usize) i32 {
-    g_num_tensors = 0;
-    if (size < HEADER_SIZE) return WEIGHTS_ERR_BAD_OFFSET;
-
-    const magic = readU32LE(ptr, 0);
-    if (magic != WEIGHTS_MAGIC) return WEIGHTS_ERR_MAGIC;
-    const version = readU32LE(ptr, 4);
-    if (version != WEIGHTS_VERSION) return WEIGHTS_ERR_VERSION;
-
-    const n = readU32LE(ptr, 8);
-    if (n > MAX_TENSORS) return WEIGHTS_ERR_TOO_MANY;
-
-    const data_offset = readU32LE(ptr, 12);
-    const table_end = HEADER_SIZE + ENTRY_SIZE * @as(usize, n);
-    if (data_offset < table_end) return WEIGHTS_ERR_BAD_OFFSET;
-    if (data_offset > size) return WEIGHTS_ERR_BAD_OFFSET;
-
-    var i: u32 = 0;
-    while (i < n) : (i += 1) {
-        const base: usize = HEADER_SIZE + ENTRY_SIZE * @as(usize, i);
-        var rec: TensorRecord = undefined;
-
-        // Copy 64-byte name.
-        var j: usize = 0;
-        while (j < NAME_FIELD) : (j += 1) {
-            rec.name[j] = ptr[base + j];
-        }
-
-        rec.dtype = readU32LE(ptr, base + 64);
-        rec.ndim = readU32LE(ptr, base + 68);
-        rec.shape[0] = readU32LE(ptr, base + 72);
-        rec.shape[1] = readU32LE(ptr, base + 76);
-        rec.shape[2] = readU32LE(ptr, base + 80);
-        rec.shape[3] = readU32LE(ptr, base + 84);
-
-        // Layout past the shape fields:
-        //   +88..+95  data_offset u64
-        //   +96..+103 data_size  u64
-        const data_off = readU64LE(ptr, base + 88);
-        const data_size = readU64LE(ptr, base + 96);
-        rec.data_ptr = ptr + @as(usize, @intCast(data_off));
-        rec.data_size = @intCast(data_size);
-
-        if (data_off + rec.data_size > size) return WEIGHTS_ERR_BAD_OFFSET;
-
-        g_tensors[i] = rec;
-    }
-
-    g_num_tensors = n;
-    return 0;
-}
-
-export fn weights_count() u32 {
-    return g_num_tensors;
-}
-
-export fn weights_dtype(idx: u32) u32 {
-    if (idx >= g_num_tensors) return 0xFFFF_FFFF;
-    return g_tensors[idx].dtype;
-}
-
-export fn weights_ndim(idx: u32) u32 {
-    if (idx >= g_num_tensors) return 0xFFFF_FFFF;
-    return g_tensors[idx].ndim;
-}
-
-/// Write shape into `out[0..4]`. Returns 0 on success, 1 on bad index.
-export fn weights_shape(idx: u32, out: [*]u32) u32 {
-    if (idx >= g_num_tensors) return 1;
-    const s = g_tensors[idx].shape;
-    out[0] = s[0];
-    out[1] = s[1];
-    out[2] = s[2];
-    out[3] = s[3];
-    return 0;
-}
-
-/// Return byte offset (into linear memory) of the tensor's data, or 0 on bad idx.
-export fn weights_data_ptr(idx: u32) u32 {
-    if (idx >= g_num_tensors) return 0;
-    const p: [*]const u8 = g_tensors[idx].data_ptr;
-    return @intCast(@intFromPtr(p));
-}
-
-export fn weights_data_size(idx: u32) u32 {
-    if (idx >= g_num_tensors) return 0;
-    return @intCast(g_tensors[idx].data_size);
-}
-
-/// Write the tensor's name into out[0..NAME_FIELD]. Returns string length
-/// (excluding null padding) on success, or 0xFFFFFFFF on bad idx.
-export fn weights_name(idx: u32, out: [*]u8) u32 {
-    if (idx >= g_num_tensors) return 0xFFFF_FFFF;
-    const name = g_tensors[idx].name;
-    var len: u32 = 0;
-    while (len < NAME_FIELD and name[len] != 0) : (len += 1) {
-        out[len] = name[len];
-    }
-    // Zero-pad the rest so JS can treat the buffer as a fixed-size field.
-    var i: usize = len;
-    while (i < NAME_FIELD) : (i += 1) out[i] = 0;
-    return len;
-}
-
-// --------------------------------------------------------------
 // Kernel: RMSNorm
 // --------------------------------------------------------------
 //
 // y[t, d] = x[t, d] * gamma[d] / sqrt(mean_d(x[t, :]^2) + eps)
 //
-// x:     bf16 [T, D]      row-major
-// gamma: bf16 [D]
-// out:   bf16 [T, D]      row-major
+// x:     fp16 [T, D]      row-major
+// gamma: fp16 [D]
+// out:   fp16 [T, D]      row-major
 //
 // Sum-of-squares accumulates in f32 for numerical stability (640-wide
-// bf16 rows would lose ~6 bits of precision if accumulated in bf16).
+// fp16 rows would lose precision if accumulated in fp16).
 // The upstream model uses `rms_norm_eps = 1e-5` everywhere.
 
 export fn rms_norm(
@@ -345,7 +201,7 @@ export fn rms_norm(
         var sumsq: f32 = 0.0;
         var d: usize = 0;
         while (d < Dz) : (d += 1) {
-            const v = bf16ToF32(x_ptr[row_base + d]);
+            const v = fp16ToF32(x_ptr[row_base + d]);
             sumsq += v * v;
         }
 
@@ -353,238 +209,13 @@ export fn rms_norm(
 
         d = 0;
         while (d < Dz) : (d += 1) {
-            const xv = bf16ToF32(x_ptr[row_base + d]);
-            const gv = bf16ToF32(gamma_ptr[d]);
-            out_ptr[row_base + d] = f32ToBf16(xv * inv_rms * gv);
+            const xv = fp16ToF32(x_ptr[row_base + d]);
+            const gv = fp16ToF32(gamma_ptr[d]);
+            out_ptr[row_base + d] = f32ToFp16(xv * inv_rms * gv);
         }
     }
 }
 
-// --------------------------------------------------------------
-// Kernel: bf16 matmul with bias
-// --------------------------------------------------------------
-//
-// out = x @ W.T + bias          // PyTorch `F.linear` convention
-//   x:    bf16 [T, D]
-//   W:    bf16 [N, D]           // HF stores linear weights as [out, in]
-//   bias: bf16 [N]
-//   out:  bf16 [T, N]
-//
-// Inner D-loop uses:
-//   (1) 4-wide SIMD bf16→f32 widen (see `bf16x4ToF32x4`).
-//   (2) Four independent @Vector(4, f32) accumulators, each covering a
-//       separate 4-lane slice of D, unrolled 16-at-a-time. The four
-//       accumulators break the serial add dependency chain, giving the
-//       WASM engine (V8/SM/JSC) room to schedule FMA-ish throughput.
-//   (3) Horizontal reduce at the end: (a0+a1+a2+a3)[0..3] summed to scalar.
-//
-// The accumulate order differs from a strictly-scalar reference, so the
-// output is NOT bit-exact against the scalar-drain version this kernel
-// used to ship. Parity contract is tolerance-based (rel_tol ≤ 1e-3 on
-// the bf16 output); see `tests/fixtures/manifest.json`.
-//
-// `@mulAdd` was tried and reverted — Zig's wasm-freestanding codegen
-// has no hardware f32x4 FMA intrinsic, so it falls back to a scalar
-// software fma that runs ~6× slower than the separate-mul-add vector
-// form. `f32x4.relaxed_madd` would help here, but Zig has no builtin
-// for it yet; inline asm or a future compiler update is needed.
-
-export fn matmul_bf16(
-    x_ptr: [*]const u16,
-    w_ptr: [*]const u16,
-    bias_ptr: [*]const u16,
-    out_ptr: [*]u16,
-    T: u32,
-    N: u32,
-    D: u32,
-) void {
-    const Tz: usize = T;
-    const Nz: usize = N;
-    const Dz: usize = D;
-    const LANES: usize = 4;
-    const TR: usize = 4;
-
-    // TR-tiled T loop: amortize W row loads across 4 X rows. For each
-    // tile of 4 consecutive T rows, one pass over W gives us 4 outputs
-    // per n. Register footprint: TR × 2 accumulator vectors + 4 X
-    // loads/iter + 2 W loads/iter.
-    var tt: usize = 0;
-    while (tt + TR <= Tz) : (tt += TR) {
-        var n: usize = 0;
-        while (n < Nz) : (n += 1) {
-            const w_base = n * Dz;
-
-            var a00: @Vector(4, f32) = @splat(0);
-            var a01: @Vector(4, f32) = @splat(0);
-            var a10: @Vector(4, f32) = @splat(0);
-            var a11: @Vector(4, f32) = @splat(0);
-            var a20: @Vector(4, f32) = @splat(0);
-            var a21: @Vector(4, f32) = @splat(0);
-            var a30: @Vector(4, f32) = @splat(0);
-            var a31: @Vector(4, f32) = @splat(0);
-
-            const step: usize = LANES * 2; // 8-wide step, two accs per T row
-            var d: usize = 0;
-            while (d + step <= Dz) : (d += step) {
-                const w0 = bf16x4ToF32x4(w_ptr[w_base + d ..][0..LANES].*);
-                const w1 = bf16x4ToF32x4(w_ptr[w_base + d + 4 ..][0..LANES].*);
-                const x00 = bf16x4ToF32x4(x_ptr[(tt + 0) * Dz + d ..][0..LANES].*);
-                const x01 = bf16x4ToF32x4(x_ptr[(tt + 0) * Dz + d + 4 ..][0..LANES].*);
-                const x10 = bf16x4ToF32x4(x_ptr[(tt + 1) * Dz + d ..][0..LANES].*);
-                const x11 = bf16x4ToF32x4(x_ptr[(tt + 1) * Dz + d + 4 ..][0..LANES].*);
-                const x20 = bf16x4ToF32x4(x_ptr[(tt + 2) * Dz + d ..][0..LANES].*);
-                const x21 = bf16x4ToF32x4(x_ptr[(tt + 2) * Dz + d + 4 ..][0..LANES].*);
-                const x30 = bf16x4ToF32x4(x_ptr[(tt + 3) * Dz + d ..][0..LANES].*);
-                const x31 = bf16x4ToF32x4(x_ptr[(tt + 3) * Dz + d + 4 ..][0..LANES].*);
-                a00 += x00 * w0;
-                a01 += x01 * w1;
-                a10 += x10 * w0;
-                a11 += x11 * w1;
-                a20 += x20 * w0;
-                a21 += x21 * w1;
-                a30 += x30 * w0;
-                a31 += x31 * w1;
-            }
-
-            // 4-lane tail for the last step if D % 8 != 0.
-            while (d + LANES <= Dz) : (d += LANES) {
-                const w0 = bf16x4ToF32x4(w_ptr[w_base + d ..][0..LANES].*);
-                a00 += bf16x4ToF32x4(x_ptr[(tt + 0) * Dz + d ..][0..LANES].*) * w0;
-                a10 += bf16x4ToF32x4(x_ptr[(tt + 1) * Dz + d ..][0..LANES].*) * w0;
-                a20 += bf16x4ToF32x4(x_ptr[(tt + 2) * Dz + d ..][0..LANES].*) * w0;
-                a30 += bf16x4ToF32x4(x_ptr[(tt + 3) * Dz + d ..][0..LANES].*) * w0;
-            }
-
-            const c0 = a00 + a01;
-            const c1 = a10 + a11;
-            const c2 = a20 + a21;
-            const c3 = a30 + a31;
-            var acc0: f32 = (c0[0] + c0[1]) + (c0[2] + c0[3]);
-            var acc1: f32 = (c1[0] + c1[1]) + (c1[2] + c1[3]);
-            var acc2: f32 = (c2[0] + c2[1]) + (c2[2] + c2[3]);
-            var acc3: f32 = (c3[0] + c3[1]) + (c3[2] + c3[3]);
-
-            while (d < Dz) : (d += 1) {
-                const wv = bf16ToF32(w_ptr[w_base + d]);
-                acc0 += bf16ToF32(x_ptr[(tt + 0) * Dz + d]) * wv;
-                acc1 += bf16ToF32(x_ptr[(tt + 1) * Dz + d]) * wv;
-                acc2 += bf16ToF32(x_ptr[(tt + 2) * Dz + d]) * wv;
-                acc3 += bf16ToF32(x_ptr[(tt + 3) * Dz + d]) * wv;
-            }
-
-            const b_val = bf16ToF32(bias_ptr[n]);
-            out_ptr[(tt + 0) * Nz + n] = f32ToBf16(acc0 + b_val);
-            out_ptr[(tt + 1) * Nz + n] = f32ToBf16(acc1 + b_val);
-            out_ptr[(tt + 2) * Nz + n] = f32ToBf16(acc2 + b_val);
-            out_ptr[(tt + 3) * Nz + n] = f32ToBf16(acc3 + b_val);
-        }
-    }
-
-    // T tail for T not divisible by TR. Same structure as the old
-    // single-row path.
-    while (tt < Tz) : (tt += 1) {
-        const x_base = tt * Dz;
-        const out_base = tt * Nz;
-
-        var n: usize = 0;
-        while (n < Nz) : (n += 1) {
-            const w_base = n * Dz;
-
-            var a0: @Vector(4, f32) = @splat(0);
-            var a1: @Vector(4, f32) = @splat(0);
-            var a2: @Vector(4, f32) = @splat(0);
-            var a3: @Vector(4, f32) = @splat(0);
-
-            const step: usize = LANES * 4;
-            var d: usize = 0;
-            while (d + step <= Dz) : (d += step) {
-                a0 += bf16x4ToF32x4(x_ptr[x_base + d ..][0..LANES].*) *
-                    bf16x4ToF32x4(w_ptr[w_base + d ..][0..LANES].*);
-                a1 += bf16x4ToF32x4(x_ptr[x_base + d + 4 ..][0..LANES].*) *
-                    bf16x4ToF32x4(w_ptr[w_base + d + 4 ..][0..LANES].*);
-                a2 += bf16x4ToF32x4(x_ptr[x_base + d + 8 ..][0..LANES].*) *
-                    bf16x4ToF32x4(w_ptr[w_base + d + 8 ..][0..LANES].*);
-                a3 += bf16x4ToF32x4(x_ptr[x_base + d + 12 ..][0..LANES].*) *
-                    bf16x4ToF32x4(w_ptr[w_base + d + 12 ..][0..LANES].*);
-            }
-            while (d + LANES <= Dz) : (d += LANES) {
-                a0 += bf16x4ToF32x4(x_ptr[x_base + d ..][0..LANES].*) *
-                    bf16x4ToF32x4(w_ptr[w_base + d ..][0..LANES].*);
-            }
-            const combined: @Vector(4, f32) = (a0 + a1) + (a2 + a3);
-            var acc: f32 = combined[0] + combined[1] + combined[2] + combined[3];
-            while (d < Dz) : (d += 1) {
-                acc += bf16ToF32(x_ptr[x_base + d]) * bf16ToF32(w_ptr[w_base + d]);
-            }
-            acc += bf16ToF32(bias_ptr[n]);
-            out_ptr[out_base + n] = f32ToBf16(acc);
-        }
-    }
-}
-
-/// F32-output variant of `matmul_bf16`. Same arithmetic; stores the
-/// accumulator + bias as f32 instead of rounding to bf16. Used when
-/// the consumer runs in fp32 (router, expert chain).
-export fn matmul_bf16_out_f32(
-    x_ptr: [*]const u16,
-    w_ptr: [*]const u16,
-    bias_ptr: [*]const u16,
-    out_ptr: [*]f32,
-    T: u32,
-    N: u32,
-    D: u32,
-) void {
-    const Tz: usize = T;
-    const Nz: usize = N;
-    const Dz: usize = D;
-    const LANES: usize = 4;
-    const UNROLL: usize = 4;
-
-    var t: usize = 0;
-    while (t < Tz) : (t += 1) {
-        const x_base = t * Dz;
-        const out_base = t * Nz;
-
-        var n: usize = 0;
-        while (n < Nz) : (n += 1) {
-            const w_base = n * Dz;
-
-            var a0: @Vector(4, f32) = @splat(0);
-            var a1: @Vector(4, f32) = @splat(0);
-            var a2: @Vector(4, f32) = @splat(0);
-            var a3: @Vector(4, f32) = @splat(0);
-
-            const step: usize = LANES * UNROLL;
-            var d: usize = 0;
-            while (d + step <= Dz) : (d += step) {
-                const x0: @Vector(4, u16) = x_ptr[x_base + d ..][0..LANES].*;
-                const x1: @Vector(4, u16) = x_ptr[x_base + d + 4 ..][0..LANES].*;
-                const x2: @Vector(4, u16) = x_ptr[x_base + d + 8 ..][0..LANES].*;
-                const x3: @Vector(4, u16) = x_ptr[x_base + d + 12 ..][0..LANES].*;
-                const w0: @Vector(4, u16) = w_ptr[w_base + d ..][0..LANES].*;
-                const w1: @Vector(4, u16) = w_ptr[w_base + d + 4 ..][0..LANES].*;
-                const w2: @Vector(4, u16) = w_ptr[w_base + d + 8 ..][0..LANES].*;
-                const w3: @Vector(4, u16) = w_ptr[w_base + d + 12 ..][0..LANES].*;
-                a0 += bf16x4ToF32x4(x0) * bf16x4ToF32x4(w0);
-                a1 += bf16x4ToF32x4(x1) * bf16x4ToF32x4(w1);
-                a2 += bf16x4ToF32x4(x2) * bf16x4ToF32x4(w2);
-                a3 += bf16x4ToF32x4(x3) * bf16x4ToF32x4(w3);
-            }
-            while (d + LANES <= Dz) : (d += LANES) {
-                const xu: @Vector(4, u16) = x_ptr[x_base + d ..][0..LANES].*;
-                const wu: @Vector(4, u16) = w_ptr[w_base + d ..][0..LANES].*;
-                a0 += bf16x4ToF32x4(xu) * bf16x4ToF32x4(wu);
-            }
-            const combined: @Vector(4, f32) = (a0 + a1) + (a2 + a3);
-            var acc: f32 = combined[0] + combined[1] + combined[2] + combined[3];
-            while (d < Dz) : (d += 1) {
-                acc += bf16ToF32(x_ptr[x_base + d]) * bf16ToF32(w_ptr[w_base + d]);
-            }
-
-            out_ptr[out_base + n] = acc + bf16ToF32(bias_ptr[n]);
-        }
-    }
-}
 
 // --------------------------------------------------------------
 // Kernel: row-wise top-k (partial selection)
@@ -662,14 +293,14 @@ export fn topk_partial_f32(
 }
 
 // --------------------------------------------------------------
-// Kernel: bf16 × int4-blockwise matmul with bias
+// Kernel: fp16 × int4-blockwise matmul with bias
 // --------------------------------------------------------------
 //
 // out = x @ dequant(W).T + bias     // PyTorch F.linear convention
-//   x:    bf16                [T, D]
+//   x:    fp16                [T, D]
 //   W:    int4 blockwise sym  [N, D]      (logical shape)
-//   bias: bf16                [N]
-//   out:  bf16                [T, N]
+//   bias: fp16                [N]
+//   out:  fp16                [T, N]
 //
 // Weight encoding (matches the "int4_block32_sym" dtype from
 // scripts/convert-weights.py):
@@ -683,13 +314,13 @@ export fn topk_partial_f32(
 //     is not required — max_abs maps to +7).
 //
 // Accumulate semantics:
-//   per block: 4-wide SIMD load of 4 x-bf16 lanes + extract 4 int4
+//   per block: 4-wide SIMD load of 4 x-fp16 lanes + extract 4 int4
 //     nibbles from 2 bytes, upcast both to f32, multiply. Drain lanes
 //     into a scalar `block_sum` so the per-block sum order matches a
 //     reference implementation. Then `acc += block_sum * scale_f32`.
 //   across blocks: scalar accumulate into `acc` (each block has its
 //     own scale; can't hoist).
-// Final `acc + bias` rounded to bf16 via RNE.
+// Final `acc + bias` rounded to fp16 via RNE.
 
 inline fn unpackInt4Lo(b: u8) i8 {
     const n: u4 = @truncate(b);
@@ -719,30 +350,22 @@ inline fn int4x4LoadF32(w_int4: [*]const u8, nibble_index: usize) @Vector(4, f32
     return @floatFromInt(q);
 }
 
-/// Read a fp16 scale as f32 (same lossless widening trick as bf16, but with
-/// fp16 semantics — we upcast via Zig's native f16 → f32 cast since fp16
-/// has real exponent/mantissa bits).
-inline fn fp16ToF32(bits: u16) f32 {
-    const h: f16 = @bitCast(bits);
-    return @floatCast(h);
-}
-
 /// Load 4 elements of an X-row as an f32 vector. `XType = u16` treats
-/// the source as bf16 and widens; `XType = f32` is a direct load.
+/// the source as fp16 and widens; `XType = f32` is a direct load.
 inline fn loadX4(comptime XType: type, base: [*]const XType, offset: usize) @Vector(4, f32) {
     if (XType == u16) {
         const xu: @Vector(4, u16) = base[offset..][0..4].*;
-        return bf16x4ToF32x4(xu);
+        return fp16x4ToF32x4(xu);
     } else if (XType == f32) {
         return base[offset..][0..4].*;
     } else @compileError("loadX4: unsupported XType");
 }
 
-/// Store an f32 accumulator lane to out. `OutType = u16` rounds to bf16;
+/// Store an f32 accumulator lane to out. `OutType = u16` rounds to fp16;
 /// `OutType = f32` is a direct store.
 inline fn storeOut(comptime OutType: type, out: [*]OutType, idx: usize, val: f32) void {
     if (OutType == u16) {
-        out[idx] = f32ToBf16(val);
+        out[idx] = f32ToFp16(val);
     } else if (OutType == f32) {
         out[idx] = val;
     } else @compileError("storeOut: unsupported OutType");
@@ -792,7 +415,7 @@ inline fn extractZp(zp_row: [*]const u8, b: usize) u8 {
 }
 
 /// Comptime-parameterized int4-block matmul body. Instantiated by the
-/// three public exports (bf16→bf16, bf16→f32, f32→f32). Three variants
+/// three public exports (fp16→fp16, fp16→f32, f32→f32). Three variants
 /// × ~100 lines each are worth a controlled monomorphization; we pay
 /// the specialization cost exactly three times.
 ///
@@ -892,7 +515,7 @@ inline fn matmulInt4BlockImpl(
                 acc3 += ((c3[0] + c3[1]) + (c3[2] + c3[3])) * scale;
             }
 
-            const b_val = bf16ToF32(bias_ptr[n]);
+            const b_val = fp16ToF32(bias_ptr[n]);
             storeOut(OutType, out_ptr, (tt + 0) * Nz + n, acc0 + b_val);
             storeOut(OutType, out_ptr, (tt + 1) * Nz + n, acc1 + b_val);
             storeOut(OutType, out_ptr, (tt + 2) * Nz + n, acc2 + b_val);
@@ -935,16 +558,16 @@ inline fn matmulInt4BlockImpl(
                 acc += block_sum * scale;
             }
 
-            acc += bf16ToF32(bias_ptr[n]);
+            acc += fp16ToF32(bias_ptr[n]);
             storeOut(OutType, out_ptr, out_base + n, acc);
         }
     }
 }
 
-/// bf16 x × int4-blockwise W + bias → bf16 out. ONNX MatMulNBits
+/// fp16 x × int4-blockwise W + bias → fp16 out. ONNX MatMulNBits
 /// semantics: uint4 weights, (q - zp) * scale dequant.
 /// Pass `w_zp_ptr = 0` for symmetric-decode (treats zp = 0 for all blocks).
-export fn matmul_bf16_x_int4block(
+export fn matmul_fp16_x_int4block(
     x_ptr: [*]const u16,
     w_int4_ptr: [*]const u8,
     w_scales_ptr: [*]const u16,
@@ -956,9 +579,9 @@ export fn matmul_bf16_x_int4block(
     matmulInt4BlockImpl(u16, u16, x_ptr, w_int4_ptr, w_scales_ptr, w_zp_ptr, bias_ptr, out_ptr, T, N, D);
 }
 
-/// bf16 x × int4-blockwise W + bias → f32 out. Used for the MoE gate_up
+/// fp16 x × int4-blockwise W + bias → f32 out. Used for the MoE gate_up
 /// matmul — upstream expert forward keeps the chain in fp32.
-export fn matmul_bf16_x_int4block_out_f32(
+export fn matmul_fp16_x_int4block_out_f32(
     x_ptr: [*]const u16,
     w_int4_ptr: [*]const u8,
     w_scales_ptr: [*]const u16,
@@ -985,11 +608,12 @@ export fn matmul_f32_x_int4block_out_f32(
 }
 
 // --------------------------------------------------------------
-// Kernel: SwiGLU with clamp (privacy-filter variant)
+// Kernel: SwiGLU with clamp (privacy-filter / ORT QMoE variant)
 // --------------------------------------------------------------
 //
-// Matches `OpenAIPrivacyFilterExperts._apply_gate` exactly:
-//   gate, up = gate_up.chunk(2, dim=-1)
+// Matches ORT's QMoE `swiglu_fusion=1` and upstream `swiglu(packed=True)`:
+//   gate = gate_up[..., 0::2]       # even indices
+//   up   = gate_up[..., 1::2]       # odd indices
 //   gate = gate.clamp(max=7.0)
 //   up   = up.clamp(-7.0, 7.0)
 //   glu  = gate * sigmoid(gate * 1.702)
@@ -998,7 +622,7 @@ export fn matmul_f32_x_int4block_out_f32(
 // All compute in f32 — the upstream expert forward runs in fp32
 // throughout (`.float()` on every op). Input and output are f32.
 //
-// gate_up: [T, 2*D]   f32       (gate concatenated with up)
+// gate_up: [T, 2*D]   f32       (packed: (gate[0], up[0], gate[1], up[1], …))
 // out:     [T, D]     f32
 //
 // Note on the 1.702 constant: this is the GELU-approximation scale
@@ -1038,8 +662,8 @@ export fn swiglu_clamp_f32(
 
         var d: usize = 0;
         while (d < Dz) : (d += 1) {
-            var gate = gate_up_ptr[row_base + d];
-            var up = gate_up_ptr[row_base + Dz + d];
+            var gate = gate_up_ptr[row_base + 2 * d];
+            var up = gate_up_ptr[row_base + 2 * d + 1];
             if (gate > SWIGLU_LIMIT) gate = SWIGLU_LIMIT;
             if (up > SWIGLU_LIMIT) up = SWIGLU_LIMIT;
             if (up < -SWIGLU_LIMIT) up = -SWIGLU_LIMIT;
@@ -1105,15 +729,15 @@ export fn softmax_f32(
 }
 
 // --------------------------------------------------------------
-// Kernel: elementwise bf16 add
+// Kernel: elementwise fp16 add
 // --------------------------------------------------------------
 //
-// out[i] = round_bf16(a[i] + b[i])
+// out[i] = round_fp16(a[i] + b[i])
 // Used for residual connections in the block forward pass. Upstream's
-// `residual + hidden_states` is a bf16 + bf16 → bf16 with an implicit
+// `residual + hidden_states` is a fp16 + fp16 → fp16 with an implicit
 // f32 widen inside — matched here.
 
-export fn add_bf16(
+export fn add_fp16(
     a_ptr: [*]const u16,
     b_ptr: [*]const u16,
     out_ptr: [*]u16,
@@ -1125,26 +749,26 @@ export fn add_bf16(
     while (i + LANES <= nz) : (i += LANES) {
         const av: @Vector(4, u16) = a_ptr[i ..][0..LANES].*;
         const bv: @Vector(4, u16) = b_ptr[i ..][0..LANES].*;
-        const sum: @Vector(4, f32) = bf16x4ToF32x4(av) + bf16x4ToF32x4(bv);
-        out_ptr[i + 0] = f32ToBf16(sum[0]);
-        out_ptr[i + 1] = f32ToBf16(sum[1]);
-        out_ptr[i + 2] = f32ToBf16(sum[2]);
-        out_ptr[i + 3] = f32ToBf16(sum[3]);
+        const sum: @Vector(4, f32) = fp16x4ToF32x4(av) + fp16x4ToF32x4(bv);
+        out_ptr[i + 0] = f32ToFp16(sum[0]);
+        out_ptr[i + 1] = f32ToFp16(sum[1]);
+        out_ptr[i + 2] = f32ToFp16(sum[2]);
+        out_ptr[i + 3] = f32ToFp16(sum[3]);
     }
     while (i < nz) : (i += 1) {
-        out_ptr[i] = f32ToBf16(bf16ToF32(a_ptr[i]) + bf16ToF32(b_ptr[i]));
+        out_ptr[i] = f32ToFp16(fp16ToF32(a_ptr[i]) + fp16ToF32(b_ptr[i]));
     }
 }
 
 // --------------------------------------------------------------
-// Kernel: gather bf16 rows by int32 index
+// Kernel: gather fp16 rows by int32 index
 // --------------------------------------------------------------
 //
 // dst[i, :] = src[indices[i], :]   for i in 0..m
 // Used by expert dispatch to pull the token rows assigned to one expert
 // into a contiguous scratch before the matmul chain.
 
-export fn gather_bf16(
+export fn gather_fp16(
     src_ptr: [*]const u16,
     indices_ptr: [*]const i32,
     dst_ptr: [*]u16,
@@ -1217,14 +841,14 @@ export fn zero_f32(ptr: [*]f32, n: u32) void {
 }
 
 // --------------------------------------------------------------
-// Kernel: f32 → bf16 with optional scalar multiply
+// Kernel: f32 → fp16 with optional scalar multiply
 // --------------------------------------------------------------
 //
-// dst[i] = round_bf16(src[i] * scale)
+// dst[i] = round_fp16(src[i] * scale)
 // Used to finish the MoE accumulator: multiply by `num_experts_per_tok`
-// and downcast to bf16 in one pass (saves a buffer).
+// and downcast to fp16 in one pass (saves a buffer).
 
-export fn cast_f32_to_bf16_scaled(
+export fn cast_f32_to_fp16_scaled(
     src_ptr: [*]const f32,
     dst_ptr: [*]u16,
     n: u32,
@@ -1233,20 +857,20 @@ export fn cast_f32_to_bf16_scaled(
     const nz: usize = n;
     var i: usize = 0;
     while (i < nz) : (i += 1) {
-        dst_ptr[i] = f32ToBf16(src_ptr[i] * scale);
+        dst_ptr[i] = f32ToFp16(src_ptr[i] * scale);
     }
 }
 
 // --------------------------------------------------------------
-// Kernel: in-place bf16 scale
+// Kernel: in-place fp16 scale
 // --------------------------------------------------------------
 //
-// `x[i] = bf16(bf16(x[i]) * scale)` for i in 0..n.
+// `x[i] = fp16(fp16(x[i]) * scale)` for i in 0..n.
 // Used by the attention composition to multiply Q and K by
 // `head_dim^-0.25` after RoPE. Upstream applies this as an explicit
 // Python multiply, one rounding per element — we match.
 
-export fn scale_bf16_inplace(
+export fn scale_fp16_inplace(
     x_ptr: [*]u16,
     scale: f32,
     n: u32,
@@ -1256,14 +880,14 @@ export fn scale_bf16_inplace(
     var i: usize = 0;
     while (i + 4 <= Nz) : (i += 4) {
         const xu: @Vector(4, u16) = x_ptr[i ..][0..4].*;
-        const scaled: @Vector(4, f32) = bf16x4ToF32x4(xu) * scale_vec;
-        x_ptr[i + 0] = f32ToBf16(scaled[0]);
-        x_ptr[i + 1] = f32ToBf16(scaled[1]);
-        x_ptr[i + 2] = f32ToBf16(scaled[2]);
-        x_ptr[i + 3] = f32ToBf16(scaled[3]);
+        const scaled: @Vector(4, f32) = fp16x4ToF32x4(xu) * scale_vec;
+        x_ptr[i + 0] = f32ToFp16(scaled[0]);
+        x_ptr[i + 1] = f32ToFp16(scaled[1]);
+        x_ptr[i + 2] = f32ToFp16(scaled[2]);
+        x_ptr[i + 3] = f32ToFp16(scaled[3]);
     }
     while (i < Nz) : (i += 1) {
-        x_ptr[i] = f32ToBf16(bf16ToF32(x_ptr[i]) * scale);
+        x_ptr[i] = f32ToFp16(fp16ToF32(x_ptr[i]) * scale);
     }
 }
 
@@ -1290,12 +914,12 @@ export fn scale_bf16_inplace(
 //     out[t_q, h_q, :] = sum_i scores_drop_sink[i] * V[ws+i, h_kv, :]
 //
 // Layouts (all [T, H * head_dim] row-major, NOT transposed to [H, T, ...]):
-//   q:     bf16 [T, H_q * head_dim]
-//   k:     bf16 [T, H_kv * head_dim]
-//   v:     bf16 [T, H_kv * head_dim]
+//   q:     fp16 [T, H_q * head_dim]
+//   k:     fp16 [T, H_kv * head_dim]
+//   v:     fp16 [T, H_kv * head_dim]
 //   sinks: f32  [H_q]                 (upstream keeps sinks in fp32)
 //   mask:  u8   [T] or NULL (= 0 ptr) (1 = valid key, 0 = padding — skip)
-//   out:   bf16 [T, H_q * head_dim]
+//   out:   fp16 [T, H_q * head_dim]
 //
 // Constraint: `H_q % H_kv == 0` (GQA). Window is one-sided — `window=128`
 // means total attended keys ≤ `2*window + 1 = 257`.
@@ -1322,20 +946,20 @@ inline fn dotBf16F32(a: [*]const u16, b: [*]const u16, n: usize) f32 {
         const y1: @Vector(4, u16) = b[i + 4 ..][0..LANES].*;
         const y2: @Vector(4, u16) = b[i + 8 ..][0..LANES].*;
         const y3: @Vector(4, u16) = b[i + 12 ..][0..LANES].*;
-        a0 += bf16x4ToF32x4(x0) * bf16x4ToF32x4(y0);
-        a1 += bf16x4ToF32x4(x1) * bf16x4ToF32x4(y1);
-        a2 += bf16x4ToF32x4(x2) * bf16x4ToF32x4(y2);
-        a3 += bf16x4ToF32x4(x3) * bf16x4ToF32x4(y3);
+        a0 += fp16x4ToF32x4(x0) * fp16x4ToF32x4(y0);
+        a1 += fp16x4ToF32x4(x1) * fp16x4ToF32x4(y1);
+        a2 += fp16x4ToF32x4(x2) * fp16x4ToF32x4(y2);
+        a3 += fp16x4ToF32x4(x3) * fp16x4ToF32x4(y3);
     }
     while (i + LANES <= n) : (i += LANES) {
         const xu: @Vector(4, u16) = a[i ..][0..LANES].*;
         const yu: @Vector(4, u16) = b[i ..][0..LANES].*;
-        a0 += bf16x4ToF32x4(xu) * bf16x4ToF32x4(yu);
+        a0 += fp16x4ToF32x4(xu) * fp16x4ToF32x4(yu);
     }
     const combined: @Vector(4, f32) = (a0 + a1) + (a2 + a3);
     var sum: f32 = combined[0] + combined[1] + combined[2] + combined[3];
     while (i < n) : (i += 1) {
-        sum += bf16ToF32(a[i]) * bf16ToF32(b[i]);
+        sum += fp16ToF32(a[i]) * fp16ToF32(b[i]);
     }
     return sum;
 }
@@ -1347,11 +971,11 @@ inline fn saxpyF32Bf16(p: f32, v_ptr: [*]const u16, acc: [*]f32, n: usize) void 
     while (i + LANES <= n) : (i += LANES) {
         const vv: @Vector(4, u16) = v_ptr[i ..][0..LANES].*;
         const acc_vec: @Vector(4, f32) = acc[i ..][0..LANES].*;
-        const new_acc = acc_vec + p_vec * bf16x4ToF32x4(vv);
+        const new_acc = acc_vec + p_vec * fp16x4ToF32x4(vv);
         acc[i ..][0..LANES].* = new_acc;
     }
     while (i < n) : (i += 1) {
-        acc[i] += p * bf16ToF32(v_ptr[i]);
+        acc[i] += p * fp16ToF32(v_ptr[i]);
     }
 }
 
@@ -1437,7 +1061,7 @@ export fn banded_attention(
 
             d = 0;
             while (d < Dz) : (d += 1) {
-                out_ptr[out_base + d] = f32ToBf16(acc[d]);
+                out_ptr[out_base + d] = f32ToFp16(acc[d]);
             }
         }
     }
@@ -1461,12 +1085,12 @@ export fn banded_attention(
 //     x[t, h, 2p]   = a*c - b*s
 //     x[t, h, 2p+1] = b*c + a*s
 //
-// qk:   bf16 [T, H, head_dim]          row-major, in-place
-// cos:  bf16 [T, head_dim/2]            yarn's mscale already baked in
-// sin:  bf16 [T, head_dim/2]
+// qk:   fp16 [T, H, head_dim]          row-major, in-place
+// cos:  fp16 [T, head_dim/2]            yarn's mscale already baked in
+// sin:  fp16 [T, head_dim/2]
 //
-// cos/sin are bf16 because that's what the upstream layer returns (it
-// downcasts its f32 compute to the caller's dtype, which is bf16 in
+// cos/sin are fp16 because that's what the upstream layer returns (it
+// downcasts its f32 compute to the caller's dtype, which is fp16 in
 // Phase D). Widened to f32 inside the kernel for the rotation math.
 
 export fn rope_apply(
@@ -1493,21 +1117,21 @@ export fn rope_apply(
 
             var p: usize = 0;
             while (p < HalfDz) : (p += 1) {
-                const c = bf16ToF32(cos_row[p]);
-                const s = bf16ToF32(sin_row[p]);
-                const a = bf16ToF32(qk_ptr[head_base + 2 * p]);
-                const b = bf16ToF32(qk_ptr[head_base + 2 * p + 1]);
-                // PyTorch eager bf16 arithmetic rounds between every op:
-                // upcast → mul → round to bf16 → upcast → combine → round.
+                const c = fp16ToF32(cos_row[p]);
+                const s = fp16ToF32(sin_row[p]);
+                const a = fp16ToF32(qk_ptr[head_base + 2 * p]);
+                const b = fp16ToF32(qk_ptr[head_base + 2 * p + 1]);
+                // PyTorch eager fp16 arithmetic rounds between every op:
+                // upcast → mul → round to fp16 → upcast → combine → round.
                 // Three roundings total per lane, which produces bit-identical
                 // output vs the reference but is slightly noisier than a
                 // single-rounding f32 chain.
-                const ac = bf16ToF32(f32ToBf16(a * c));
-                const bs = bf16ToF32(f32ToBf16(b * s));
-                const bc = bf16ToF32(f32ToBf16(b * c));
-                const as_ = bf16ToF32(f32ToBf16(a * s));
-                qk_ptr[head_base + 2 * p] = f32ToBf16(ac - bs);
-                qk_ptr[head_base + 2 * p + 1] = f32ToBf16(bc + as_);
+                const ac = fp16ToF32(f32ToFp16(a * c));
+                const bs = fp16ToF32(f32ToFp16(b * s));
+                const bc = fp16ToF32(f32ToFp16(b * c));
+                const as_ = fp16ToF32(f32ToFp16(a * s));
+                qk_ptr[head_base + 2 * p] = f32ToFp16(ac - bs);
+                qk_ptr[head_base + 2 * p + 1] = f32ToFp16(bc + as_);
             }
         }
     }
@@ -1527,10 +1151,10 @@ export fn rope_apply(
 //   embed_scales:  fp16,         [V, D/32]
 //   embed_zp:      uint4 packed, [V, ceil(D/32/2)] bytes
 //
-// Output is bf16 so the downstream kernels (rms_norm, q/k/v proj) read
+// Output is fp16 so the downstream kernels (rms_norm, q/k/v proj) read
 // their usual input dtype.
 //
-// OOB ids zero-fill, same safety policy as the bf16 variant.
+// OOB ids zero-fill, same safety policy as the fp16 variant.
 
 export fn embed_lookup_int4(
     embed_int4: [*]const u8,
@@ -1575,53 +1199,12 @@ export fn embed_lookup_int4(
             inline for (0..8) |chunk| {
                 const base = out_base + block_d + chunk * 4;
                 const qf = q_chunks[chunk];
-                out_ptr[base + 0] = f32ToBf16(qf[0] * scale);
-                out_ptr[base + 1] = f32ToBf16(qf[1] * scale);
-                out_ptr[base + 2] = f32ToBf16(qf[2] * scale);
-                out_ptr[base + 3] = f32ToBf16(qf[3] * scale);
+                out_ptr[base + 0] = f32ToFp16(qf[0] * scale);
+                out_ptr[base + 1] = f32ToFp16(qf[1] * scale);
+                out_ptr[base + 2] = f32ToFp16(qf[2] * scale);
+                out_ptr[base + 3] = f32ToFp16(qf[3] * scale);
             }
         }
     }
 }
 
-// --------------------------------------------------------------
-// Kernel: embedding lookup
-// --------------------------------------------------------------
-//
-// out[t, d] = embed[ids[t], d]
-//   embed: bf16 [V, D]   (V = vocab_size = 200 064, D = d_model = 640)
-//   ids:   i32  [T]
-//   out:   bf16 [T, D]
-//
-// A pure gather — no arithmetic. Sanity-checks the id against `V` and
-// writes zeros for out-of-range ids rather than reading past the end
-// of the embedding table. The model's pad_token_id (199 999) is in
-// range so this branch only fires on bad input.
-
-export fn embed_lookup(
-    embed_ptr: [*]const u16,
-    ids_ptr: [*]const i32,
-    out_ptr: [*]u16,
-    T: u32,
-    V: u32,
-    D: u32,
-) void {
-    const Tz: usize = T;
-    const Dz: usize = D;
-
-    var t: usize = 0;
-    while (t < Tz) : (t += 1) {
-        const out_base = t * Dz;
-        const id = ids_ptr[t];
-        if (id < 0 or @as(u32, @intCast(id)) >= V) {
-            var d: usize = 0;
-            while (d < Dz) : (d += 1) out_ptr[out_base + d] = 0;
-            continue;
-        }
-        const row_base: usize = @as(usize, @intCast(id)) * Dz;
-        var d: usize = 0;
-        while (d < Dz) : (d += 1) {
-            out_ptr[out_base + d] = embed_ptr[row_base + d];
-        }
-    }
-}

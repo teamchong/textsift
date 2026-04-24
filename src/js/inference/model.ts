@@ -12,21 +12,25 @@
  * forward pass.
  */
 
-import type { PiiWasmExports, WeightTensorInfo } from "../backends/wasm.js";
+import type { Int4BlockWeight, PiiWasmExports, WeightTensorInfo } from "../backends/wasm.js";
 import { blockForward, type BlockWeights, type BlockConfig } from "./block.js";
 import { buildRopeTables, type YarnRopeConfig } from "./rope.js";
 
 export interface ModelWeights {
-  /** `model.embed_tokens.weight`: bf16 [vocab, D]. */
-  embedTokens: WeightTensorInfo;
+  /** Embed table: int4-block32 packed W [vocab, D] + fp16 scales + uint4 zp. */
+  embedInt4: WeightTensorInfo;
+  embedScales: WeightTensorInfo;
+  embedZp: WeightTensorInfo;
   /** One `BlockWeights` per transformer layer. */
   blocks: BlockWeights[];
-  /** `model.norm.weight`: bf16 [D]. */
+  /** `model.norm.weight`: fp16 [D]. */
   finalLayernorm: WeightTensorInfo;
-  /** `score.weight`: bf16 [num_classes, D]. */
-  classifierW: WeightTensorInfo;
-  /** `score.bias`: bf16 [num_classes]. */
-  classifierB: WeightTensorInfo;
+  /**
+   * Classifier head: int4-block32 W [num_classes, D] + fp16 scales + uint4 zp.
+   * ONNX has no bias for `score`; loader synthesises a zero fp16 bias so the
+   * kernel signature stays uniform.
+   */
+  classifier: Int4BlockWeight;
 }
 
 export interface ModelConfig extends BlockConfig {
@@ -39,7 +43,7 @@ export interface ModelConfig extends BlockConfig {
 
 /**
  * Run one forward pass. `inputIdsPtr` points to an `i32 [T]` buffer of
- * token IDs. `logitsPtr` must be a `bf16 [T, num_classes]` buffer owned
+ * token IDs. `logitsPtr` must be a `fp16 [T, num_classes]` buffer owned
  * by the caller. All other scratch is bump-alloc'd.
  */
 export function modelForward(
@@ -67,7 +71,10 @@ export function modelForward(
   // Embedding → h0. Ping-pong between h0 and h1 across blocks.
   const h0Ptr = wasm.alloc(T * D * 2);
   const h1Ptr = wasm.alloc(T * D * 2);
-  wasm.embed_lookup(weights.embedTokens.dataOffset, inputIdsPtr, h0Ptr, T, config.vocabSize, D);
+  wasm.embed_lookup_int4(
+    weights.embedInt4.dataOffset, weights.embedScales.dataOffset, weights.embedZp.dataOffset,
+    inputIdsPtr, h0Ptr, T, config.vocabSize, D,
+  );
 
   let srcPtr = h0Ptr;
   let dstPtr = h1Ptr;
@@ -82,8 +89,12 @@ export function modelForward(
   wasm.rms_norm(srcPtr, weights.finalLayernorm.dataOffset, dstPtr, T, D, config.rmsNormEps);
 
   // Classifier head: [T, D] × [num_classes, D]^T + [num_classes] → [T, num_classes].
-  wasm.matmul_bf16(
-    dstPtr, weights.classifierW.dataOffset, weights.classifierB.dataOffset,
+  wasm.matmul_fp16_x_int4block(
+    dstPtr,
+    weights.classifier.int4.dataOffset,
+    weights.classifier.scales.dataOffset,
+    weights.classifier.zp.dataOffset,
+    weights.classifier.bias.dataOffset,
     logitsPtr, T, config.numClasses, D,
   );
 }

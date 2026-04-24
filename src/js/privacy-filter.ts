@@ -175,18 +175,12 @@ export class PrivacyFilter {
       const tokenizer = await Tokenizer.fromBundle(bundle);
 
       // Stage-1 Zig+WASM backend is requested explicitly via
-      // `backend: "wasm"` + `wasmWeightsUrl`. Anything else routes to
+      // `backend: "wasm"`. Anything else routes to
       // transformers.js. In browsers, transformers.js wants WebGPU
       // (q4f16 needs MatMulNBits / GatherBlockQuantized with no WASM
       // CPU kernel); in Node, onnxruntime-node picks CPU automatically
       // and doesn't accept a "wasm" device string.
       const wantsStage1 = this.opts.backend === "wasm";
-      if (wantsStage1 && !this.opts.wasmWeightsUrl) {
-        throw new PrivacyFilterError(
-          "backend: \"wasm\" requires wasmWeightsUrl pointing to a pii-weights.bin blob",
-          "BACKEND_UNAVAILABLE",
-        );
-      }
       const hasWebGPU = typeof navigator !== "undefined"
         && !!(navigator as { gpu?: unknown }).gpu;
       const device: "auto" | "wasm" | "webgpu" = hasWebGPU ? "webgpu" : "auto";
@@ -199,8 +193,6 @@ export class PrivacyFilter {
         device,
         bundle,
         backend: wantsStage1 ? "wasm" : "transformers-js",
-        wasmWeightsUrl: this.opts.wasmWeightsUrl,
-        wasmWeightsSha256: this.opts.wasmWeightsSha256,
         wasmModuleUrl: this.opts.wasmModuleUrl,
       });
 

@@ -5,10 +5,10 @@
  * `src/zig/wasm_exports.zig` and compiles to `dist/pii.wasm` via
  * `npm run build:zig`.
  *
- * Status: Phase A (scaffolding) — module loads, ABI round-trips, heap
- * init works. `forward()` throws until kernels land (Phases C/D).
- *
- * See `docs/roadmap.md` → Stage 1 for the build order.
+ * Loads weights directly from the upstream ONNX graph shipped on HF Hub
+ * (`onnx/model_q4f16.onnx` + `.onnx_data`). No custom weight format;
+ * shares the same ~772 MB download with the transformers.js backend so
+ * both backends hit the browser's HTTP cache identically.
  */
 
 import type {
@@ -18,6 +18,7 @@ import type {
 } from "./abstract.js";
 import { modelForward, type ModelConfig, type ModelWeights } from "../inference/model.js";
 import type { BlockWeights } from "../inference/block.js";
+import { parseOnnxGraph, resolveTensorBytes } from "../model/onnx-reader.js";
 import { PII_WASM_BYTES } from "./pii-wasm-inline.js";
 
 /** Exports declared in `src/zig/wasm_exports.zig`. Keep in sync. */
@@ -32,21 +33,11 @@ export interface PiiWasmExports {
   heap_used(): number;
   echo(x: number): number;
   sum_i32(ptr: number, len: number): number;
-  weights_load(ptr: number, size: number): number;
-  weights_count(): number;
-  weights_dtype(idx: number): number;
-  weights_ndim(idx: number): number;
-  weights_shape(idx: number, out: number): number;
-  weights_data_ptr(idx: number): number;
-  weights_data_size(idx: number): number;
-  weights_name(idx: number, out: number): number;
   rms_norm(x: number, gamma: number, out: number, T: number, D: number, eps: number): void;
-  matmul_bf16(x: number, w: number, bias: number, out: number, T: number, N: number, D: number): void;
-  matmul_bf16_out_f32(x: number, w: number, bias: number, out: number, T: number, N: number, D: number): void;
   // int4-block matmul variants: `w_zp` is `0` for symmetric decode (no zero-points),
   // or a pointer into WASM memory for asymmetric (ONNX MatMulNBits semantics).
-  matmul_bf16_x_int4block(x: number, w_int4: number, w_scales: number, w_zp: number, bias: number, out: number, T: number, N: number, D: number): void;
-  matmul_bf16_x_int4block_out_f32(x: number, w_int4: number, w_scales: number, w_zp: number, bias: number, out: number, T: number, N: number, D: number): void;
+  matmul_fp16_x_int4block(x: number, w_int4: number, w_scales: number, w_zp: number, bias: number, out: number, T: number, N: number, D: number): void;
+  matmul_fp16_x_int4block_out_f32(x: number, w_int4: number, w_scales: number, w_zp: number, bias: number, out: number, T: number, N: number, D: number): void;
   matmul_f32_x_int4block_out_f32(x: number, w_int4: number, w_scales: number, w_zp: number, bias: number, out: number, T: number, N: number, D: number): void;
   topk_partial_f32(x: number, out_idx: number, out_val: number, rows: number, cols: number, k: number): void;
   rope_apply(qk: number, cos: number, sin: number, T: number, H: number, head_dim: number): void;
@@ -54,39 +45,34 @@ export interface PiiWasmExports {
     q: number, k: number, v: number, sinks: number, mask: number, out: number,
     T: number, H_q: number, H_kv: number, head_dim: number, window: number,
   ): void;
-  scale_bf16_inplace(x: number, scale: number, n: number): void;
-  add_bf16(a: number, b: number, out: number, n: number): void;
-  gather_bf16(src: number, indices: number, dst: number, m: number, D: number): void;
+  scale_fp16_inplace(x: number, scale: number, n: number): void;
+  add_fp16(a: number, b: number, out: number, n: number): void;
+  gather_fp16(src: number, indices: number, dst: number, m: number, D: number): void;
   scatter_add_weighted_f32(
     target: number, values: number, indices: number, weights: number,
     m: number, D: number,
   ): void;
   zero_f32(ptr: number, n: number): void;
-  cast_f32_to_bf16_scaled(src: number, dst: number, n: number, scale: number): void;
+  cast_f32_to_fp16_scaled(src: number, dst: number, n: number, scale: number): void;
   softmax_f32(x: number, out: number, rows: number, cols: number): void;
   swiglu_clamp_f32(gate_up: number, out: number, T: number, D: number): void;
-  embed_lookup(embed: number, ids: number, out: number, T: number, V: number, D: number): void;
   embed_lookup_int4(
     embed_int4: number, embed_scales: number, embed_zp: number,
     ids: number, out: number, T: number, V: number, D: number,
   ): void;
 }
 
-/** Dtype codes emitted by `scripts/convert_weights.py`. */
+/**
+ * Dtype tag on each pinned tensor. The Zig kernels read raw bytes — this
+ * is pure JS-side bookkeeping so callers can sanity-check what they're
+ * holding.
+ */
 export enum WeightDType {
   F32 = 0,
   F16 = 1,
-  BF16 = 2,
-  I8 = 3,
-  U8 = 4,
-  I32 = 5,
-  /**
-   * Signed symmetric int4, blockwise along the last dim (block=32),
-   * per-block fp16 scale, no zero-point. Layout per tensor:
-   *   [N, D/2] packed u8 (low nibble = even d index, high = odd)
-   *   then [N, D/32] fp16 scales.
-   */
-  I4_BLOCK32_SYM = 6,
+  I8 = 2,
+  U8 = 3,
+  I32 = 4,
 }
 
 export interface WeightTensorInfo {
@@ -97,6 +83,19 @@ export interface WeightTensorInfo {
   readonly dataOffset: number;
   /** Size in bytes. */
   readonly dataSize: number;
+}
+
+/**
+ * int4-block32 weight bundle matching our matmul kernel's calling
+ * convention: a packed int4 tensor, fp16 per-block scales, uint4 per-block
+ * zero-points, and a fp16 bias. Used for every MatMulNBits-shaped weight
+ * in the model (attention projections, router, classifier).
+ */
+export interface Int4BlockWeight {
+  int4: WeightTensorInfo;
+  scales: WeightTensorInfo;
+  zp: WeightTensorInfo;
+  bias: WeightTensorInfo;
 }
 
 /**
@@ -131,32 +130,21 @@ export async function loadPiiWasm(url?: string | URL | null): Promise<PiiWasmExp
     "heap_used",
     "echo",
     "sum_i32",
-    "weights_load",
-    "weights_count",
-    "weights_dtype",
-    "weights_ndim",
-    "weights_shape",
-    "weights_data_ptr",
-    "weights_data_size",
-    "weights_name",
     "rms_norm",
-    "matmul_bf16",
-    "matmul_bf16_out_f32",
-    "matmul_bf16_x_int4block",
-    "matmul_bf16_x_int4block_out_f32",
+    "matmul_fp16_x_int4block",
+    "matmul_fp16_x_int4block_out_f32",
     "matmul_f32_x_int4block_out_f32",
     "topk_partial_f32",
     "rope_apply",
     "banded_attention",
-    "scale_bf16_inplace",
-    "add_bf16",
-    "gather_bf16",
+    "scale_fp16_inplace",
+    "add_fp16",
+    "gather_fp16",
     "scatter_add_weighted_f32",
     "zero_f32",
-    "cast_f32_to_bf16_scaled",
+    "cast_f32_to_fp16_scaled",
     "softmax_f32",
     "swiglu_clamp_f32",
-    "embed_lookup",
     "embed_lookup_int4",
   ];
   for (const name of required) {
@@ -168,83 +156,208 @@ export async function loadPiiWasm(url?: string | URL | null): Promise<PiiWasmExp
   return exports;
 }
 
-/**
- * Fetch a `pii-weights.bin` blob, optionally verify its sha256, copy
- * it into WASM linear memory, parse it, and pin it below the bump
- * mark so subsequent `reset()` calls preserve it. Returns the tensor
- * table for JS-side inspection; the data lives in WASM memory and is
- * referenced by `info.dataOffset`.
- *
- * `expectedSha256` is optional but strongly recommended for
- * production — a truncated or corrupted weight blob would otherwise
- * silently produce garbage logits.
- */
-export async function loadWeights(
-  wasm: PiiWasmExports,
-  url: string | URL,
-  expectedSha256?: string,
-): Promise<readonly WeightTensorInfo[]> {
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`loadWeights: fetch ${url} → ${response.status} ${response.statusText}`);
-  }
-  const buf = await response.arrayBuffer();
+// ---------- dtype conversion ----------
+//
+// Weights in `model_q4f16.onnx` are a mix of: fp16 (biases, norms, scales),
+// f32 (router scales, router bias, attention sinks), uint8 (packed int4
+// quant + zp). Kernels consume fp16 throughout the activation path
+// (matching ORT Web's q4f16 numerics) — fp16 weights pass through as-is;
+// only f32 router scales/bias need a down-convert at load time.
 
-  if (expectedSha256 !== undefined) {
-    const digest = await crypto.subtle.digest("SHA-256", buf);
-    const got = [...new Uint8Array(digest)]
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
-    if (got !== expectedSha256.toLowerCase()) {
-      throw new Error(`loadWeights: sha256 mismatch — got ${got}, expected ${expectedSha256}`);
+const _cvBuf = new ArrayBuffer(4);
+const _cvU32 = new Uint32Array(_cvBuf);
+const _cvF32 = new Float32Array(_cvBuf);
+
+function f32ToFp16Bits(f: number): number {
+  if (f === 0) return 0;
+  _cvF32[0] = f;
+  const u32 = _cvU32[0]!;
+  const sign = (u32 >>> 16) & 0x8000;
+  const exp32 = (u32 >>> 23) & 0xff;
+  const mant23 = u32 & 0x7fffff;
+  if (exp32 === 0xff) {
+    return (sign | 0x7c00 | (mant23 ? 0x200 : 0)) & 0xffff;
+  }
+  let exp16 = exp32 - 127 + 15;
+  if (exp16 >= 0x1f) return (sign | 0x7c00) & 0xffff;
+  if (exp16 <= 0) {
+    if (exp16 < -10) return sign;
+    const shift = 14 - exp16;
+    const mant24 = mant23 | 0x800000;
+    return (sign | ((mant24 + (1 << (shift - 1))) >>> shift)) & 0xffff;
+  }
+  // Normal, RNE
+  const lsb = (mant23 >>> 13) & 1;
+  let m10 = (mant23 + 0xfff + lsb) >>> 13;
+  if (m10 >= 0x400) {
+    m10 = 0;
+    exp16 += 1;
+    if (exp16 >= 0x1f) return (sign | 0x7c00) & 0xffff;
+  }
+  return (sign | (exp16 << 10) | m10) & 0xffff;
+}
+
+function f32BufferToFp16(src: Uint8Array): Uint8Array {
+  const n = src.byteLength / 4;
+  const dst = new Uint8Array(n * 2);
+  const sv = new DataView(src.buffer, src.byteOffset, src.byteLength);
+  const dv = new DataView(dst.buffer);
+  for (let i = 0; i < n; i++) {
+    _cvU32[0] = sv.getUint32(i * 4, true);
+    dv.setUint16(i * 2, f32ToFp16Bits(_cvF32[0]!), true);
+  }
+  return dst;
+}
+
+// ---------- ONNX → WASM memory ----------
+
+function pinBytes(
+  wasm: PiiWasmExports,
+  name: string,
+  dtype: WeightDType,
+  shape: readonly number[],
+  bytes: Uint8Array,
+): WeightTensorInfo {
+  const ptr = wasm.alloc(bytes.byteLength);
+  if (ptr === 0) {
+    throw new Error(`loadOnnxWeights: WASM OOM allocating ${bytes.byteLength} bytes for "${name}"`);
+  }
+  new Uint8Array(wasm.memory.buffer, ptr, bytes.byteLength).set(bytes);
+  return { name, dtype, shape: [...shape], dataOffset: ptr, dataSize: bytes.byteLength };
+}
+
+/**
+ * Fetch `onnx/model_q4f16.onnx` + `.onnx_data` from `modelSource`, parse
+ * the graph, preprocess each tensor into the dtype/layout our kernels
+ * expect, and pin them all below the reset mark in WASM memory. Returns
+ * a name → info map keyed by our canonical (dotted) names.
+ */
+export async function loadOnnxWeights(
+  wasm: PiiWasmExports,
+  modelSource: string,
+): Promise<Map<string, WeightTensorInfo>> {
+  const base = modelSource.endsWith("/") ? modelSource : `${modelSource}/`;
+  const graphUrl = `${base}onnx/model_q4f16.onnx`;
+  const dataUrl = `${base}onnx/model_q4f16.onnx_data`;
+
+  const fetchBuf = async (url: string): Promise<ArrayBuffer> => {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`loadOnnxWeights: fetch ${url} → ${r.status} ${r.statusText}`);
+    return r.arrayBuffer();
+  };
+  const [graphBuf, dataBuf] = await Promise.all([fetchBuf(graphUrl), fetchBuf(dataUrl)]);
+  const graph = parseOnnxGraph(new Uint8Array(graphBuf));
+  const extData = new Uint8Array(dataBuf);
+
+  const bytesOf = (name: string): Uint8Array => {
+    const t = graph.get(name);
+    if (!t) throw new Error(`loadOnnxWeights: missing ONNX tensor "${name}"`);
+    return resolveTensorBytes(t, extData);
+  };
+  const shapeOf = (name: string): readonly number[] => {
+    const t = graph.get(name);
+    if (!t) throw new Error(`loadOnnxWeights: missing ONNX tensor "${name}"`);
+    return t.shape;
+  };
+
+  const out = new Map<string, WeightTensorInfo>();
+  const put = (key: string, info: WeightTensorInfo): void => { out.set(key, info); };
+
+  // Embed table — int4 + fp16 scales + uint4 zp, no preprocessing.
+  put("embed.int4",   pinBytes(wasm, "embed.int4",   WeightDType.U8,  shapeOf("model_embed_tokens_weight_quant"),  bytesOf("model_embed_tokens_weight_quant")));
+  put("embed.scales", pinBytes(wasm, "embed.scales", WeightDType.F16, shapeOf("model_embed_tokens_weight_scales"), bytesOf("model_embed_tokens_weight_scales")));
+  put("embed.zp",     pinBytes(wasm, "embed.zp",     WeightDType.U8,  shapeOf("model_embed_tokens_weight_zp"),     bytesOf("model_embed_tokens_weight_zp")));
+
+  // Final norm — fp16 [D], pass-through.
+  {
+    const name = "model.layers.8.final_norm_layernorm.weight";
+    put("final_norm", pinBytes(wasm, "final_norm", WeightDType.F16, shapeOf(name), bytesOf(name)));
+  }
+
+  // Classifier — int4 + fp16 scales + uint4 zp. ONNX has no bias on
+  // `score`; synthesise a zero fp16 [num_classes] so the kernel's bias
+  // load doesn't dereference 0.
+  {
+    const quantShape = shapeOf("model_score_MatMul_weight_quant");
+    put("score.int4",   pinBytes(wasm, "score.int4",   WeightDType.U8,  quantShape,                                      bytesOf("model_score_MatMul_weight_quant")));
+    put("score.scales", pinBytes(wasm, "score.scales", WeightDType.F16, shapeOf("model_score_MatMul_weight_scales"),     bytesOf("model_score_MatMul_weight_scales")));
+    put("score.zp",     pinBytes(wasm, "score.zp",     WeightDType.U8,  shapeOf("model_score_MatMul_weight_zp"),         bytesOf("model_score_MatMul_weight_zp")));
+    const numClasses = quantShape[0]!;
+    put("score.bias",   pinBytes(wasm, "score.bias",   WeightDType.F16, [numClasses], new Uint8Array(numClasses * 2)));
+  }
+
+  // Count transformer layers (layer 8 carries only the final norm).
+  let numLayers = 0;
+  for (let L = 0; L < 64; L++) {
+    if (graph.has(`model.layers.${L}.input_layernorm.weight`)) numLayers = L + 1;
+  }
+  if (numLayers === 0) throw new Error("loadOnnxWeights: no transformer layers found");
+
+  for (let L = 0; L < numLayers; L++) {
+    // Layer norms (fp16 pass-through).
+    for (const n of ["input_layernorm", "post_attention_layernorm"] as const) {
+      const oname = `model.layers.${L}.${n}.weight`;
+      put(`layers.${L}.${n}`, pinBytes(wasm, `layers.${L}.${n}`, WeightDType.F16, shapeOf(oname), bytesOf(oname)));
+    }
+
+    // Attention: Q/K/V/O — int4 + fp16 scales + uint4 zp + fp16 bias pass-through.
+    for (const proj of ["q_proj", "k_proj", "v_proj", "o_proj"] as const) {
+      const qBase = `model_layers_${L}_attn_${proj}_MatMul`;
+      const k = `layers.${L}.attn.${proj}`;
+      put(`${k}.int4`,   pinBytes(wasm, `${k}.int4`,   WeightDType.U8,  shapeOf(`${qBase}_weight_quant`),  bytesOf(`${qBase}_weight_quant`)));
+      put(`${k}.scales`, pinBytes(wasm, `${k}.scales`, WeightDType.F16, shapeOf(`${qBase}_weight_scales`), bytesOf(`${qBase}_weight_scales`)));
+      put(`${k}.zp`,     pinBytes(wasm, `${k}.zp`,     WeightDType.U8,  shapeOf(`${qBase}_weight_zp`),     bytesOf(`${qBase}_weight_zp`)));
+      const biasName = `model.layers.${L}.attn.${proj}.Add.bias`;
+      put(`${k}.bias`,   pinBytes(wasm, `${k}.bias`,   WeightDType.F16, shapeOf(biasName), bytesOf(biasName)));
+    }
+
+    // Attention sinks — stays as f32. ONNX stores [1, H_q, 1, 1]; flatten to [H_q].
+    {
+      const sName = `model.layers.${L}.attn.sinks`;
+      const flatLen = shapeOf(sName).reduce((a, b) => a * b, 1);
+      put(`layers.${L}.attn.sinks`, pinBytes(wasm, `layers.${L}.attn.sinks`, WeightDType.F32, [flatLen], bytesOf(sName)));
+    }
+
+    // Router — int4 + (f32→fp16) scales + uint4 zp + (f32→fp16) bias.
+    {
+      const rBase = `/model/layers_${L}/moe/router/MatMul`;
+      const k = `layers.${L}.router`;
+      put(`${k}.int4`,   pinBytes(wasm, `${k}.int4`,   WeightDType.U8,  shapeOf(`${rBase}_weight_fp32_quant`),                bytesOf(`${rBase}_weight_fp32_quant`)));
+      put(`${k}.scales`, pinBytes(wasm, `${k}.scales`, WeightDType.F16, shapeOf(`${rBase}_weight_fp32_scales`),               f32BufferToFp16(bytesOf(`${rBase}_weight_fp32_scales`))));
+      put(`${k}.zp`,     pinBytes(wasm, `${k}.zp`,     WeightDType.U8,  shapeOf(`${rBase}_weight_fp32_zp`),                   bytesOf(`${rBase}_weight_fp32_zp`)));
+      const biasName = `/model/layers.${L}/moe/router/Add.bias_fp32`;
+      put(`${k}.bias`,   pinBytes(wasm, `${k}.bias`,   WeightDType.F16, shapeOf(biasName),                                    f32BufferToFp16(bytesOf(biasName))));
+    }
+
+    // Experts — ONNX stores uint4 values centered on 8 (modal byte is
+    // 0x88, i.e. nibbles (8,8) = zero in the dequant space). No zp
+    // tensor ships with the graph; we synthesise one full of 0x88 so
+    // the kernel computes `(q - 8) * scale` per block and recovers the
+    // signed-centered weights.
+    for (const [onnxProj, ourKey] of [
+      ["gate_up_proj", "gate_up"] as const,
+      ["down_proj",    "down"]    as const,
+    ]) {
+      const eBase = `model_layers_${L}_moe_experts_${onnxProj}`;
+      const k = `layers.${L}.experts.${ourKey}`;
+      const quantShape = shapeOf(`${eBase}_weight_quant`);           // [E, N, D/2]
+      const scalesShape = shapeOf(`${eBase}_weight_scales`);         // [E, N, nBlocks]
+      const nBlocks = scalesShape[2]!;
+      const zpPerRow = (nBlocks + 1) >>> 1;
+      const E = quantShape[0]!;
+      const Nrows = quantShape[1]!;
+      const zp = new Uint8Array(E * Nrows * zpPerRow);
+      zp.fill(0x88);
+      put(`${k}.int4`,   pinBytes(wasm, `${k}.int4`,   WeightDType.U8,  quantShape,                    bytesOf(`${eBase}_weight_quant`)));
+      put(`${k}.scales`, pinBytes(wasm, `${k}.scales`, WeightDType.F16, scalesShape,                   bytesOf(`${eBase}_weight_scales`)));
+      put(`${k}.zp`,     pinBytes(wasm, `${k}.zp`,     WeightDType.U8,  [E, Nrows, zpPerRow],          zp));
+      const biasName = `model.layers.${L}.moe.experts.${onnxProj}.bias`;
+      put(`${k}.bias`,   pinBytes(wasm, `${k}.bias`,   WeightDType.F16, shapeOf(biasName),             bytesOf(biasName)));
     }
   }
 
-  const size = buf.byteLength;
-  const ptr = wasm.alloc(size);
-  if (ptr === 0) {
-    throw new Error(`loadWeights: WASM OOM allocating ${size} bytes`);
-  }
-  new Uint8Array(wasm.memory.buffer, ptr, size).set(new Uint8Array(buf));
-
-  const rc = wasm.weights_load(ptr, size);
-  if (rc !== 0) {
-    throw new Error(`loadWeights: parser returned error ${rc}`);
-  }
-
-  // Pin the blob + any internal Zig-side bookkeeping below the reset
-  // line. Everything allocated after this call is scratch that goes
-  // away on `reset()`.
+  // Everything past this mark is scratch; `reset()` will only rewind to here.
   wasm.heap_mark_now();
-
-  const n = wasm.weights_count();
-  const shapeBuf = wasm.alloc(16);
-  const nameBuf = wasm.alloc(64);
-  const decoder = new TextDecoder();
-
-  const out: WeightTensorInfo[] = [];
-  for (let i = 0; i < n; i++) {
-    wasm.weights_shape(i, shapeBuf);
-    const shapeU32 = new Uint32Array(wasm.memory.buffer, shapeBuf, 4);
-    const ndim = wasm.weights_ndim(i);
-    const shape = Array.from(shapeU32.slice(0, ndim));
-
-    const nameLen = wasm.weights_name(i, nameBuf);
-    const nameBytes = new Uint8Array(wasm.memory.buffer, nameBuf, nameLen);
-    const name = decoder.decode(nameBytes);
-
-    out.push({
-      name,
-      dtype: wasm.weights_dtype(i) as WeightDType,
-      shape,
-      dataOffset: wasm.weights_data_ptr(i),
-      dataSize: wasm.weights_data_size(i),
-    });
-  }
-
-  // Drop the scratch we just used. The mark stays where it was — at
-  // the top of the weight blob — so the weights survive.
-  wasm.reset();
   return out;
 }
 
@@ -279,16 +392,11 @@ const PF_CONFIG: Omit<ModelConfig, "vocabSize" | "numExperts" | "numExpertsInBlo
 };
 
 export interface WasmBackendOptions extends BackendConstructionOptions {
-  /** URL or path to the `pii-weights.bin` blob produced by `scripts/convert_weights.py`. */
-  weightsUrl: string | URL;
-  /** Optional sha256 for integrity check. */
-  weightsSha256?: string;
   /**
    * Override the URL the backend fetches `pii.wasm` from. Defaults to
-   * a path relative to the bundled JS (`./pii.wasm`), which works when
-   * the bundle and the .wasm live in the same directory. Node tests
-   * that import directly from source use a different relative path;
-   * provide this option to pin the URL explicitly.
+   * the bytes inlined into the JS bundle, which is the right choice for
+   * every deployment so far. Only set this if you want to host an
+   * alternative .wasm build separately.
    */
   wasmModuleUrl?: string | URL;
 }
@@ -302,10 +410,10 @@ function weightByName(map: ReadonlyMap<string, WeightTensorInfo>, name: string):
 function detectNumLayers(map: ReadonlyMap<string, WeightTensorInfo>): number {
   let max = -1;
   for (const name of map.keys()) {
-    const m = /^model\.layers\.(\d+)\./.exec(name);
+    const m = /^layers\.(\d+)\.input_layernorm$/.exec(name);
     if (m) max = Math.max(max, Number.parseInt(m[1]!, 10));
   }
-  if (max < 0) throw new Error("WasmBackend: no model.layers.* tensors in blob");
+  if (max < 0) throw new Error("WasmBackend: no transformer layers found in weight map");
   return max + 1;
 }
 
@@ -313,39 +421,45 @@ function buildModelWeights(
   map: ReadonlyMap<string, WeightTensorInfo>,
   numLayers: number,
 ): ModelWeights {
+  const g = (n: string): WeightTensorInfo => weightByName(map, n);
+  const i4 = (prefix: string) => ({
+    int4:   g(`${prefix}.int4`),
+    scales: g(`${prefix}.scales`),
+    zp:     g(`${prefix}.zp`),
+    bias:   g(`${prefix}.bias`),
+  });
   const blocks: BlockWeights[] = [];
   for (let L = 0; L < numLayers; L++) {
-    const p = `model.layers.${L}.`;
     blocks.push({
-      inputLayernorm: weightByName(map, `${p}input_layernorm.weight`),
-      postAttentionLayernorm: weightByName(map, `${p}post_attention_layernorm.weight`),
+      inputLayernorm: g(`layers.${L}.input_layernorm`),
+      postAttentionLayernorm: g(`layers.${L}.post_attention_layernorm`),
       attn: {
-        qProj: weightByName(map, `${p}self_attn.q_proj.weight`),
-        qProjBias: weightByName(map, `${p}self_attn.q_proj.bias`),
-        kProj: weightByName(map, `${p}self_attn.k_proj.weight`),
-        kProjBias: weightByName(map, `${p}self_attn.k_proj.bias`),
-        vProj: weightByName(map, `${p}self_attn.v_proj.weight`),
-        vProjBias: weightByName(map, `${p}self_attn.v_proj.bias`),
-        oProj: weightByName(map, `${p}self_attn.o_proj.weight`),
-        oProjBias: weightByName(map, `${p}self_attn.o_proj.bias`),
-        sinks: weightByName(map, `${p}self_attn.sinks`),
+        qProj: i4(`layers.${L}.attn.q_proj`),
+        kProj: i4(`layers.${L}.attn.k_proj`),
+        vProj: i4(`layers.${L}.attn.v_proj`),
+        oProj: i4(`layers.${L}.attn.o_proj`),
+        sinks: g(`layers.${L}.attn.sinks`),
       },
-      routerW: weightByName(map, `${p}mlp.router.weight`),
-      routerB: weightByName(map, `${p}mlp.router.bias`),
+      router: i4(`layers.${L}.router`),
       experts: {
-        gateUp: weightByName(map, `${p}mlp.experts.gate_up_proj`),
-        gateUpBias: weightByName(map, `${p}mlp.experts.gate_up_proj_bias`),
-        down: weightByName(map, `${p}mlp.experts.down_proj`),
-        downBias: weightByName(map, `${p}mlp.experts.down_proj_bias`),
+        gateUpInt4:   g(`layers.${L}.experts.gate_up.int4`),
+        gateUpScales: g(`layers.${L}.experts.gate_up.scales`),
+        gateUpZp:     g(`layers.${L}.experts.gate_up.zp`),
+        gateUpBias:   g(`layers.${L}.experts.gate_up.bias`),
+        downInt4:     g(`layers.${L}.experts.down.int4`),
+        downScales:   g(`layers.${L}.experts.down.scales`),
+        downZp:       g(`layers.${L}.experts.down.zp`),
+        downBias:     g(`layers.${L}.experts.down.bias`),
       },
     });
   }
   return {
-    embedTokens: weightByName(map, "model.embed_tokens.weight"),
+    embedInt4:   g("embed.int4"),
+    embedScales: g("embed.scales"),
+    embedZp:     g("embed.zp"),
     blocks,
-    finalLayernorm: weightByName(map, "model.norm.weight"),
-    classifierW: weightByName(map, "score.weight"),
-    classifierB: weightByName(map, "score.bias"),
+    finalLayernorm: g("final_norm"),
+    classifier: i4("score"),
   };
 }
 
@@ -373,13 +487,11 @@ export class WasmBackend implements InferenceBackend {
       throw new Error(`WasmBackend: echo round-trip returned ${echoed}, expected 42`);
     }
 
-    const tensors = await loadWeights(this.wasm, this.opts.weightsUrl, this.opts.weightsSha256);
-    this.weightMap = new Map(tensors.map((t) => [t.name, t]));
+    this.weightMap = await loadOnnxWeights(this.wasm, this.opts.bundle.modelSource);
     const numLayers = detectNumLayers(this.weightMap);
     this.modelWeights = buildModelWeights(this.weightMap, numLayers);
-    // numExperts (the router's output size) comes from the router weight's
-    // first dim. Truncated test blobs have < 128 experts; full blobs 128.
-    this.numExpertsInBlob = this.modelWeights.blocks[0]!.routerW.shape[0]!;
+    // numExperts comes from the router's output dim (first shape axis).
+    this.numExpertsInBlob = this.modelWeights.blocks[0]!.router.int4.shape[0]!;
 
     // Prefill: run one dummy forward so V8 JITs every hot-path kernel
     // and the bump heap hits its steady-state size. Amortizes that
@@ -405,7 +517,7 @@ export class WasmBackend implements InferenceBackend {
         `WasmBackend.forward: attentionMask length ${attentionMask.length} does not match tokenIds length ${T}`,
       );
     }
-    const vocabSize = this.modelWeights.embedTokens.shape[0]!;
+    const vocabSize = this.modelWeights.embedInt4.shape[0]!;
 
     const idsBytes = T * 4;
     const logitsBytes = T * PF_CONFIG.numClasses * 2;
@@ -436,15 +548,26 @@ export class WasmBackend implements InferenceBackend {
       numExpertsInBlob: this.numExpertsInBlob,
     }, T, maskPtr);
 
-    // Upcast bf16 → f32 for the backend contract.
-    const bf16View = new Uint16Array(wasm.memory.buffer, logitsPtr, T * PF_CONFIG.numClasses);
-    const f32 = new Float32Array(bf16View.length);
-    const tmp = new ArrayBuffer(4);
-    const tmpU32 = new Uint32Array(tmp);
-    const tmpF32 = new Float32Array(tmp);
-    for (let i = 0; i < bf16View.length; i++) {
-      tmpU32[0] = bf16View[i]! << 16;
-      f32[i] = tmpF32[0]!;
+    // Upcast fp16 → f32 for the backend contract.
+    const fp16View = new Uint16Array(wasm.memory.buffer, logitsPtr, T * PF_CONFIG.numClasses);
+    const f32 = new Float32Array(fp16View.length);
+    for (let i = 0; i < fp16View.length; i++) {
+      const h = fp16View[i]!;
+      const sign = (h & 0x8000) << 16;
+      const exp = (h >> 10) & 0x1f;
+      const mant = h & 0x3ff;
+      if (exp === 0) {
+        if (mant === 0) { f32[i] = sign ? -0 : 0; continue; }
+        let m = mant, e = 1;
+        while ((m & 0x400) === 0) { m <<= 1; e--; }
+        m &= 0x3ff;
+        _cvU32[0] = (sign | ((e + 112) << 23) | (m << 13)) >>> 0;
+      } else if (exp === 0x1f) {
+        _cvU32[0] = (sign | 0x7f800000 | (mant << 13)) >>> 0;
+      } else {
+        _cvU32[0] = (sign | ((exp + 112) << 23) | (mant << 13)) >>> 0;
+      }
+      f32[i] = _cvF32[0]!;
     }
 
     wasm.reset();

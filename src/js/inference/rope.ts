@@ -74,24 +74,44 @@ export function getYarnAttentionScaling(factor: number): number {
   return 0.1 * Math.log(factor) + 1.0;
 }
 
-/** f32 → bf16 with round-to-nearest-ties-to-even. Matches PyTorch's cast. */
-function f32ToBf16(f: number): number {
-  const buf = new ArrayBuffer(4);
-  new DataView(buf).setFloat32(0, f, true);
-  const bits = new DataView(buf).getUint32(0, true);
-  if ((bits & 0x7f800000) === 0x7f800000 && (bits & 0x007fffff) !== 0) {
-    // NaN: preserve, set top mantissa bit.
-    return ((bits | 0x00400000) >>> 16) & 0xffff;
+/** f32 → fp16 with round-to-nearest-ties-to-even. Matches PyTorch's cast. */
+const _cvBuf = new ArrayBuffer(4);
+const _cvU32 = new Uint32Array(_cvBuf);
+const _cvF32 = new Float32Array(_cvBuf);
+
+function f32ToFp16(f: number): number {
+  if (f === 0) return 0;
+  _cvF32[0] = f;
+  const u32 = _cvU32[0]!;
+  const sign = (u32 >>> 16) & 0x8000;
+  const exp32 = (u32 >>> 23) & 0xff;
+  const mant23 = u32 & 0x7fffff;
+  if (exp32 === 0xff) {
+    return (sign | 0x7c00 | (mant23 ? 0x200 : 0)) & 0xffff;
   }
-  const rounded = (bits + 0x7fff + ((bits >>> 16) & 1)) >>> 0;
-  return (rounded >>> 16) & 0xffff;
+  let exp16 = exp32 - 127 + 15;
+  if (exp16 >= 0x1f) return (sign | 0x7c00) & 0xffff;
+  if (exp16 <= 0) {
+    if (exp16 < -10) return sign;
+    const shift = 14 - exp16;
+    const mant24 = mant23 | 0x800000;
+    return (sign | ((mant24 + (1 << (shift - 1))) >>> shift)) & 0xffff;
+  }
+  const lsb = (mant23 >>> 13) & 1;
+  let m10 = (mant23 + 0xfff + lsb) >>> 13;
+  if (m10 >= 0x400) {
+    m10 = 0;
+    exp16 += 1;
+    if (exp16 >= 0x1f) return (sign | 0x7c00) & 0xffff;
+  }
+  return (sign | (exp16 << 10) | m10) & 0xffff;
 }
 
 /**
- * Build cos/sin tables for positions `[0, seqLen)` as bf16. PyTorch's
+ * Build cos/sin tables for positions `[0, seqLen)` as fp16. PyTorch's
  * `OpenAIPrivacyFilterRotaryEmbedding.forward` computes in f32 and
- * downcasts to the caller's dtype (bf16 in Phase D); the apply path
- * reads cos/sin as bf16. Storing bf16 here guarantees byte-identical
+ * downcasts to the caller's dtype (fp16 in Phase D); the apply path
+ * reads cos/sin as fp16. Storing fp16 here guarantees byte-identical
  * tables vs the PyTorch reference.
  */
 export function computeRopeTables(
@@ -105,8 +125,8 @@ export function computeRopeTables(
   for (let t = 0; t < seqLen; t++) {
     for (let i = 0; i < halfDim; i++) {
       const angle = t * invFreq[i]!;
-      cos[t * halfDim + i] = f32ToBf16(Math.cos(angle) * attentionScaling);
-      sin[t * halfDim + i] = f32ToBf16(Math.sin(angle) * attentionScaling);
+      cos[t * halfDim + i] = f32ToFp16(Math.cos(angle) * attentionScaling);
+      sin[t * halfDim + i] = f32ToFp16(Math.sin(angle) * attentionScaling);
     }
   }
   return { cos, sin };

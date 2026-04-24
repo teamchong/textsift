@@ -36,24 +36,50 @@ pub inline fn bf16x4ToF32x4(u: @Vector(4, u16)) @Vector(4, f32) {
     return @bitCast(shifted);
 }
 
+// fp16 = IEEE 754 binary16 (1 sign + 5 exp + 10 mantissa, bias 15).
+// Conversions go through Zig's native `f16` type, which the backend
+// lowers to inline integer bit-math on wasm — no libcall.
+
+pub inline fn fp16ToF32(bits: u16) f32 {
+    const h: f16 = @bitCast(bits);
+    return @floatCast(h);
+}
+
+pub inline fn f32ToFp16(f: f32) u16 {
+    const h: f16 = @floatCast(f);
+    return @bitCast(h);
+}
+
+pub inline fn fp16x4ToF32x4(u: @Vector(4, u16)) @Vector(4, f32) {
+    // Zig/LLVM doesn't vectorise `@floatCast(@Vector(4, f16))` on wasm
+    // (emits an invalid cast). Inline an integer-ops widening: build the
+    // f32 bit pattern from the fp16 bits and reinterpret. Handles the
+    // finite-normal + zero cases model weights actually see. Subnormals
+    // and inf/NaN fall through to a non-IEEE result, which is fine for
+    // trained-model tensors.
+    const u32v: @Vector(4, u32) = u;
+    const sign_shifted: @Vector(4, u32) =
+        (u32v & @as(@Vector(4, u32), @splat(0x8000))) << @splat(16);
+    const exp_nib: @Vector(4, u32) =
+        (u32v >> @splat(10)) & @as(@Vector(4, u32), @splat(0x1f));
+    const mant_nib: @Vector(4, u32) =
+        u32v & @as(@Vector(4, u32), @splat(0x3ff));
+    // exp==0 → zero (for non-subnormals). exp+112 is the rebase from
+    // fp16 bias 15 to f32 bias 127. Subnormals would need normalization
+    // — we accept the drift (trained weights ≫ 2^-14).
+    const exp_mask: @Vector(4, u32) =
+        @select(u32, exp_nib == @as(@Vector(4, u32), @splat(0)),
+            @as(@Vector(4, u32), @splat(0)),
+            @as(@Vector(4, u32), @splat(0xFFFF_FFFF)));
+    const f32_exp: @Vector(4, u32) =
+        ((exp_nib + @as(@Vector(4, u32), @splat(112))) << @splat(23)) & exp_mask;
+    const f32_mant: @Vector(4, u32) = (mant_nib << @splat(13)) & exp_mask;
+    const bits: @Vector(4, u32) = sign_shifted | f32_exp | f32_mant;
+    return @bitCast(bits);
+}
+
 pub inline fn alignUp(x: usize, a: usize) usize {
     return (x + (a - 1)) & ~@as(usize, a - 1);
-}
-
-pub inline fn readU32LE(ptr: [*]const u8, off: usize) u32 {
-    return @as(u32, ptr[off])
-        | (@as(u32, ptr[off + 1]) << 8)
-        | (@as(u32, ptr[off + 2]) << 16)
-        | (@as(u32, ptr[off + 3]) << 24);
-}
-
-pub inline fn readU64LE(ptr: [*]const u8, off: usize) u64 {
-    var v: u64 = 0;
-    var i: usize = 0;
-    while (i < 8) : (i += 1) {
-        v |= @as(u64, ptr[off + i]) << @intCast(i * 8);
-    }
-    return v;
 }
 
 // --------------------------------------------------------------
@@ -117,6 +143,22 @@ test "bf16x4ToF32x4 matches scalar bf16ToF32 lane-by-lane" {
     }
 }
 
+test "fp16 roundtrip — exactly-representable finite values" {
+    const clean: [6]f32 = .{ 0.0, 1.0, -1.0, 2.5, -3.25, 1024.0 };
+    for (clean) |f| {
+        try std.testing.expectEqual(f, fp16ToF32(f32ToFp16(f)));
+    }
+}
+
+test "fp16x4ToF32x4 matches scalar lane-by-lane" {
+    const samples: [4]u16 = .{ 0x0000, 0x3C00, 0xBC00, 0x5000 }; // 0, 1.0, -1.0, 32.0
+    const v: @Vector(4, u16) = samples;
+    const out = fp16x4ToF32x4(v);
+    inline for (0..4) |i| {
+        try std.testing.expectEqual(fp16ToF32(samples[i]), out[i]);
+    }
+}
+
 test "alignUp rounds to multiple" {
     try std.testing.expectEqual(@as(usize, 0), alignUp(0, 16));
     try std.testing.expectEqual(@as(usize, 16), alignUp(1, 16));
@@ -125,12 +167,3 @@ test "alignUp rounds to multiple" {
     try std.testing.expectEqual(@as(usize, 64), alignUp(48, 64));
 }
 
-test "readU32LE assembles little-endian bytes" {
-    const buf = [_]u8{ 0x78, 0x56, 0x34, 0x12, 0xFF };
-    try std.testing.expectEqual(@as(u32, 0x1234_5678), readU32LE(&buf, 0));
-}
-
-test "readU64LE assembles little-endian bytes" {
-    const buf = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
-    try std.testing.expectEqual(@as(u64, 0x0807_0605_0403_0201), readU64LE(&buf, 0));
-}

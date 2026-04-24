@@ -3,13 +3,9 @@
  * vs our Zig+WASM Stage-1 backend. Collects warm-forward medians across
  * several input lengths and prints a comparison table.
  *
- * Requires the full blob at tests/fixtures/pii-weights-full.bin
- * (symlink to /tmp/pii-wasm-e2e/pii-weights-full.bin from
- * gen-full-parity-fixture.py). The transformers.js path fetches the
- * ONNX export from HuggingFace Hub on first run (~770 MB), cached by
- * the browser afterwards.
- *
- * Not a CI test — marked with `@bench` so it's skipped by default.
+ * Both backends fetch the same `onnx/model_q4f16.onnx` + `.onnx_data`
+ * (~772 MB) from HuggingFace Hub on first run; cached by the browser
+ * afterwards so the second backend's warmup is served from cache.
  */
 
 import { test, expect } from "@playwright/test";

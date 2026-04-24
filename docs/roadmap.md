@@ -88,26 +88,15 @@ Target: 1.5–2× faster than Stage 0 Chrome warm-inference
 - [x] End-to-end round-trip verified: echo ABI, JS→WASM memory
       staging, bump heap grow + rewind.
 
-### Phase B — weight conversion + loading (done, plumbing only)
+### Phase B — weight conversion + loading (superseded)
 
-- [x] Python converter `scripts/convert_weights.py`. Phase-B1 scope:
-      a 4-tensor subset (classifier head + 2 RMSNorm weights, ~87 KB
-      in bf16). `--full` flag emits all 140 tensors (~2.8 GB).
-      Int4 blockwise quantization deferred to Phase C (where the int4
-      matmul kernel defines the block layout).
-- [x] Zig parser in `src/zig/wasm_exports.zig` — validates magic +
-      version, walks the 104-byte entry table, exposes per-tensor
-      metadata via `weights_{count,dtype,ndim,shape,name,data_ptr,
-      data_size}`.
-- [x] JS loader `loadWeights()` in `src/js/backends/wasm.ts` —
-      fetches blob, verifies sha256, copies into WASM linear memory,
-      calls `weights_load`, then pins via `heap_mark_now()` so the
-      blob survives per-call `reset()`.
-- [x] Cross-verified bit-exact against PyTorch: bf16 bytes in the
-      blob and in WASM memory match `state_dict[name].view(uint16)`
-      for all 4 test tensors.
-- [ ] Full-model blob generation + int4 quantization — unblocked
-      only once Phase C/D define the quant block layout.
+Originally scoped around a custom `pii-weights.bin` format (Python
+converter + Zig parser + JS loader). That format was retired 2026-04-23
+in favour of reading upstream's `onnx/model_q4f16.onnx` + `.onnx_data`
+directly (see "ONNX pivot" below). Converter scripts, Zig parser
+exports, and the full-blob generation step were removed. The committed
+truncated `tests/fixtures/pii-weights.bin` remains as frozen per-kernel
+fixture data only; `scripts/verify-kernels.mjs` parses it in JS.
 
 ### Phase C — tiny kernels
 
@@ -200,19 +189,78 @@ baselines and blocks on regression. Zig unit tests for pure helpers
       wasmWeightsUrl })` reaches it. 1-layer-truncated e2e parity
       vs PyTorch: rms 0.014 on final logits.
 
-### Phase E — assembly + parity
+### Phase E — assembly + parity (done)
 
-- [ ] Full 8-block forward pass.
-- [ ] Cross-backend conformance: WASM output matches transformers.js
-      within 1e-5 relative error on the 5 upstream sample inputs.
-- [ ] Prefill: one dummy forward pass inside `warmup()` to amortize
-      kernel JIT + buffer allocation cost out of the user's first
-      click. (Was never added to the transformers.js backend; going
-      to bake it into this one from the start.)
-- [ ] Wire `CreateOptions.backend: "wasm"` in `selectBackend` so the
-      new path is reachable from the public API.
-- [ ] Benchmark vs Stage 0 on the same Chrome / Firefox / WebKit
-      configurations; update `docs/benchmarks.md`.
+- [x] Full 8-block forward pass — `modelForward` runs embed +
+      8 blocks + final norm + classifier through the int4 kernels.
+- [x] Prefill: `WasmBackend.warmup()` runs one dummy T=16 forward so
+      V8 JITs every hot kernel and the bump heap hits steady state.
+- [x] Public API wiring — `CreateOptions.backend: "wasm"` routes
+      through `selectBackend` to `WasmBackend` with the shared
+      `LoadedModelBundle.modelSource`. No per-backend options.
+- [x] Cross-backend conformance scaffold — `tests/browser/smoke.spec.ts`
+      spins up both `PrivacyFilter` instances in a real Chromium and
+      asserts span-for-span equality on a representative input.
+      (Actual run with the 772 MB model is a manual `npm run test`;
+      not wired into default CI yet.)
+- [x] Benchmark vs Stage 0 — `tests/browser/bench.{html,spec.ts}`
+      measures warm forward medians at multiple T; numbers in
+      `docs/benchmarks.md`.
+
+### Phase F — browser harness (done)
+
+- [x] Playwright config + browser tests (`smoke.spec.ts`,
+      `bench.spec.ts`, `public-api.html` + spec) running under
+      Chromium with `--enable-unsafe-webgpu --use-angle=metal` so
+      the transformers.js WebGPU path is real, not swiftshader.
+- [x] Inline `dist/pii.wasm` as a Uint8Array via
+      `scripts/inline-wasm.mjs` — the JS bundle ships the .wasm bytes
+      so there's no separate HTTP round-trip and no URL-resolution
+      quirk when the library is re-bundled.
+- [x] TR=4 outer tiling in bf16 matmul (~23 GFLOPS on T≥16 shapes,
+      up from 17 GFLOPS pre-tiling). Same change lifted the int4
+      matmul from 13 → ~20 GFLOPS.
+
+### Phase G — ONNX pivot (done 2026-04-23)
+
+Replace the custom `pii-weights.bin` path with direct reading of
+`openai/privacy-filter`'s upstream `onnx/model_q4f16.onnx` +
+`.onnx_data`. Both backends now share exactly one HTTP download
+(~772 MB) and one cache entry.
+
+- [x] Minimal ONNX protobuf decoder in TS
+      (`src/js/model/onnx-reader.ts`, no external deps). Parses the
+      initializer list; handles inline `raw_data` / `float_data` and
+      external `(location, offset, length)` pointers into the
+      `.onnx_data` sidecar.
+- [x] Int4 matmul kernels extended to asymmetric uint4 with per-block
+      uint4 zero-point buffer — matches ONNX MatMulNBits exactly.
+      `w_zp_ptr = 0` preserves the old symmetric-decode path.
+- [x] New `embed_lookup_int4` Zig kernel for ONNX
+      GatherBlockQuantized semantics (uint4 packed embed table +
+      fp16 scales + uint4 zp, block size 32 along D).
+- [x] `loadOnnxWeights()` in `src/js/backends/wasm.ts` fetches both
+      ONNX files, parses the graph, and pins each tensor into WASM
+      memory in the dtype/layout the kernels want. Preprocessing at
+      load time: f16→bf16 for biases/norms, f32→fp16 for router
+      scales, f32→bf16 for router bias, and XOR-0x88 +
+      synthesised-0x88 zp buffer for QMoE signed-int4 experts
+      (reinterpret as unsigned+zp=8, bit-identical dequant).
+- [x] Attention Q/K/V/O, MoE router, and classifier head all moved
+      off bf16 matmul onto int4 matmul. Embed table moved onto
+      `embed_lookup_int4`. No int4-dequant-at-load inflation — the
+      772 MB ONNX stays 772 MB in WASM memory.
+- [x] `CreateOptions.wasmWeightsUrl` / `wasmWeightsSha256` dropped
+      from the public API; backend derives the URL from
+      `bundle.modelSource`.
+- [x] Cleanup — `scripts/convert_weights.py`,
+      `scripts/gen-kernel-fixtures.py`,
+      `scripts/gen-full-parity-fixture.py`, and the
+      blob-dependent verify/bench scripts removed. Zig blob-parser
+      exports (`weights_load` et al.) + `readU32LE`/`readU64LE`
+      helpers removed. Composition fixture specs pruned from
+      `tests/fixtures/manifest.json` (per-kernel fixtures stay).
+      `WeightDType.I4_BLOCK32_SYM` removed. dist/pii.wasm: 25 KB.
 
 **OPFS note.** With Stage 3 NO-GO (2026-04-23), the weight size
 Stage 1 carries equals what Stage 0 already ships: ~772 MB

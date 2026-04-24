@@ -10,13 +10,10 @@
       // Run both backends in a real browser; measure warm-forward
       // medians at several T. Playwright reads window.__result.
       //
-      // Assumes the full blob is at /tests/fixtures/pii-weights-full.bin
-      // (symlink to /tmp/pii-wasm-e2e/pii-weights-full.bin). Without it
-      // the WasmBackend will fail to load.
-      import {
-        PrivacyFilter,
-        WasmBackend,
-      } from "/dist/index.js";
+      // Both backends fetch the same `onnx/model_q4f16.onnx` from
+      // `modelSource`. First run hits HF Hub; second run is served
+      // from the browser's HTTP cache.
+      import { PrivacyFilter } from "/dist/index.js";
 
       const $out = document.getElementById("out");
       const log = (m) => { $out.textContent += "\n" + m; };
@@ -71,8 +68,6 @@
         const t1 = performance.now();
         const wasm = await PrivacyFilter.create({
           backend: "wasm",
-          wasmWeightsUrl: "/tests/fixtures/pii-weights-full.bin",
-          wasmModuleUrl: "/dist/pii.wasm",
         });
         const wasmWarmup = performance.now() - t1;
         log(`wasm ready in ${wasmWarmup.toFixed(0)}ms`);

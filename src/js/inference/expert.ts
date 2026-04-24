@@ -6,20 +6,20 @@
  * model is numerically sensitive to accumulation dtype here):
  *
  *   for each expert e with ≥1 token routed to it:
- *     x_e           = gather(hidden, token_idx_e)                 bf16
- *     gate_up       = matmul(x_e, gate_up_proj[e]) + bias_gu[e]   f32 ← bf16 x × int4 W
+ *     x_e           = gather(hidden, token_idx_e)                 fp16
+ *     gate_up       = matmul(x_e, gate_up_proj[e]) + bias_gu[e]   f32 ← fp16 x × int4 W
  *     glu, up       = apply_gate(gate_up)                         f32 × f32
  *     out           = matmul(glu, down_proj[e])   + bias_d[e]     f32 ← f32 x × int4 W
  *     acc[token_idx_e] += routing_scores_e * out                  f32 scatter
  *
- *   final = bf16(acc * num_experts_per_tok)
+ *   final = fp16(acc * num_experts_per_tok)
  *
  * Expert weights are stored in the blob as:
  *   gate_up_proj: int4-block32-sym, shape [E, 2*d_ff, d_model] (transposed
  *     from upstream's [E, d_model, 2*d_ff] so our x @ W.T matmul fits).
  *   down_proj:   int4-block32-sym, shape [E, d_model, d_ff] (transposed
  *     from upstream's [E, d_ff, d_model]).
- *   biases:       bf16 [E, N].
+ *   biases:       fp16 [E, N].
  *
  * The packed tensor blob lays out `[E*N, D/2]` int4 bytes first, then
  * `[E*N, D/32]` fp16 scales. Per-expert pointers are computed via
@@ -29,13 +29,21 @@
 import type { PiiWasmExports, WeightTensorInfo } from "../backends/wasm.js";
 
 export interface ExpertWeights {
-  /** int4-block32-sym, shape [E, 2*d_ff, d_model] (transposed). */
-  gateUp: WeightTensorInfo;
-  /** bf16, shape [E, 2*d_ff]. */
+  /** uint4 packed, shape [E, 2*d_ff, d_model/2]. */
+  gateUpInt4: WeightTensorInfo;
+  /** fp16 scales, shape [E, 2*d_ff, d_model/32]. */
+  gateUpScales: WeightTensorInfo;
+  /** uint4 zero-points packed 2/byte, shape [E, 2*d_ff, ceil(d_model/32/2)]. */
+  gateUpZp: WeightTensorInfo;
+  /** fp16 (or fp16) bias, shape [E, 2*d_ff]. */
   gateUpBias: WeightTensorInfo;
-  /** int4-block32-sym, shape [E, d_model, d_ff] (transposed). */
-  down: WeightTensorInfo;
-  /** bf16, shape [E, d_model]. */
+  /** uint4 packed, shape [E, d_model, d_ff/2]. */
+  downInt4: WeightTensorInfo;
+  /** fp16 scales, shape [E, d_model, d_ff/32]. */
+  downScales: WeightTensorInfo;
+  /** uint4 zero-points, shape [E, d_model, ceil(d_ff/32/2)]. */
+  downZp: WeightTensorInfo;
+  /** fp16 (or fp16) bias, shape [E, d_model]. */
   downBias: WeightTensorInfo;
 }
 
@@ -47,30 +55,27 @@ export interface ExpertConfig {
 }
 
 function expertSlicePointers(
-  tensor: WeightTensorInfo, expertIdx: number,
+  int4Tensor: WeightTensorInfo,
+  scalesTensor: WeightTensorInfo,
+  zpTensor: WeightTensorInfo,
+  expertIdx: number,
+  N: number,
+  D: number,
 ): { int4Ptr: number; scalesPtr: number; zpPtr: number } {
-  if (tensor.shape.length !== 3) {
-    throw new Error(`expert slice expects 3D tensor, got shape ${tensor.shape}`);
-  }
-  const E = tensor.shape[0]!;
-  const N = tensor.shape[1]!;
-  const D = tensor.shape[2]!;
   if (D % 32 !== 0) throw new Error(`D=${D} not divisible by 32`);
   const nBlocks = D >>> 5;
-  const int4Stride = (N * D) >>> 1;            // bytes per expert for int4 data
-  const scalesStride = N * nBlocks * 2;         // bytes per expert for fp16 scales
-  const zpStride = N * ((nBlocks + 1) >>> 1);   // bytes per expert for packed uint4 zp
-  const totalInt4 = E * int4Stride;
-  const totalScales = E * scalesStride;
+  const int4Stride = (N * D) >>> 1;
+  const scalesStride = N * nBlocks * 2;
+  const zpStride = N * ((nBlocks + 1) >>> 1);
   return {
-    int4Ptr: tensor.dataOffset + expertIdx * int4Stride,
-    scalesPtr: tensor.dataOffset + totalInt4 + expertIdx * scalesStride,
-    zpPtr: tensor.dataOffset + totalInt4 + totalScales + expertIdx * zpStride,
+    int4Ptr: int4Tensor.dataOffset + expertIdx * int4Stride,
+    scalesPtr: scalesTensor.dataOffset + expertIdx * scalesStride,
+    zpPtr: zpTensor.dataOffset + expertIdx * zpStride,
   };
 }
 
 function expertBiasPointer(tensor: WeightTensorInfo, expertIdx: number): number {
-  // Bias is a 2-D bf16 tensor, [E, N]. Per-expert stride: N * 2 bytes.
+  // Bias is a 2-D fp16 tensor, [E, N]. Per-expert stride: N * 2 bytes.
   if (tensor.shape.length !== 2) {
     throw new Error(`expert bias expects 2D tensor, got shape ${tensor.shape}`);
   }
@@ -120,7 +125,7 @@ export function expertDispatch(
   // Scratch sizing: max tokens any single expert could see is `T * K` (all
   // tokens × all k-positions). Allocate that upper bound once and reuse.
   const maxM = T * K;
-  const xGatheredPtr = wasm.alloc(maxM * D * 2);           // bf16 [m, D]
+  const xGatheredPtr = wasm.alloc(maxM * D * 2);           // fp16 [m, D]
   const gateUpPtr = wasm.alloc(maxM * 2 * dff * 4);        // f32 [m, 2*dff]
   const gluPtr = wasm.alloc(maxM * dff * 4);               // f32 [m, dff]
   const outF32Ptr = wasm.alloc(maxM * D * 4);              // f32 [m, D]
@@ -144,12 +149,14 @@ export function expertDispatch(
     }
 
     // Gather hidden rows for this expert's tokens.
-    wasm.gather_bf16(hiddenPtr, tokIdxPtr, xGatheredPtr, m, D);
+    wasm.gather_fp16(hiddenPtr, tokIdxPtr, xGatheredPtr, m, D);
 
-    // gate_up = x @ W_gu^T + bias_gu   (bf16 x × int4 W → f32)
-    const guSlice = expertSlicePointers(weights.gateUp, e);
+    // gate_up = x @ W_gu^T + bias_gu   (fp16 x × int4 W → f32)
+    const guSlice = expertSlicePointers(
+      weights.gateUpInt4, weights.gateUpScales, weights.gateUpZp, e, 2 * dff, D,
+    );
     const guBiasPtr = expertBiasPointer(weights.gateUpBias, e);
-    wasm.matmul_bf16_x_int4block_out_f32(
+    wasm.matmul_fp16_x_int4block_out_f32(
       xGatheredPtr, guSlice.int4Ptr, guSlice.scalesPtr, guSlice.zpPtr, guBiasPtr,
       gateUpPtr, m, 2 * dff, D,
     );
@@ -158,7 +165,9 @@ export function expertDispatch(
     wasm.swiglu_clamp_f32(gateUpPtr, gluPtr, m, dff);
 
     // out = glu @ W_d^T + bias_d   (f32 x × int4 W → f32)
-    const dSlice = expertSlicePointers(weights.down, e);
+    const dSlice = expertSlicePointers(
+      weights.downInt4, weights.downScales, weights.downZp, e, D, dff,
+    );
     const dBiasPtr = expertBiasPointer(weights.downBias, e);
     wasm.matmul_f32_x_int4block_out_f32(
       gluPtr, dSlice.int4Ptr, dSlice.scalesPtr, dSlice.zpPtr, dBiasPtr,
@@ -169,6 +178,6 @@ export function expertDispatch(
     wasm.scatter_add_weighted_f32(accPtr, outF32Ptr, tokIdxPtr, weightsPtr, m, D);
   }
 
-  // final output = bf16(acc * num_experts_per_tok)
-  wasm.cast_f32_to_bf16_scaled(accPtr, outputPtr, T * D, K);
+  // final output = fp16(acc * num_experts_per_tok)
+  wasm.cast_f32_to_fp16_scaled(accPtr, outputPtr, T * D, K);
 }

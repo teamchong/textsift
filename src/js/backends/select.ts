@@ -17,26 +17,17 @@ export interface SelectOptions {
   bundle: LoadedModelBundle;
   /** Explicit backend selection. Defaults to the transformers.js path. */
   backend?: "auto" | "transformers-js" | "wasm";
-  /** Required when `backend: "wasm"`. URL/path to the `pii-weights.bin` blob. */
-  wasmWeightsUrl?: string | URL;
-  /** Optional sha256 of the weight blob for integrity check. */
-  wasmWeightsSha256?: string;
-  /** Override for the `pii.wasm` module URL; defaults to a path sibling to the bundled JS. */
+  /** Override for the `pii.wasm` module URL. Defaults to the bytes inlined into the JS bundle. */
   wasmModuleUrl?: string | URL;
 }
 
 export async function selectBackend(opts: SelectOptions): Promise<InferenceBackend> {
   if (opts.backend === "wasm") {
-    if (!opts.wasmWeightsUrl) {
-      throw new Error(
-        "selectBackend: backend=\"wasm\" requires `wasmWeightsUrl` pointing to a pii-weights.bin blob.",
-      );
-    }
     const { WasmBackend } = await import("./wasm.js");
     return new WasmBackend({
-      ...opts,
-      weightsUrl: opts.wasmWeightsUrl,
-      weightsSha256: opts.wasmWeightsSha256,
+      bundle: opts.bundle,
+      quantization: opts.quantization,
+      device: opts.device,
       wasmModuleUrl: opts.wasmModuleUrl,
     });
   }

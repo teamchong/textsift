@@ -33,7 +33,7 @@ export interface Logits {
 
 export interface InferenceBackend {
   /** A debug name used in progress events + error messages. */
-  readonly name: "wasm" | "transformers-js";
+  readonly name: "wasm" | "transformers-js" | "webgpu";
 
   /** Run the model once, compiling pipelines if not already done. */
   warmup(): Promise<void>;

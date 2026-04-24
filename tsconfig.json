@@ -19,7 +19,7 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "skipLibCheck": true,
-    "types": ["@types/node"]
+    "types": ["@types/node", "@webgpu/types"]
   },
   "include": ["src/js/**/*.ts"],
   "exclude": ["node_modules", "dist", "tests", "demo"]

@@ -1,0 +1,112 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>pii-wasm — WebGPU matmul parity</title>
+  </head>
+  <body>
+    <pre id="out">starting</pre>
+    <script type="module">
+      // Exercises the new WebGPU matmul kernel against the committed
+      // WASM backend's matmul. Both run the same layers.0.attn.q_proj
+      // weights on the same input norm; we expect the GPU output to
+      // match within fp16 tolerance.
+      import {
+        WasmBackend,
+        WebGpuBackend,
+        ModelLoader,
+      } from "/dist/index.js";
+
+      const $out = document.getElementById("out");
+      const log = (m) => { $out.textContent += "\n" + m; };
+
+      try {
+        if (!navigator.gpu) throw new Error("navigator.gpu is not available");
+
+        const loader = new ModelLoader({ source: "openai/privacy-filter" });
+        const bundle = await loader.load();
+
+        log("warmup WebGPU backend");
+        const gpu = new WebGpuBackend({ bundle, quantization: "int4", device: "auto" });
+        const t0 = performance.now();
+        await gpu.warmup();
+        log(`gpu warmup ${(performance.now() - t0).toFixed(0)}ms`);
+
+        log("warmup WASM backend");
+        const wasm = new WasmBackend({ bundle, quantization: "int4", device: "wasm" });
+        const t1 = performance.now();
+        await wasm.warmup();
+        log(`wasm warmup ${(performance.now() - t1).toFixed(0)}ms`);
+
+        // Build a deterministic input: T=8 rows of f32 [T, K=640].
+        const T = 8, K = 640, N = 896;
+        const x = new Float32Array(T * K);
+        for (let i = 0; i < x.length; i++) x[i] = Math.sin(i * 0.013) * 0.5;
+
+        // Run GPU matmul via the test helper.
+        log(`dispatch GPU matmul T=${T} N=${N} K=${K}`);
+        const tg0 = performance.now();
+        const gpuOut = await gpu.matmulInt4Test("layers.0.attn.q_proj", x, T, N, K);
+        const tg1 = performance.now() - tg0;
+
+        // Run WASM matmul via private access. Pull the internals directly.
+        const wasmInst = wasm.wasm;
+        const weights = wasm.weightMap;
+        if (!wasmInst || !weights) throw new Error("wasm backend internals unavailable");
+
+        const xPtr = wasmInst.alloc(x.byteLength);
+        new Uint8Array(wasmInst.memory.buffer, xPtr, x.byteLength).set(new Uint8Array(x.buffer));
+        const outBytes = T * N * 4;
+        const outPtr = wasmInst.alloc(outBytes);
+
+        const wq = weights.get("layers.0.attn.q_proj.int4");
+        const ws = weights.get("layers.0.attn.q_proj.scales");
+        const wz = weights.get("layers.0.attn.q_proj.zp");
+        const wb = weights.get("layers.0.attn.q_proj.bias");
+        if (!wq || !ws || !wz || !wb) throw new Error("missing q_proj weights in wasm map");
+
+        const tw0 = performance.now();
+        wasmInst.matmul_f32_x_int4block_out_f32(
+          xPtr, wq.dataOffset, ws.dataOffset, wz.dataOffset, wb.dataOffset,
+          outPtr, T, N, K,
+        );
+        const tw1 = performance.now() - tw0;
+        const wasmOut = new Float32Array(wasmInst.memory.buffer, outPtr, T * N).slice();
+
+        // Compare. Relative error is only meaningful away from zero —
+        // gate the rel-error check on a minimum absolute value so we
+        // don't flag 8% relative error on outputs near 1e-4.
+        let maxAbs = 0, maxRel = 0, rms = 0, outlierIdx = -1;
+        for (let i = 0; i < wasmOut.length; i++) {
+          const d = Math.abs(gpuOut[i] - wasmOut[i]);
+          if (d > maxAbs) { maxAbs = d; outlierIdx = i; }
+          if (Math.abs(wasmOut[i]) > 0.1) {
+            const rel = d / Math.abs(wasmOut[i]);
+            if (rel > maxRel) maxRel = rel;
+          }
+          rms += d * d;
+        }
+        rms = Math.sqrt(rms / wasmOut.length);
+
+        window.__result = {
+          ok: maxAbs < 0.05 && maxRel < 0.02 && rms < 1e-3,
+          T, N, K,
+          maxAbs, maxRel, rms, outlierIdx,
+          outlierGpu: gpuOut[outlierIdx],
+          outlierWasm: wasmOut[outlierIdx],
+          gpuFirst5: Array.from(gpuOut.slice(0, 5)),
+          wasmFirst5: Array.from(wasmOut.slice(0, 5)),
+          tGpuMs: tg1,
+          tWasmMs: tw1,
+        };
+        log(`GPU matmul ${tg1.toFixed(1)}ms  WASM matmul ${tw1.toFixed(1)}ms`);
+        log(`maxAbs=${maxAbs.toExponential(2)}  maxRel=${maxRel.toExponential(2)}  rms=${rms.toExponential(2)}`);
+        log(`done: ${window.__result.ok ? "OK" : "FAIL"}`);
+      } catch (e) {
+        window.__result = { ok: false, error: String(e), stack: e.stack };
+        log("ERROR: " + e);
+        throw e;
+      }
+    </script>
+  </body>
+</html>

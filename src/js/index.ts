@@ -20,6 +20,8 @@ export { PrivacyFilter } from "./privacy-filter.js";
 // skip the tokenizer / chunking pipeline. Most consumers should use
 // `PrivacyFilter.create({ backend: "wasm", ... })` instead.
 export { WasmBackend } from "./backends/wasm.js";
+export { WebGpuBackend } from "./backends/webgpu.js";
+export { ModelLoader } from "./model/loader.js";
 
 export type {
   CreateOptions,

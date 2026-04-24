@@ -85,7 +85,8 @@ function expertBiasPointer(tensor: WeightTensorInfo, expertIdx: number): number 
 
 export function expertDispatch(
   wasm: PiiWasmExports,
-  hiddenPtr: number,
+  /** f32 [T, D]; the caller has already widened hidden from fp16. */
+  hiddenF32Ptr: number,
   outputPtr: number,
   routingIndicesPtr: number,
   routingScoresPtr: number,
@@ -125,14 +126,13 @@ export function expertDispatch(
   // Scratch sizing: max tokens any single expert could see is `T * K` (all
   // tokens × all k-positions). Allocate that upper bound once and reuse.
   const maxM = T * K;
-  const xGatheredPtr = wasm.alloc(maxM * D * 2);           // fp16 [m, D]
-  const xF32Ptr = wasm.alloc(maxM * D * 4);                // f32  [m, D]
+  const xGatheredPtr = wasm.alloc(maxM * D * 4);           // f32 [m, D]
   const gateUpPtr = wasm.alloc(maxM * 2 * dff * 4);        // f32 [m, 2*dff]
   const gluPtr = wasm.alloc(maxM * dff * 4);               // f32 [m, dff]
   const outF32Ptr = wasm.alloc(maxM * D * 4);              // f32 [m, D]
   const tokIdxPtr = wasm.alloc(maxM * 4);                  // i32 [m]
   const weightsPtr = wasm.alloc(maxM * 4);                 // f32 [m]
-  if (xGatheredPtr === 0 || xF32Ptr === 0 || gateUpPtr === 0 || gluPtr === 0 ||
+  if (xGatheredPtr === 0 || gateUpPtr === 0 || gluPtr === 0 ||
       outF32Ptr === 0 || tokIdxPtr === 0 || weightsPtr === 0) {
     throw new Error("expertDispatch: scratch alloc OOM");
   }
@@ -149,12 +149,10 @@ export function expertDispatch(
       wView[i] = scoresPerExpert[e]![i]!;
     }
 
-    // Gather hidden rows for this expert's tokens, then widen fp16 → f32
-    // once before the matmul. The int4 matmul's inner MAC loop reads
-    // each x column N times, so this saves ~N fp16 widenings per lane
-    // compared to the fp16-input kernel variant.
-    wasm.gather_fp16(hiddenPtr, tokIdxPtr, xGatheredPtr, m, D);
-    wasm.convert_fp16_to_f32(xGatheredPtr, xF32Ptr, m * D);
+    // Hidden is already f32 (converted once per layer by the caller);
+    // gather the rows this expert owns and feed straight into the
+    // f32-input int4 matmul. No per-expert fp16 widening.
+    wasm.gather_f32(hiddenF32Ptr, tokIdxPtr, xGatheredPtr, m, D);
 
     // gate_up = x @ W_gu^T + bias_gu   (f32 x × int4 W → f32)
     const guSlice = expertSlicePointers(
@@ -162,7 +160,7 @@ export function expertDispatch(
     );
     const guBiasPtr = expertBiasPointer(weights.gateUpBias, e);
     wasm.matmul_f32_x_int4block_out_f32(
-      xF32Ptr, guSlice.int4Ptr, guSlice.scalesPtr, guSlice.zpPtr, guBiasPtr,
+      xGatheredPtr, guSlice.int4Ptr, guSlice.scalesPtr, guSlice.zpPtr, guBiasPtr,
       gateUpPtr, m, 2 * dff, D,
     );
 

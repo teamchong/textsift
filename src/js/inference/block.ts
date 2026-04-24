@@ -44,7 +44,7 @@ export interface BlockConfig extends AttentionConfig, ExpertConfig {
  */
 export function routerForward(
   wasm: PiiWasmExports,
-  hiddenPtr: number,
+  hiddenF32Ptr: number,
   routingIdxPtr: number,
   routingScoresPtr: number,
   router: Int4BlockWeight,
@@ -55,8 +55,8 @@ export function routerForward(
 ): void {
   // Logits in fp32 (upstream: `F.linear(hidden.float(), W.float(), b.float())`).
   const logitsPtr = wasm.alloc(T * numExperts * 4);
-  wasm.matmul_fp16_x_int4block_out_f32(
-    hiddenPtr,
+  wasm.matmul_f32_x_int4block_out_f32(
+    hiddenF32Ptr,
     router.int4.dataOffset, router.scales.dataOffset, router.zp.dataOffset,
     router.bias.dataOffset, logitsPtr,
     T, numExperts, D,
@@ -70,62 +70,8 @@ export function routerForward(
 }
 
 /**
- * Transformer block with externally provided routing. Useful for tests
- * where we want to exercise the block body with synthetic routing (e.g.
- * when the blob carries only a subset of experts).
- */
-export function blockForwardWithRouting(
-  wasm: PiiWasmExports,
-  inputPtr: number,
-  outputPtr: number,
-  routingIdxPtr: number,
-  routingScoresPtr: number,
-  weights: BlockWeights,
-  tables: AttentionTables,
-  config: BlockConfig,
-  T: number,
-  maskPtr: number = 0,
-): void {
-  const D = config.hiddenSize;
-
-  // Residual save 1.
-  const residualPtr = wasm.alloc(T * D * 2);
-  new Uint8Array(wasm.memory.buffer, residualPtr, T * D * 2).set(
-    new Uint8Array(wasm.memory.buffer, inputPtr, T * D * 2),
-  );
-
-  const normed1Ptr = wasm.alloc(T * D * 2);
-  wasm.rms_norm(inputPtr, weights.inputLayernorm.dataOffset, normed1Ptr, T, D, config.rmsNormEps);
-
-  const attnOutPtr = wasm.alloc(T * D * 2);
-  attentionForward(wasm, normed1Ptr, attnOutPtr, weights.attn, config, tables, T, maskPtr);
-
-  const h1Ptr = wasm.alloc(T * D * 2);
-  wasm.add_fp16(residualPtr, attnOutPtr, h1Ptr, T * D);
-
-  const residual2Ptr = wasm.alloc(T * D * 2);
-  new Uint8Array(wasm.memory.buffer, residual2Ptr, T * D * 2).set(
-    new Uint8Array(wasm.memory.buffer, h1Ptr, T * D * 2),
-  );
-
-  const normed2Ptr = wasm.alloc(T * D * 2);
-  wasm.rms_norm(h1Ptr, weights.postAttentionLayernorm.dataOffset, normed2Ptr, T, D, config.rmsNormEps);
-
-  const moeOutPtr = wasm.alloc(T * D * 2);
-  expertDispatch(
-    wasm, normed2Ptr, moeOutPtr, routingIdxPtr, routingScoresPtr,
-    weights.experts,
-    { ...config, numExperts: config.numExpertsInBlob },
-    T,
-  );
-
-  wasm.add_fp16(residual2Ptr, moeOutPtr, outputPtr, T * D);
-}
-
-/**
- * Full transformer block: runs its own router, then delegates to
- * `blockForwardWithRouting`. This is the production entry point used by
- * `modelForward`.
+ * Full transformer block: norms → attention → residual → MoE → residual.
+ * Sole production entry point called by `modelForward`.
  */
 export function blockForward(
   wasm: PiiWasmExports,
@@ -163,17 +109,23 @@ export function blockForward(
   const normed2Ptr = wasm.alloc(T * D * 2);
   wasm.rms_norm(h1Ptr, weights.postAttentionLayernorm.dataOffset, normed2Ptr, T, D, config.rmsNormEps);
 
-  // Router + expert dispatch.
+  // Pre-widen normed2 once — used by both the router matmul and
+  // every expert's gate_up, so a single conversion here avoids per-
+  // caller duplication.
+  const normed2F32Ptr = wasm.alloc(T * D * 4);
+  wasm.convert_fp16_to_f32(normed2Ptr, normed2F32Ptr, T * D);
+
+  // Router + expert dispatch (both read f32 hidden).
   const routingIdxPtr = wasm.alloc(T * K * 4);
   const routingScoresPtr = wasm.alloc(T * K * 4);
   routerForward(
-    wasm, normed2Ptr, routingIdxPtr, routingScoresPtr,
+    wasm, normed2F32Ptr, routingIdxPtr, routingScoresPtr,
     weights.router, config.numExperts, K, T, D,
   );
 
   const moeOutPtr = wasm.alloc(T * D * 2);
   expertDispatch(
-    wasm, normed2Ptr, moeOutPtr, routingIdxPtr, routingScoresPtr,
+    wasm, normed2F32Ptr, moeOutPtr, routingIdxPtr, routingScoresPtr,
     weights.experts,
     { ...config, numExperts: config.numExpertsInBlob },
     T,

@@ -49,6 +49,7 @@ export interface PiiWasmExports {
   scale_fp16_inplace(x: number, scale: number, n: number): void;
   add_fp16(a: number, b: number, out: number, n: number): void;
   gather_fp16(src: number, indices: number, dst: number, m: number, D: number): void;
+  gather_f32(src: number, indices: number, dst: number, m: number, D: number): void;
   scatter_add_weighted_f32(
     target: number, values: number, indices: number, weights: number,
     m: number, D: number,
@@ -143,6 +144,7 @@ export async function loadPiiWasm(url?: string | URL | null): Promise<PiiWasmExp
     "scale_fp16_inplace",
     "add_fp16",
     "gather_fp16",
+    "gather_f32",
     "scatter_add_weighted_f32",
     "zero_f32",
     "convert_fp16_to_f32",

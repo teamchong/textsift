@@ -885,6 +885,33 @@ export fn convert_fp16_to_f32(src_ptr: [*]const u16, dst_ptr: [*]f32, n: u32) vo
 }
 
 // --------------------------------------------------------------
+// Kernel: gather f32 rows
+// --------------------------------------------------------------
+//
+// Copies `m` rows of width `D` from `src` (indexed by `indices[0..m]`)
+// into a dense `dst [m, D]`. f32 analogue of `gather_fp16`, used when
+// the caller has already widened hidden activations to f32 once per
+// block.
+
+export fn gather_f32(src_ptr: [*]const f32, indices_ptr: [*]const i32, dst_ptr: [*]f32, m: u32, D: u32) void {
+    const mz: usize = m;
+    const Dz: usize = D;
+    const LANES: usize = 4;
+    var i: usize = 0;
+    while (i < mz) : (i += 1) {
+        const idx: usize = @intCast(indices_ptr[i]);
+        const src_row = src_ptr + idx * Dz;
+        const dst_row = dst_ptr + i * Dz;
+        var d: usize = 0;
+        while (d + LANES <= Dz) : (d += LANES) {
+            const v: @Vector(4, f32) = src_row[d..][0..LANES].*;
+            dst_row[d..][0..LANES].* = v;
+        }
+        while (d < Dz) : (d += 1) dst_row[d] = src_row[d];
+    }
+}
+
+// --------------------------------------------------------------
 // Kernel: f32 → fp16 with optional scalar multiply
 // --------------------------------------------------------------
 //

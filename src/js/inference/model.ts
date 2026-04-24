@@ -89,8 +89,11 @@ export function modelForward(
   wasm.rms_norm(srcPtr, weights.finalLayernorm.dataOffset, dstPtr, T, D, config.rmsNormEps);
 
   // Classifier head: [T, D] × [num_classes, D]^T + [num_classes] → [T, num_classes].
-  wasm.matmul_fp16_x_int4block(
-    dstPtr,
+  // Pre-widen the final-norm output so the int4 matmul runs against f32.
+  const classifierXPtr = wasm.alloc(T * D * 4);
+  wasm.convert_fp16_to_f32(dstPtr, classifierXPtr, T * D);
+  wasm.matmul_f32_x_int4block(
+    classifierXPtr,
     weights.classifier.int4.dataOffset,
     weights.classifier.scales.dataOffset,
     weights.classifier.zp.dataOffset,

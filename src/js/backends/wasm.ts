@@ -38,6 +38,7 @@ export interface PiiWasmExports {
   // or a pointer into WASM memory for asymmetric (ONNX MatMulNBits semantics).
   matmul_fp16_x_int4block(x: number, w_int4: number, w_scales: number, w_zp: number, bias: number, out: number, T: number, N: number, D: number): void;
   matmul_fp16_x_int4block_out_f32(x: number, w_int4: number, w_scales: number, w_zp: number, bias: number, out: number, T: number, N: number, D: number): void;
+  matmul_f32_x_int4block(x: number, w_int4: number, w_scales: number, w_zp: number, bias: number, out: number, T: number, N: number, D: number): void;
   matmul_f32_x_int4block_out_f32(x: number, w_int4: number, w_scales: number, w_zp: number, bias: number, out: number, T: number, N: number, D: number): void;
   topk_partial_f32(x: number, out_idx: number, out_val: number, rows: number, cols: number, k: number): void;
   rope_apply(qk: number, cos: number, sin: number, T: number, H: number, head_dim: number): void;
@@ -134,6 +135,7 @@ export async function loadPiiWasm(url?: string | URL | null): Promise<PiiWasmExp
     "rms_norm",
     "matmul_fp16_x_int4block",
     "matmul_fp16_x_int4block_out_f32",
+    "matmul_f32_x_int4block",
     "matmul_f32_x_int4block_out_f32",
     "topk_partial_f32",
     "rope_apply",

@@ -67,23 +67,29 @@ export function attentionForward(
   const kPtr = wasm.alloc(T * Hkv * hd * 2);
   const vPtr = wasm.alloc(T * Hkv * hd * 2);
   const attnOutPtr = wasm.alloc(T * Hq * hd * 2);
-  if (qPtr === 0 || kPtr === 0 || vPtr === 0 || attnOutPtr === 0) {
+  // Pre-convert hidden (fp16) → f32 once so the Q/K/V int4 matmuls can
+  // use the f32-input kernel and skip the per-load fp16 widening.
+  const hiddenF32Ptr = wasm.alloc(T * D * 4);
+  const attnF32Ptr = wasm.alloc(T * Hq * hd * 4);
+  if (qPtr === 0 || kPtr === 0 || vPtr === 0 || attnOutPtr === 0
+      || hiddenF32Ptr === 0 || attnF32Ptr === 0) {
     throw new Error("attentionForward: scratch alloc OOM");
   }
+  wasm.convert_fp16_to_f32(hiddenPtr, hiddenF32Ptr, T * D);
 
-  // Q/K/V projections (fp16 x × int4 W → fp16 out, asymmetric uint4 with per-block ZP).
-  wasm.matmul_fp16_x_int4block(
-    hiddenPtr,
+  // Q/K/V projections (f32 x × int4 W → fp16 out, asymmetric uint4 with per-block ZP).
+  wasm.matmul_f32_x_int4block(
+    hiddenF32Ptr,
     weights.qProj.int4.dataOffset, weights.qProj.scales.dataOffset, weights.qProj.zp.dataOffset,
     weights.qProj.bias.dataOffset, qPtr, T, Hq * hd, D,
   );
-  wasm.matmul_fp16_x_int4block(
-    hiddenPtr,
+  wasm.matmul_f32_x_int4block(
+    hiddenF32Ptr,
     weights.kProj.int4.dataOffset, weights.kProj.scales.dataOffset, weights.kProj.zp.dataOffset,
     weights.kProj.bias.dataOffset, kPtr, T, Hkv * hd, D,
   );
-  wasm.matmul_fp16_x_int4block(
-    hiddenPtr,
+  wasm.matmul_f32_x_int4block(
+    hiddenF32Ptr,
     weights.vProj.int4.dataOffset, weights.vProj.scales.dataOffset, weights.vProj.zp.dataOffset,
     weights.vProj.bias.dataOffset, vPtr, T, Hkv * hd, D,
   );
@@ -102,9 +108,10 @@ export function attentionForward(
     T, Hq, Hkv, hd, config.slidingWindow,
   );
 
-  // O projection: [T, Hq*hd] @ [D, Hq*hd]^T + [D] → [T, D]  (int4 W, asymmetric).
-  wasm.matmul_fp16_x_int4block(
-    attnOutPtr,
+  // O projection: pre-widen attn_out, then f32-input int4 matmul.
+  wasm.convert_fp16_to_f32(attnOutPtr, attnF32Ptr, T * Hq * hd);
+  wasm.matmul_f32_x_int4block(
+    attnF32Ptr,
     weights.oProj.int4.dataOffset, weights.oProj.scales.dataOffset, weights.oProj.zp.dataOffset,
     weights.oProj.bias.dataOffset, outputPtr, T, D, Hq * hd,
   );

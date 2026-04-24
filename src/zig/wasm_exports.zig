@@ -615,6 +615,21 @@ export fn matmul_f32_x_int4block_out_f32(
     matmulInt4BlockImpl(f32, f32, x_ptr, w_int4_ptr, w_scales_ptr, w_zp_ptr, bias_ptr, out_ptr, T, N, D);
 }
 
+/// f32 x × int4-blockwise W + bias → fp16 out. Used by attention Q/K/V/O
+/// and the classifier head, where callers pre-widen x once and use this
+/// kernel to skip the per-load fp16 → f32 conversion in the inner loop.
+export fn matmul_f32_x_int4block(
+    x_ptr: [*]const f32,
+    w_int4_ptr: [*]const u8,
+    w_scales_ptr: [*]const u16,
+    w_zp_ptr: ?[*]const u8,
+    bias_ptr: [*]const u16,
+    out_ptr: [*]u16,
+    T: u32, N: u32, D: u32,
+) void {
+    matmulInt4BlockImpl(f32, u16, x_ptr, w_int4_ptr, w_scales_ptr, w_zp_ptr, bias_ptr, out_ptr, T, N, D);
+}
+
 // --------------------------------------------------------------
 // Kernel: SwiGLU with clamp (privacy-filter / ORT QMoE variant)
 // --------------------------------------------------------------

@@ -515,15 +515,17 @@ inline fn matmulInt4BlockImpl(
                 sum += block_contribs * @as(@Vector(8, f32), @splat(scale));
             }
 
-            const b_val = fp16ToF32(bias_ptr[n]);
-            storeOut(OutType, out_ptr, (tt + 0) * Nz + n, sum[0] + b_val);
-            storeOut(OutType, out_ptr, (tt + 1) * Nz + n, sum[1] + b_val);
-            storeOut(OutType, out_ptr, (tt + 2) * Nz + n, sum[2] + b_val);
-            storeOut(OutType, out_ptr, (tt + 3) * Nz + n, sum[3] + b_val);
-            storeOut(OutType, out_ptr, (tt + 4) * Nz + n, sum[4] + b_val);
-            storeOut(OutType, out_ptr, (tt + 5) * Nz + n, sum[5] + b_val);
-            storeOut(OutType, out_ptr, (tt + 6) * Nz + n, sum[6] + b_val);
-            storeOut(OutType, out_ptr, (tt + 7) * Nz + n, sum[7] + b_val);
+            // Bias-add once as a splatted SIMD add, then store lanes.
+            const b_vec: @Vector(8, f32) = @splat(fp16ToF32(bias_ptr[n]));
+            const out_vec = sum + b_vec;
+            storeOut(OutType, out_ptr, (tt + 0) * Nz + n, out_vec[0]);
+            storeOut(OutType, out_ptr, (tt + 1) * Nz + n, out_vec[1]);
+            storeOut(OutType, out_ptr, (tt + 2) * Nz + n, out_vec[2]);
+            storeOut(OutType, out_ptr, (tt + 3) * Nz + n, out_vec[3]);
+            storeOut(OutType, out_ptr, (tt + 4) * Nz + n, out_vec[4]);
+            storeOut(OutType, out_ptr, (tt + 5) * Nz + n, out_vec[5]);
+            storeOut(OutType, out_ptr, (tt + 6) * Nz + n, out_vec[6]);
+            storeOut(OutType, out_ptr, (tt + 7) * Nz + n, out_vec[7]);
         }
     }
 

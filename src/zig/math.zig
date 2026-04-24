@@ -37,17 +37,48 @@ pub inline fn bf16x4ToF32x4(u: @Vector(4, u16)) @Vector(4, f32) {
 }
 
 // fp16 = IEEE 754 binary16 (1 sign + 5 exp + 10 mantissa, bias 15).
-// Conversions go through Zig's native `f16` type, which the backend
-// lowers to inline integer bit-math on wasm — no libcall.
+// Zig's `@floatCast(f16 ↔ f32)` still emits a libcall on wasm targets
+// — LLVM doesn't have a native f16 ABI — which pulls the conversion
+// out into a real function invocation inside hot loops. Do the bit
+// manipulation explicitly so the compiler inlines it.
 
 pub inline fn fp16ToF32(bits: u16) f32 {
-    const h: f16 = @bitCast(bits);
-    return @floatCast(h);
+    const u32_bits: u32 = bits;
+    const sign_shifted: u32 = (u32_bits & 0x8000) << 16;
+    const rest: u32 = u32_bits & 0x7fff;
+    const biased: u32 = if (rest == 0) 0 else (rest << 13) +% (112 << 23);
+    const result_bits: u32 = sign_shifted | biased;
+    return @bitCast(result_bits);
 }
 
 pub inline fn f32ToFp16(f: f32) u16 {
-    const h: f16 = @floatCast(f);
-    return @bitCast(h);
+    const u32_bits: u32 = @bitCast(f);
+    const sign: u32 = (u32_bits >> 16) & 0x8000;
+    const exp32: u32 = (u32_bits >> 23) & 0xff;
+    const mant: u32 = u32_bits & 0x7fffff;
+    if (exp32 == 0xff) {
+        // inf or NaN
+        return @intCast(sign | 0x7c00 | @as(u32, if (mant != 0) 0x200 else 0));
+    }
+    const exp16_signed: i32 = @as(i32, @intCast(exp32)) - 127 + 15;
+    if (exp16_signed >= 0x1f) return @intCast(sign | 0x7c00);
+    if (exp16_signed <= 0) {
+        if (exp16_signed < -10) return @intCast(sign);
+        const shift: u5 = @intCast(@as(u32, @intCast(14 - exp16_signed)));
+        const mant24: u32 = mant | 0x800000;
+        const rounded: u32 = (mant24 + (@as(u32, 1) << (shift - 1))) >> shift;
+        return @intCast(sign | rounded);
+    }
+    // Normal: round-to-nearest-even of the top 10 mantissa bits.
+    const lsb: u32 = (mant >> 13) & 1;
+    var m10: u32 = (mant + 0xfff + lsb) >> 13;
+    var e16: u32 = @intCast(exp16_signed);
+    if (m10 >= 0x400) {
+        m10 = 0;
+        e16 += 1;
+        if (e16 >= 0x1f) return @intCast(sign | 0x7c00);
+    }
+    return @intCast(sign | (e16 << 10) | m10);
 }
 
 pub inline fn fp16x4ToF32x4(u: @Vector(4, u16)) @Vector(4, f32) {

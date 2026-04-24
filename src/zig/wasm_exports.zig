@@ -678,13 +678,40 @@ export fn swiglu_clamp_f32(
     const Tz: usize = T;
     const Dz: usize = D;
     const stride: usize = 2 * Dz;
+    const LIMIT_VEC: @Vector(4, f32) = @splat(SWIGLU_LIMIT);
+    const NEG_LIMIT_VEC: @Vector(4, f32) = @splat(-SWIGLU_LIMIT);
+    const ALPHA_VEC: @Vector(4, f32) = @splat(SWIGLU_ALPHA);
+    const ONE_VEC: @Vector(4, f32) = @splat(1.0);
 
     var t: usize = 0;
     while (t < Tz) : (t += 1) {
         const row_base = t * stride;
         const out_base = t * Dz;
 
+        // 4-at-a-time SIMD loop: load two v128s of interleaved (gate, up)
+        // pairs, shuffle-deinterleave, clamp in SIMD; sigmoid stays
+        // scalar-per-lane (wasm has no SIMD exp).
         var d: usize = 0;
+        while (d + 4 <= Dz) : (d += 4) {
+            const v0: @Vector(4, f32) = gate_up_ptr[row_base + 2 * d ..][0..4].*;
+            const v1: @Vector(4, f32) = gate_up_ptr[row_base + 2 * d + 4 ..][0..4].*;
+            const gates_raw = @shuffle(f32, v0, v1, @Vector(4, i32){ 0, 2, -1, -3 });
+            const ups_raw   = @shuffle(f32, v0, v1, @Vector(4, i32){ 1, 3, -2, -4 });
+            const gates = @min(gates_raw, LIMIT_VEC);
+            const ups = @max(@min(ups_raw, LIMIT_VEC), NEG_LIMIT_VEC);
+            const scaled = gates * ALPHA_VEC;
+            const sigs: @Vector(4, f32) = .{
+                sigmoidF32(scaled[0]),
+                sigmoidF32(scaled[1]),
+                sigmoidF32(scaled[2]),
+                sigmoidF32(scaled[3]),
+            };
+            const glu = gates * sigs;
+            const result = (ups + ONE_VEC) * glu;
+            out_ptr[out_base + d ..][0..4].* = result;
+        }
+
+        // Scalar tail for D not divisible by 4.
         while (d < Dz) : (d += 1) {
             var gate = gate_up_ptr[row_base + 2 * d];
             var up = gate_up_ptr[row_base + 2 * d + 1];

@@ -870,7 +870,7 @@ export fn scatter_add_weighted_f32(
         while (d + LANES <= Dz) : (d += LANES) {
             const tgt: @Vector(4, f32) = tgt_row[d ..][0..LANES].*;
             const val: @Vector(4, f32) = val_row[d ..][0..LANES].*;
-            tgt_row[d ..][0..LANES].* = tgt + w_vec * val;
+            tgt_row[d ..][0..LANES].* = fma4(w_vec, val, tgt);
         }
         while (d < Dz) : (d += 1) tgt_row[d] += w * val_row[d];
     }
@@ -1045,15 +1045,15 @@ inline fn dotBf16F32(a: [*]const u16, b: [*]const u16, n: usize) f32 {
         const y1: @Vector(4, u16) = b[i + 4 ..][0..LANES].*;
         const y2: @Vector(4, u16) = b[i + 8 ..][0..LANES].*;
         const y3: @Vector(4, u16) = b[i + 12 ..][0..LANES].*;
-        a0 += fp16x4ToF32x4(x0) * fp16x4ToF32x4(y0);
-        a1 += fp16x4ToF32x4(x1) * fp16x4ToF32x4(y1);
-        a2 += fp16x4ToF32x4(x2) * fp16x4ToF32x4(y2);
-        a3 += fp16x4ToF32x4(x3) * fp16x4ToF32x4(y3);
+        a0 = fma4(fp16x4ToF32x4(x0), fp16x4ToF32x4(y0), a0);
+        a1 = fma4(fp16x4ToF32x4(x1), fp16x4ToF32x4(y1), a1);
+        a2 = fma4(fp16x4ToF32x4(x2), fp16x4ToF32x4(y2), a2);
+        a3 = fma4(fp16x4ToF32x4(x3), fp16x4ToF32x4(y3), a3);
     }
     while (i + LANES <= n) : (i += LANES) {
         const xu: @Vector(4, u16) = a[i ..][0..LANES].*;
         const yu: @Vector(4, u16) = b[i ..][0..LANES].*;
-        a0 += fp16x4ToF32x4(xu) * fp16x4ToF32x4(yu);
+        a0 = fma4(fp16x4ToF32x4(xu), fp16x4ToF32x4(yu), a0);
     }
     const combined: @Vector(4, f32) = (a0 + a1) + (a2 + a3);
     var sum: f32 = combined[0] + combined[1] + combined[2] + combined[3];
@@ -1070,8 +1070,7 @@ inline fn saxpyF32Bf16(p: f32, v_ptr: [*]const u16, acc: [*]f32, n: usize) void 
     while (i + LANES <= n) : (i += LANES) {
         const vv: @Vector(4, u16) = v_ptr[i ..][0..LANES].*;
         const acc_vec: @Vector(4, f32) = acc[i ..][0..LANES].*;
-        const new_acc = acc_vec + p_vec * fp16x4ToF32x4(vv);
-        acc[i ..][0..LANES].* = new_acc;
+        acc[i ..][0..LANES].* = fma4(p_vec, fp16x4ToF32x4(vv), acc_vec);
     }
     while (i < n) : (i += 1) {
         acc[i] += p * fp16ToF32(v_ptr[i]);

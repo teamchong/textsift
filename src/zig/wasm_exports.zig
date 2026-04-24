@@ -441,7 +441,7 @@ inline fn matmulInt4BlockImpl(
     const Nz: usize = N;
     const Dz: usize = D;
     const BLOCK: usize = 32;
-    const TR: usize = 4;
+    const TR: usize = 8;
 
     const w_int4_stride: usize = Dz / 2;
     const w_scale_stride: usize = Dz / BLOCK;
@@ -449,9 +449,10 @@ inline fn matmulInt4BlockImpl(
     const w_ptr = w_int4_ptr;
     const scales_base: [*]const u16 = w_scales_ptr;
 
-    // TR-tiled T loop: amortize int4 decode across 4 rows of X that
-    // share the same W row. Trailing 0..3 rows run through the scalar
-    // tail below.
+    // TR-tiled T loop: amortize one int4 decode across 8 rows of X
+    // sharing the same W row. 8 × 32 = 256 MACs per decode, up from
+    // 128 with TR=4. Single accumulator per T row (no ILP×2) keeps
+    // the SIMD register set within wasm's 16-register budget.
     var tt: usize = 0;
     while (tt + TR <= Tz) : (tt += TR) {
         var n: usize = 0;
@@ -460,74 +461,76 @@ inline fn matmulInt4BlockImpl(
             const w_scale_row = scales_base + n * w_scale_stride;
             const w_zp_row: ?[*]const u8 = if (w_zp_ptr) |p| p + n * w_zp_stride else null;
 
-            var acc0: f32 = 0.0;
-            var acc1: f32 = 0.0;
-            var acc2: f32 = 0.0;
-            var acc3: f32 = 0.0;
+            var sum: @Vector(8, f32) = @splat(0);
             var b: usize = 0;
             while (b < w_scale_stride) : (b += 1) {
                 const scale = fp16ToF32(w_scale_row[b]);
                 const block_d = b * BLOCK;
                 const zp: u8 = if (w_zp_row) |p| extractZp(p, b) else 0;
 
-                // Decode the block's 32 int4 values once; reuse across 4 T rows.
                 const q_chunks: [8]@Vector(4, f32) = int4BlockDecode(w_int4_row, block_d, zp);
 
-                // One vector accumulator per T row (×2 for ILP).
-                var v00: @Vector(4, f32) = @splat(0);
-                var v01: @Vector(4, f32) = @splat(0);
-                var v10: @Vector(4, f32) = @splat(0);
-                var v11: @Vector(4, f32) = @splat(0);
-                var v20: @Vector(4, f32) = @splat(0);
-                var v21: @Vector(4, f32) = @splat(0);
-                var v30: @Vector(4, f32) = @splat(0);
-                var v31: @Vector(4, f32) = @splat(0);
+                var v0: @Vector(4, f32) = @splat(0);
+                var v1: @Vector(4, f32) = @splat(0);
+                var v2: @Vector(4, f32) = @splat(0);
+                var v3: @Vector(4, f32) = @splat(0);
+                var v4: @Vector(4, f32) = @splat(0);
+                var v5: @Vector(4, f32) = @splat(0);
+                var v6: @Vector(4, f32) = @splat(0);
+                var v7: @Vector(4, f32) = @splat(0);
 
                 inline for (0..4) |k| {
                     const j = k * 8;
                     const qf0 = q_chunks[k * 2];
                     const qf1 = q_chunks[k * 2 + 1];
-                    const x0_0 = loadX4(XType, x_ptr, (tt + 0) * Dz + block_d + j);
-                    const x0_1 = loadX4(XType, x_ptr, (tt + 0) * Dz + block_d + j + 4);
-                    const x1_0 = loadX4(XType, x_ptr, (tt + 1) * Dz + block_d + j);
-                    const x1_1 = loadX4(XType, x_ptr, (tt + 1) * Dz + block_d + j + 4);
-                    const x2_0 = loadX4(XType, x_ptr, (tt + 2) * Dz + block_d + j);
-                    const x2_1 = loadX4(XType, x_ptr, (tt + 2) * Dz + block_d + j + 4);
-                    const x3_0 = loadX4(XType, x_ptr, (tt + 3) * Dz + block_d + j);
-                    const x3_1 = loadX4(XType, x_ptr, (tt + 3) * Dz + block_d + j + 4);
-                    v00 += x0_0 * qf0;
-                    v01 += x0_1 * qf1;
-                    v10 += x1_0 * qf0;
-                    v11 += x1_1 * qf1;
-                    v20 += x2_0 * qf0;
-                    v21 += x2_1 * qf1;
-                    v30 += x3_0 * qf0;
-                    v31 += x3_1 * qf1;
+                    v0 += loadX4(XType, x_ptr, (tt + 0) * Dz + block_d + j) * qf0;
+                    v0 += loadX4(XType, x_ptr, (tt + 0) * Dz + block_d + j + 4) * qf1;
+                    v1 += loadX4(XType, x_ptr, (tt + 1) * Dz + block_d + j) * qf0;
+                    v1 += loadX4(XType, x_ptr, (tt + 1) * Dz + block_d + j + 4) * qf1;
+                    v2 += loadX4(XType, x_ptr, (tt + 2) * Dz + block_d + j) * qf0;
+                    v2 += loadX4(XType, x_ptr, (tt + 2) * Dz + block_d + j + 4) * qf1;
+                    v3 += loadX4(XType, x_ptr, (tt + 3) * Dz + block_d + j) * qf0;
+                    v3 += loadX4(XType, x_ptr, (tt + 3) * Dz + block_d + j + 4) * qf1;
+                    v4 += loadX4(XType, x_ptr, (tt + 4) * Dz + block_d + j) * qf0;
+                    v4 += loadX4(XType, x_ptr, (tt + 4) * Dz + block_d + j + 4) * qf1;
+                    v5 += loadX4(XType, x_ptr, (tt + 5) * Dz + block_d + j) * qf0;
+                    v5 += loadX4(XType, x_ptr, (tt + 5) * Dz + block_d + j + 4) * qf1;
+                    v6 += loadX4(XType, x_ptr, (tt + 6) * Dz + block_d + j) * qf0;
+                    v6 += loadX4(XType, x_ptr, (tt + 6) * Dz + block_d + j + 4) * qf1;
+                    v7 += loadX4(XType, x_ptr, (tt + 7) * Dz + block_d + j) * qf0;
+                    v7 += loadX4(XType, x_ptr, (tt + 7) * Dz + block_d + j + 4) * qf1;
                 }
 
-                const c0 = v00 + v01;
-                const c1 = v10 + v11;
-                const c2 = v20 + v21;
-                const c3 = v30 + v31;
-                acc0 += ((c0[0] + c0[1]) + (c0[2] + c0[3])) * scale;
-                acc1 += ((c1[0] + c1[1]) + (c1[2] + c1[3])) * scale;
-                acc2 += ((c2[0] + c2[1]) + (c2[2] + c2[3])) * scale;
-                acc3 += ((c3[0] + c3[1]) + (c3[2] + c3[3])) * scale;
+                const block_contribs: @Vector(8, f32) = .{
+                    (v0[0] + v0[1]) + (v0[2] + v0[3]),
+                    (v1[0] + v1[1]) + (v1[2] + v1[3]),
+                    (v2[0] + v2[1]) + (v2[2] + v2[3]),
+                    (v3[0] + v3[1]) + (v3[2] + v3[3]),
+                    (v4[0] + v4[1]) + (v4[2] + v4[3]),
+                    (v5[0] + v5[1]) + (v5[2] + v5[3]),
+                    (v6[0] + v6[1]) + (v6[2] + v6[3]),
+                    (v7[0] + v7[1]) + (v7[2] + v7[3]),
+                };
+                sum += block_contribs * @as(@Vector(8, f32), @splat(scale));
             }
 
             const b_val = fp16ToF32(bias_ptr[n]);
-            storeOut(OutType, out_ptr, (tt + 0) * Nz + n, acc0 + b_val);
-            storeOut(OutType, out_ptr, (tt + 1) * Nz + n, acc1 + b_val);
-            storeOut(OutType, out_ptr, (tt + 2) * Nz + n, acc2 + b_val);
-            storeOut(OutType, out_ptr, (tt + 3) * Nz + n, acc3 + b_val);
+            storeOut(OutType, out_ptr, (tt + 0) * Nz + n, sum[0] + b_val);
+            storeOut(OutType, out_ptr, (tt + 1) * Nz + n, sum[1] + b_val);
+            storeOut(OutType, out_ptr, (tt + 2) * Nz + n, sum[2] + b_val);
+            storeOut(OutType, out_ptr, (tt + 3) * Nz + n, sum[3] + b_val);
+            storeOut(OutType, out_ptr, (tt + 4) * Nz + n, sum[4] + b_val);
+            storeOut(OutType, out_ptr, (tt + 5) * Nz + n, sum[5] + b_val);
+            storeOut(OutType, out_ptr, (tt + 6) * Nz + n, sum[6] + b_val);
+            storeOut(OutType, out_ptr, (tt + 7) * Nz + n, sum[7] + b_val);
         }
     }
 
-    // T tail for T not divisible by 4 (hot for expert dispatch — each
-    // expert sees m ∈ {1..K×T/E} tokens, often 1-3). Walk blocks in the
+    // T tail for T not divisible by TR=8 (hot for expert dispatch — each
+    // expert sees m ∈ {1..K×T/E} tokens, often 1-6). Walk blocks in the
     // outer loop so one decode serves all m_tail tokens instead of
     // re-decoding per token. Accumulators are a small stack array
-    // (m_tail ≤ TR-1 = 3).
+    // (m_tail ≤ TR-1 = 7).
     const m_tail: usize = Tz - tt;
     if (m_tail > 0) {
         var n: usize = 0;
@@ -536,7 +539,7 @@ inline fn matmulInt4BlockImpl(
             const w_scale_row = scales_base + n * w_scale_stride;
             const w_zp_row: ?[*]const u8 = if (w_zp_ptr) |p| p + n * w_zp_stride else null;
 
-            var accs: [TR - 1]f32 = .{ 0.0, 0.0, 0.0 };
+            var accs: [TR - 1]f32 = .{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
             var b: usize = 0;
             while (b < w_scale_stride) : (b += 1) {
                 const scale = fp16ToF32(w_scale_row[b]);

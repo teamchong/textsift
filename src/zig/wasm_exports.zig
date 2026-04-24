@@ -849,6 +849,27 @@ export fn zero_f32(ptr: [*]f32, n: u32) void {
 }
 
 // --------------------------------------------------------------
+// Kernel: fp16 → f32 widen (bulk)
+// --------------------------------------------------------------
+//
+// Pre-converting X from fp16 to f32 once before a matmul lets the
+// inner MAC loop skip the per-load widening (was ~4 SIMD ops per
+// 4-lane x load). Saves real time in the MoE gate_up path where the
+// fp16 int4 matmul reads each x column ~N times per call.
+
+export fn convert_fp16_to_f32(src_ptr: [*]const u16, dst_ptr: [*]f32, n: u32) void {
+    const nz: usize = n;
+    const LANES: usize = 4;
+    var i: usize = 0;
+    while (i + LANES <= nz) : (i += LANES) {
+        const u: @Vector(4, u16) = src_ptr[i..][0..LANES].*;
+        const f: @Vector(4, f32) = fp16x4ToF32x4(u);
+        dst_ptr[i..][0..LANES].* = f;
+    }
+    while (i < nz) : (i += 1) dst_ptr[i] = fp16ToF32(src_ptr[i]);
+}
+
+// --------------------------------------------------------------
 // Kernel: f32 → fp16 with optional scalar multiply
 // --------------------------------------------------------------
 //

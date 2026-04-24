@@ -126,12 +126,13 @@ export function expertDispatch(
   // tokens × all k-positions). Allocate that upper bound once and reuse.
   const maxM = T * K;
   const xGatheredPtr = wasm.alloc(maxM * D * 2);           // fp16 [m, D]
+  const xF32Ptr = wasm.alloc(maxM * D * 4);                // f32  [m, D]
   const gateUpPtr = wasm.alloc(maxM * 2 * dff * 4);        // f32 [m, 2*dff]
   const gluPtr = wasm.alloc(maxM * dff * 4);               // f32 [m, dff]
   const outF32Ptr = wasm.alloc(maxM * D * 4);              // f32 [m, D]
   const tokIdxPtr = wasm.alloc(maxM * 4);                  // i32 [m]
   const weightsPtr = wasm.alloc(maxM * 4);                 // f32 [m]
-  if (xGatheredPtr === 0 || gateUpPtr === 0 || gluPtr === 0 ||
+  if (xGatheredPtr === 0 || xF32Ptr === 0 || gateUpPtr === 0 || gluPtr === 0 ||
       outF32Ptr === 0 || tokIdxPtr === 0 || weightsPtr === 0) {
     throw new Error("expertDispatch: scratch alloc OOM");
   }
@@ -148,16 +149,20 @@ export function expertDispatch(
       wView[i] = scoresPerExpert[e]![i]!;
     }
 
-    // Gather hidden rows for this expert's tokens.
+    // Gather hidden rows for this expert's tokens, then widen fp16 → f32
+    // once before the matmul. The int4 matmul's inner MAC loop reads
+    // each x column N times, so this saves ~N fp16 widenings per lane
+    // compared to the fp16-input kernel variant.
     wasm.gather_fp16(hiddenPtr, tokIdxPtr, xGatheredPtr, m, D);
+    wasm.convert_fp16_to_f32(xGatheredPtr, xF32Ptr, m * D);
 
-    // gate_up = x @ W_gu^T + bias_gu   (fp16 x × int4 W → f32)
+    // gate_up = x @ W_gu^T + bias_gu   (f32 x × int4 W → f32)
     const guSlice = expertSlicePointers(
       weights.gateUpInt4, weights.gateUpScales, weights.gateUpZp, e, 2 * dff, D,
     );
     const guBiasPtr = expertBiasPointer(weights.gateUpBias, e);
-    wasm.matmul_fp16_x_int4block_out_f32(
-      xGatheredPtr, guSlice.int4Ptr, guSlice.scalesPtr, guSlice.zpPtr, guBiasPtr,
+    wasm.matmul_f32_x_int4block_out_f32(
+      xF32Ptr, guSlice.int4Ptr, guSlice.scalesPtr, guSlice.zpPtr, guBiasPtr,
       gateUpPtr, m, 2 * dff, D,
     );
 

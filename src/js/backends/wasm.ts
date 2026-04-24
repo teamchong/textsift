@@ -53,6 +53,7 @@ export interface PiiWasmExports {
     m: number, D: number,
   ): void;
   zero_f32(ptr: number, n: number): void;
+  convert_fp16_to_f32(src: number, dst: number, n: number): void;
   cast_f32_to_fp16_scaled(src: number, dst: number, n: number, scale: number): void;
   softmax_f32(x: number, out: number, rows: number, cols: number): void;
   swiglu_clamp_f32(gate_up: number, out: number, T: number, D: number): void;
@@ -142,6 +143,7 @@ export async function loadPiiWasm(url?: string | URL | null): Promise<PiiWasmExp
     "gather_fp16",
     "scatter_add_weighted_f32",
     "zero_f32",
+    "convert_fp16_to_f32",
     "cast_f32_to_fp16_scaled",
     "softmax_f32",
     "swiglu_clamp_f32",

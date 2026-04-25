@@ -176,42 +176,53 @@ struct Dims { T: u32, N: u32, K: u32, _pad: u32 };
 @group(0) @binding(6) var<storage, read_write> y: array<f16>;
 
 const BLOCK: u32 = 32u;
+const TR: u32 = 4u;
+const WG: u32 = 64u;
 
 ${INT4_ACCESS_WGSL}
 
+// 2D dispatch: workgroup_id.x indexes 64-wide N tiles, .y indexes
+// 4-wide T tiles. Each thread owns one N column and four T rows; the
+// int4 weight decode (8 nibbles per u32 word) is reused across the
+// four T accumulators, matching the WASM Zig kernel's TR=8 amortization
+// pattern (TR=4 here keeps register pressure low — Apple Silicon
+// has limited GPU registers per thread).
 @compute @workgroup_size(64, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let tn = gid.x;
-    let total = dims.T * dims.N;
-    if (tn >= total) { return; }
-    let t = tn / dims.N;
-    let n = tn % dims.N;
+fn main(
+    @builtin(workgroup_id) wg_id: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let n = wg_id.x * WG + lid.x;
+    let t_base = wg_id.y * TR;
+    if (n >= dims.N) { return; }
+
     let K = dims.K;
     let n_blocks = K / BLOCK;
     let zp_per_row = (n_blocks + 1u) >> 1u;
-
     let nibble_row_base = n * K;
     let scale_row = n * n_blocks;
-    let x_row = t * K;
 
-    var acc: f32 = 0.0;
+    var acc0: f32 = 0.0;
+    var acc1: f32 = 0.0;
+    var acc2: f32 = 0.0;
+    var acc3: f32 = 0.0;
+
     for (var b: u32 = 0u; b < n_blocks; b = b + 1u) {
         let scale: f32 = f32(w_scales[scale_row + b]);
-        let zp_byte_idx = n * zp_per_row + (b >> 1u);
-        let zp_byte = load_byte(&w_zp, zp_byte_idx);
+        let zp_byte = load_byte(&w_zp, n * zp_per_row + (b >> 1u));
         let zp_nib = select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (b & 1u) == 1u);
         let zp_f: f32 = f32(zp_nib);
-
-        // 32 nibbles per block = 4 u32 words × 8 nibbles each. Explicit
-        // u32 loads amortize the int4 unpack: one word dispatches 8
-        // (nibble, x, fma) triples instead of 8 scalar load_nibble calls.
         let word_base = (nibble_row_base + b * BLOCK) >> 3u;
-        let xb = x_row + b * BLOCK;
+        let kbase = b * BLOCK;
 
-        var block_sum: f32 = 0.0;
+        var blk0: f32 = 0.0;
+        var blk1: f32 = 0.0;
+        var blk2: f32 = 0.0;
+        var blk3: f32 = 0.0;
+
         for (var w: u32 = 0u; w < 4u; w = w + 1u) {
             let word = w_int4[word_base + w];
-            let kb = w * 8u;
+            let kb = kbase + w * 8u;
             let q0 = f32( word        & 0xFu) - zp_f;
             let q1 = f32((word >>  4u) & 0xFu) - zp_f;
             let q2 = f32((word >>  8u) & 0xFu) - zp_f;
@@ -220,19 +231,62 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let q5 = f32((word >> 20u) & 0xFu) - zp_f;
             let q6 = f32((word >> 24u) & 0xFu) - zp_f;
             let q7 = f32((word >> 28u) & 0xFu) - zp_f;
-            block_sum = fma(q0, f32(x[xb + kb + 0u]), block_sum);
-            block_sum = fma(q1, f32(x[xb + kb + 1u]), block_sum);
-            block_sum = fma(q2, f32(x[xb + kb + 2u]), block_sum);
-            block_sum = fma(q3, f32(x[xb + kb + 3u]), block_sum);
-            block_sum = fma(q4, f32(x[xb + kb + 4u]), block_sum);
-            block_sum = fma(q5, f32(x[xb + kb + 5u]), block_sum);
-            block_sum = fma(q6, f32(x[xb + kb + 6u]), block_sum);
-            block_sum = fma(q7, f32(x[xb + kb + 7u]), block_sum);
+
+            let r0 = (t_base + 0u) * K + kb;
+            blk0 = fma(q0, f32(x[r0 + 0u]), blk0);
+            blk0 = fma(q1, f32(x[r0 + 1u]), blk0);
+            blk0 = fma(q2, f32(x[r0 + 2u]), blk0);
+            blk0 = fma(q3, f32(x[r0 + 3u]), blk0);
+            blk0 = fma(q4, f32(x[r0 + 4u]), blk0);
+            blk0 = fma(q5, f32(x[r0 + 5u]), blk0);
+            blk0 = fma(q6, f32(x[r0 + 6u]), blk0);
+            blk0 = fma(q7, f32(x[r0 + 7u]), blk0);
+
+            let r1 = (t_base + 1u) * K + kb;
+            blk1 = fma(q0, f32(x[r1 + 0u]), blk1);
+            blk1 = fma(q1, f32(x[r1 + 1u]), blk1);
+            blk1 = fma(q2, f32(x[r1 + 2u]), blk1);
+            blk1 = fma(q3, f32(x[r1 + 3u]), blk1);
+            blk1 = fma(q4, f32(x[r1 + 4u]), blk1);
+            blk1 = fma(q5, f32(x[r1 + 5u]), blk1);
+            blk1 = fma(q6, f32(x[r1 + 6u]), blk1);
+            blk1 = fma(q7, f32(x[r1 + 7u]), blk1);
+
+            let r2 = (t_base + 2u) * K + kb;
+            blk2 = fma(q0, f32(x[r2 + 0u]), blk2);
+            blk2 = fma(q1, f32(x[r2 + 1u]), blk2);
+            blk2 = fma(q2, f32(x[r2 + 2u]), blk2);
+            blk2 = fma(q3, f32(x[r2 + 3u]), blk2);
+            blk2 = fma(q4, f32(x[r2 + 4u]), blk2);
+            blk2 = fma(q5, f32(x[r2 + 5u]), blk2);
+            blk2 = fma(q6, f32(x[r2 + 6u]), blk2);
+            blk2 = fma(q7, f32(x[r2 + 7u]), blk2);
+
+            let r3 = (t_base + 3u) * K + kb;
+            blk3 = fma(q0, f32(x[r3 + 0u]), blk3);
+            blk3 = fma(q1, f32(x[r3 + 1u]), blk3);
+            blk3 = fma(q2, f32(x[r3 + 2u]), blk3);
+            blk3 = fma(q3, f32(x[r3 + 3u]), blk3);
+            blk3 = fma(q4, f32(x[r3 + 4u]), blk3);
+            blk3 = fma(q5, f32(x[r3 + 5u]), blk3);
+            blk3 = fma(q6, f32(x[r3 + 6u]), blk3);
+            blk3 = fma(q7, f32(x[r3 + 7u]), blk3);
         }
-        acc = fma(block_sum, scale, acc);
+        acc0 = fma(blk0, scale, acc0);
+        acc1 = fma(blk1, scale, acc1);
+        acc2 = fma(blk2, scale, acc2);
+        acc3 = fma(blk3, scale, acc3);
     }
-    acc = acc + f32(bias[n]);
-    y[t * dims.N + n] = f16(acc);
+
+    let bias_f = f32(bias[n]);
+    let t0 = t_base + 0u;
+    let t1 = t_base + 1u;
+    let t2 = t_base + 2u;
+    let t3 = t_base + 3u;
+    if (t0 < dims.T) { y[t0 * dims.N + n] = f16(acc0 + bias_f); }
+    if (t1 < dims.T) { y[t1 * dims.N + n] = f16(acc1 + bias_f); }
+    if (t2 < dims.T) { y[t2 * dims.N + n] = f16(acc2 + bias_f); }
+    if (t3 < dims.T) { y[t3 * dims.N + n] = f16(acc3 + bias_f); }
 }
 `;
 
@@ -825,19 +879,31 @@ struct Dims {
 @group(0) @binding(7) var<storage, read_write> out: array<f32>;
 
 const BLOCK: u32 = 32u;
+const D_MAX: u32 = 640u;  // pii-filter hidden_size; assert at dispatch time
+const WG: u32 = 64u;
+
+// Workgroup-shared input row. All 64 threads in a wg share the same
+// (t, k_pick) so they read the same x row — load it once cooperatively
+// and reuse from on-chip memory instead of replaying 64 global loads.
+var<workgroup> x_tile: array<f32, D_MAX>;
 
 ${INT4_ACCESS_WGSL}
 
+// 2D dispatch: workgroup_id.x is the (token, k_pick) pair (0..T*K),
+// workgroup_id.y is the N-tile index (0..N/64). Each thread writes one
+// N column for that (tk, n_tile) tile.
 @compute @workgroup_size(64, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let total = dims.T * dims.K * dims.N;
-    let idx = gid.x;
-    if (idx >= total) { return; }
+fn main(
+    @builtin(workgroup_id) wg_id: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let tid = lid.x;
+    let tk = wg_id.x;
+    if (tk >= dims.T * dims.K) { return; }
+    let n_base = wg_id.y * WG;
+    let n = n_base + tid;
 
-    let n = idx % dims.N;
-    let tk = idx / dims.N;
     let t = tk / dims.K;
-
     let e = u32(routing_idx[tk]);
 
     let D = dims.D;
@@ -845,14 +911,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n_blocks = D / BLOCK;
     let zp_per_row = (n_blocks + 1u) >> 1u;
 
-    // Per-expert nibble base, scale offset (in f16 elements), zp byte base,
-    // bias offset (in f16 elements).
+    // Cooperative X load. D=640 with WG=64 → 10 elements per thread.
+    for (var i: u32 = 0u; i < 10u; i = i + 1u) {
+        let k_idx = i * WG + tid;
+        if (k_idx < D) {
+            x_tile[k_idx] = x[t * D + k_idx];
+        }
+    }
+    workgroupBarrier();
+
+    if (n >= N) { return; }
+
     let expert_nibble_base = e * N * D + n * D;
     let expert_scale_base  = e * N * n_blocks + n * n_blocks;
     let expert_zp_base     = e * N * zp_per_row + n * zp_per_row;
     let expert_bias_base   = e * N + n;
-
-    let x_row = t * D;
 
     var acc: f32 = 0.0;
     for (var b: u32 = 0u; b < n_blocks; b = b + 1u) {
@@ -862,7 +935,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let zp_f: f32 = f32(zp_nib);
 
         let word_base = (expert_nibble_base + b * BLOCK) >> 3u;
-        let xb = x_row + b * BLOCK;
+        let xb = b * BLOCK;
 
         var block_sum: f32 = 0.0;
         for (var w: u32 = 0u; w < 4u; w = w + 1u) {
@@ -876,14 +949,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let q5 = f32((word >> 20u) & 0xFu) - zp_f;
             let q6 = f32((word >> 24u) & 0xFu) - zp_f;
             let q7 = f32((word >> 28u) & 0xFu) - zp_f;
-            block_sum = fma(q0, x[xb + kb + 0u], block_sum);
-            block_sum = fma(q1, x[xb + kb + 1u], block_sum);
-            block_sum = fma(q2, x[xb + kb + 2u], block_sum);
-            block_sum = fma(q3, x[xb + kb + 3u], block_sum);
-            block_sum = fma(q4, x[xb + kb + 4u], block_sum);
-            block_sum = fma(q5, x[xb + kb + 5u], block_sum);
-            block_sum = fma(q6, x[xb + kb + 6u], block_sum);
-            block_sum = fma(q7, x[xb + kb + 7u], block_sum);
+            block_sum = fma(q0, x_tile[xb + kb + 0u], block_sum);
+            block_sum = fma(q1, x_tile[xb + kb + 1u], block_sum);
+            block_sum = fma(q2, x_tile[xb + kb + 2u], block_sum);
+            block_sum = fma(q3, x_tile[xb + kb + 3u], block_sum);
+            block_sum = fma(q4, x_tile[xb + kb + 4u], block_sum);
+            block_sum = fma(q5, x_tile[xb + kb + 5u], block_sum);
+            block_sum = fma(q6, x_tile[xb + kb + 6u], block_sum);
+            block_sum = fma(q7, x_tile[xb + kb + 7u], block_sum);
         }
         acc = fma(block_sum, scale, acc);
     }
@@ -1302,6 +1375,16 @@ export class WebGpuBackend implements InferenceBackend {
       pass.setBindGroup(0, bindGroup);
       pass.dispatchWorkgroups(Math.max(1, numGroups));
     };
+    const dispatchGroups2D = (
+      pipeline: GPUComputePipeline,
+      bindGroup: GPUBindGroup,
+      groupsX: number,
+      groupsY: number,
+    ): void => {
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.dispatchWorkgroups(Math.max(1, groupsX), Math.max(1, groupsY));
+    };
     const dispatch = dispatchThreads;
 
     // Embed lookup → h0.
@@ -1345,8 +1428,9 @@ export class WebGpuBackend implements InferenceBackend {
       );
 
       // Q/K/V projections read fp16 normed1 directly via the fp16-in
-      // matmul variant — saves one cast dispatch per layer plus the
-      // corresponding T * D f32 write + read.
+      // matmul variant. Tiled dispatch: each workgroup writes a
+      // 4 (T) × 64 (N) tile, amortizing the int4 weight decode across
+      // four T rows.
       const runMatmulFp16F16 = (
         weightsBase: string,
         xBuf: GPUBuffer,
@@ -1369,7 +1453,9 @@ export class WebGpuBackend implements InferenceBackend {
             { binding: 6, resource: { buffer: yBuf } },
           ],
         });
-        dispatch(this.pipelines!.matmulFp16F16, bg, T * N);
+        const xGroups = Math.ceil(N / 64);
+        const yGroups = Math.ceil(T / 4);
+        dispatchGroups2D(this.pipelines!.matmulFp16F16, bg, xGroups, yGroups);
       };
       runMatmulFp16F16(`layers.${L}.attn.q_proj`, scratch.normed1, scratch.qBuf, Hq * hd, D);
       runMatmulFp16F16(`layers.${L}.attn.k_proj`, scratch.normed1, scratch.kBuf, Hkv * hd, D);
@@ -1516,7 +1602,7 @@ export class WebGpuBackend implements InferenceBackend {
         const ws = this.weights.get(`layers.${L}.experts.gate_up.scales`)!;
         const wz = this.weights.get(`layers.${L}.experts.gate_up.zp`)!;
         const wb = this.weights.get(`layers.${L}.experts.gate_up.bias`)!;
-        dispatch(
+        dispatchGroups2D(
           this.pipelines.qmoeGateUp,
           device.createBindGroup({
             layout: this.bgls.qmoeGateUp,
@@ -1531,7 +1617,8 @@ export class WebGpuBackend implements InferenceBackend {
               { binding: 7, resource: { buffer: scratch.gateUp } },
             ],
           }),
-          T * Kpick * 2 * dff,
+          T * Kpick,
+          Math.ceil((2 * dff) / 64),
         );
       }
 

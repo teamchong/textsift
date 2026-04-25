@@ -19,6 +19,7 @@ import type {
 import { modelForward, type ModelConfig, type ModelWeights } from "../inference/model.js";
 import type { BlockWeights } from "../inference/block.js";
 import { parseOnnxGraph, resolveTensorBytes } from "../model/onnx-reader.js";
+import { fetchBytesCached } from "../model/opfs-fetch.js";
 import { PII_WASM_BYTES } from "./pii-wasm-inline.js";
 
 /** Exports declared in `src/zig/wasm_exports.zig`. Keep in sync. */
@@ -246,12 +247,10 @@ export async function loadOnnxWeights(
   const graphUrl = `${base}onnx/model_q4f16.onnx`;
   const dataUrl = `${base}onnx/model_q4f16.onnx_data`;
 
-  const fetchBuf = async (url: string): Promise<ArrayBuffer> => {
-    const r = await fetch(url);
-    if (!r.ok) throw new Error(`loadOnnxWeights: fetch ${url} → ${r.status} ${r.statusText}`);
-    return r.arrayBuffer();
-  };
-  const [graphBuf, dataBuf] = await Promise.all([fetchBuf(graphUrl), fetchBuf(dataUrl)]);
+  const [graphBuf, dataBuf] = await Promise.all([
+    fetchBytesCached(graphUrl),
+    fetchBytesCached(dataUrl),
+  ]);
   const graph = parseOnnxGraph(new Uint8Array(graphBuf));
   const extData = new Uint8Array(dataBuf);
 

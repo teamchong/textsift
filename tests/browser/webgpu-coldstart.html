@@ -1,0 +1,72 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>pii-wasm — WebGPU cold-start breakdown</title>
+  </head>
+  <body>
+    <pre id="out">starting</pre>
+    <script type="module">
+      // Times each sub-step of warmup. Runs one create from cold page
+      // load (browser cache may or may not be warm depending on prior
+      // visits), then reports:
+      //   ModelLoader.load:  fetch config.json + calibration.json
+      //   WebGpuBackend.warmup:
+      //     requestAdapter + requestDevice
+      //     ONNX fetch (graph + data)
+      //     parseOnnxGraph
+      //     weight upload loop
+      //     pipeline compile
+      import { WebGpuBackend, ModelLoader } from "/dist/index.js";
+
+      const $out = document.getElementById("out");
+      const log = (m) => { $out.textContent += "\n" + m; };
+
+      try {
+        if (!navigator.gpu) throw new Error("navigator.gpu not available");
+
+        const t0 = performance.now();
+        const loader = new ModelLoader({ source: "openai/privacy-filter" });
+        const bundle = await loader.load();
+        const tBundle = performance.now() - t0;
+        log(`ModelLoader.load: ${tBundle.toFixed(0)}ms`);
+
+        async function run(label) {
+          const t1 = performance.now();
+          const gpu = new WebGpuBackend({ bundle, quantization: "int4", device: "auto" });
+          await gpu.warmup();
+          const tWarmup = performance.now() - t1;
+          log(`${label}: ${tWarmup.toFixed(0)}ms`);
+          const timings = gpu.warmupTimings;
+          if (timings) {
+            log(`  adapter:        ${timings.adapterMs.toFixed(0)}ms`);
+            log(`  device:         ${timings.deviceMs.toFixed(0)}ms`);
+            log(`  onnx fetch:     ${timings.onnxFetchMs.toFixed(0)}ms`);
+            log(`  onnx parse:     ${timings.onnxParseMs.toFixed(0)}ms`);
+            log(`  weight upload:  ${timings.weightUploadMs.toFixed(0)}ms`);
+            log(`  pipeline compile: ${timings.pipelineCompileMs.toFixed(0)}ms`);
+          }
+          gpu.dispose();
+          return { warmupMs: tWarmup, timings };
+        }
+
+        const cold = await run("first warmup (cold)");
+        const warm = await run("second warmup (cache API hit)");
+
+        const tTotal = performance.now() - t0;
+        log(`total: ${tTotal.toFixed(0)}ms`);
+
+        window.__result = {
+          ok: true,
+          bundleMs: tBundle,
+          cold, warm,
+          totalMs: tTotal,
+        };
+      } catch (e) {
+        window.__result = { ok: false, error: String(e), stack: e.stack };
+        log("ERROR: " + e);
+        throw e;
+      }
+    </script>
+  </body>
+</html>

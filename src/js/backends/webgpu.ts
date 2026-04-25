@@ -29,6 +29,7 @@ import type {
   Logits,
 } from "./abstract.js";
 import { parseOnnxGraph, resolveTensorBytes } from "../model/onnx-reader.js";
+import { fetchBytesCached } from "../model/opfs-fetch.js";
 import { buildRopeTables } from "../inference/rope.js";
 
 // ---------- tensor record ----------
@@ -1093,6 +1094,16 @@ const PF_CONFIG = {
 
 // ---------- backend ----------
 
+export interface WebGpuWarmupTimings {
+  adapterMs: number;
+  deviceMs: number;
+  onnxFetchMs: number;
+  onnxParseMs: number;
+  weightUploadMs: number;
+  pipelineCompileMs: number;
+  totalMs: number;
+}
+
 export class WebGpuBackend implements InferenceBackend {
   readonly name = "webgpu" as const;
   private device: GPUDevice | null = null;
@@ -1103,6 +1114,8 @@ export class WebGpuBackend implements InferenceBackend {
   private numLayers = 0;
   private numExperts = 0;
   private vocabSize = 0;
+  /** Populated by `warmup()`. `null` until warmup completes. */
+  warmupTimings: WebGpuWarmupTimings | null = null;
   private readonly opts: WebGpuBackendOptions;
 
   constructor(opts: WebGpuBackendOptions) {
@@ -1113,6 +1126,8 @@ export class WebGpuBackend implements InferenceBackend {
     if (typeof navigator === "undefined" || !navigator.gpu) {
       throw new Error("WebGpuBackend: navigator.gpu not available");
     }
+    const tStart = performance.now();
+    const tA0 = performance.now();
     const adapter = await navigator.gpu.requestAdapter({
       powerPreference: "high-performance",
     });
@@ -1122,6 +1137,9 @@ export class WebGpuBackend implements InferenceBackend {
         "WebGpuBackend: adapter lacks shader-f16; caller should fall back to the wasm backend",
       );
     }
+    const adapterMs = performance.now() - tA0;
+
+    const tD0 = performance.now();
     const device = await adapter.requestDevice({
       requiredFeatures: ["shader-f16"],
       requiredLimits: {
@@ -1138,6 +1156,7 @@ export class WebGpuBackend implements InferenceBackend {
         ),
       },
     });
+    const deviceMs = performance.now() - tD0;
     // Surface any WebGPU validation or OOM errors as console errors so the
     // caller's diagnostics pick them up — WGSL is tricky enough that we
     // want every uncapturedevent visible.
@@ -1147,15 +1166,35 @@ export class WebGpuBackend implements InferenceBackend {
     });
     this.device = device;
 
-    this.weights = await loadOnnxWeightsGpu(device, this.opts.bundle.modelSource);
+    // Pipeline compile + weight upload are independent and both slow.
+    // Overlap them: BGLs + pipeline compile run in parallel with the
+    // ONNX fetch + parse + GPU buffer upload chain.
+    this.bgls = createBindGroupLayouts(device);
+    const tP0 = performance.now();
+    const pipelinesPromise = createPipelines(device, this.bgls).then((p) => {
+      const pipelineCompileMs = performance.now() - tP0;
+      return { pipelines: p, pipelineCompileMs };
+    });
+    const weightsBreakdown = await loadOnnxWeightsGpuTimed(device, this.opts.bundle.modelSource);
+    this.weights = weightsBreakdown.weights;
+    const { pipelines, pipelineCompileMs } = await pipelinesPromise;
+    this.pipelines = pipelines;
+
     this.numLayers = detectNumLayers(this.weights);
     this.vocabSize = this.weights.get("embed.int4")!.shape[0]!;
     const routerInt4 = this.weights.get("layers.0.router.int4");
     if (!routerInt4) throw new Error("WebGpuBackend: missing router weights");
     this.numExperts = routerInt4.shape[0]!;
 
-    this.bgls = createBindGroupLayouts(device);
-    this.pipelines = await createPipelines(device, this.bgls);
+    this.warmupTimings = {
+      adapterMs,
+      deviceMs,
+      onnxFetchMs: weightsBreakdown.fetchMs,
+      onnxParseMs: weightsBreakdown.parseMs,
+      weightUploadMs: weightsBreakdown.uploadMs,
+      pipelineCompileMs,
+      totalMs: performance.now() - tStart,
+    };
   }
 
   async forward(
@@ -1964,15 +2003,18 @@ function detectNumLayers(map: ReadonlyMap<string, GpuTensor>): number {
 
 // ---------- weight upload ----------
 
-/**
- * Parse the ONNX graph + external data, convert each tensor into the
- * dtype/layout our WGSL kernels expect, and upload as a storage buffer.
- * Scales/zp/int4 layouts match the WASM path byte-for-byte.
- */
-async function loadOnnxWeightsGpu(
+interface WeightsBreakdown {
+  weights: Map<string, GpuTensor>;
+  fetchMs: number;
+  parseMs: number;
+  uploadMs: number;
+}
+
+async function loadOnnxWeightsGpuTimed(
   device: GPUDevice,
   modelSource: string,
-): Promise<Map<string, GpuTensor>> {
+): Promise<WeightsBreakdown> {
+  const tF0 = performance.now();
   const base = modelSource.endsWith("/") ? modelSource : `${modelSource}/`;
   const graphUrl = `${base}onnx/model_q4f16.onnx`;
   const dataUrl = `${base}onnx/model_q4f16.onnx_data`;
@@ -1980,8 +2022,30 @@ async function loadOnnxWeightsGpu(
     fetchBytes(graphUrl),
     fetchBytes(dataUrl),
   ]);
+  const fetchMs = performance.now() - tF0;
+
+  const tP0 = performance.now();
   const graph = parseOnnxGraph(new Uint8Array(graphBytes));
   const extData = new Uint8Array(extBytes);
+  const parseMs = performance.now() - tP0;
+
+  const tU0 = performance.now();
+  const weights = uploadWeights(device, graph, extData);
+  const uploadMs = performance.now() - tU0;
+
+  return { weights, fetchMs, parseMs, uploadMs };
+}
+
+/**
+ * Parse the ONNX graph + external data, convert each tensor into the
+ * dtype/layout our WGSL kernels expect, and upload as a storage buffer.
+ * Scales/zp/int4 layouts match the WASM path byte-for-byte.
+ */
+function uploadWeights(
+  device: GPUDevice,
+  graph: ReturnType<typeof parseOnnxGraph>,
+  extData: Uint8Array,
+): Map<string, GpuTensor> {
 
   const out = new Map<string, GpuTensor>();
 
@@ -2130,11 +2194,7 @@ async function loadOnnxWeightsGpu(
   return out;
 }
 
-async function fetchBytes(url: string): Promise<ArrayBuffer> {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`loadOnnxWeightsGpu: fetch ${url} → ${r.status} ${r.statusText}`);
-  return r.arrayBuffer();
-}
+const fetchBytes = fetchBytesCached;
 
 const _cvBuf = new ArrayBuffer(4);
 const _cvU32 = new Uint32Array(_cvBuf);

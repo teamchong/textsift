@@ -98,12 +98,39 @@
         wasm.dispose();
         gpu.dispose();
 
+        // Second-visit cold start: dispose + recreate each backend.
+        // All persistent caches (tjs's Cache API, our OPFS) should be
+        // populated from the first round, so the only cost is parse +
+        // pipeline compile + GPU upload (or WASM memory pin).
+        log("\nsecond-visit cold start:");
+        const tjs2t0 = performance.now();
+        const tjs2 = await PrivacyFilter.create({});
+        const tjsWarmup2 = performance.now() - tjs2t0;
+        log(`  transformers.js: ${tjsWarmup2.toFixed(0)}ms`);
+
+        const wasm2t0 = performance.now();
+        const wasm2 = await PrivacyFilter.create({ backend: "wasm" });
+        const wasmWarmup2 = performance.now() - wasm2t0;
+        log(`  wasm:            ${wasmWarmup2.toFixed(0)}ms`);
+
+        const gpu2t0 = performance.now();
+        const gpu2 = await PrivacyFilter.create({ backend: "webgpu" });
+        const gpuWarmup2 = performance.now() - gpu2t0;
+        log(`  webgpu:          ${gpuWarmup2.toFixed(0)}ms`);
+
+        tjs2.dispose();
+        wasm2.dispose();
+        gpu2.dispose();
+
         window.__result = {
           ok: true,
           hasWebGPU,
           tjsWarmupMs: tjsWarmup,
           wasmWarmupMs: wasmWarmup,
           gpuWarmupMs: gpuWarmup,
+          tjsWarmup2Ms: tjsWarmup2,
+          wasmWarmup2Ms: wasmWarmup2,
+          gpuWarmup2Ms: gpuWarmup2,
           rows,
         };
         log("\ndone");

@@ -34,10 +34,9 @@ test("e2e perf bench vs transformers.js default", async ({ page }) => {
 
   console.log("\n--- browser perf bench ---");
   console.log(
-    `WebGPU: ${result.hasWebGPU}  ` +
-      `tjs warmup=${result.tjsWarmupMs.toFixed(0)}ms  ` +
-      `wasm warmup=${result.wasmWarmupMs.toFixed(0)}ms  ` +
-      `gpu warmup=${result.gpuWarmupMs.toFixed(0)}ms`,
+    `WebGPU: ${result.hasWebGPU}\n` +
+      `  first-visit warmup:   tjs=${result.tjsWarmupMs.toFixed(0)}ms  wasm=${result.wasmWarmupMs.toFixed(0)}ms  gpu=${result.gpuWarmupMs.toFixed(0)}ms\n` +
+      `  second-visit warmup:  tjs=${result.tjsWarmup2Ms.toFixed(0)}ms  wasm=${result.wasmWarmup2Ms.toFixed(0)}ms  gpu=${result.gpuWarmup2Ms.toFixed(0)}ms`,
   );
   console.log(
     `  ${"text".padEnd(40)} ` +

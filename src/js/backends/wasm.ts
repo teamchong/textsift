@@ -633,11 +633,21 @@ export class WasmBackend implements InferenceBackend {
     if (useMt) {
       const D = PF_CONFIG.hiddenSize;
       const dff = PF_CONFIG.intermediateSize;
-      // 6-thread default — sweep on M-series shows the sweet spot at 6
-      // (T=32: 4t=93ms, 6t=74ms; T=128: 4t=315ms, 6t=258ms). 8 threads
-      // regresses, likely from E-core contention competing with the
-      // main thread. Cap at hardwareConcurrency-1 so the main thread
-      // always has at least one core.
+      // Default thread count caps at 6. Sweeps on Apple Silicon
+      // (M2 8-core, M3 Pro 10-core) show 6 is the sweet spot on both
+      // — it matches the P-core count, and going past it hits the
+      // E-core / main-thread contention cliff (M3 Pro at 32 tokens:
+      // 6t=76 ms, 7t=89 ms, 8t=91 ms, 10t=80 ms — non-monotonic
+      // because the OS reshuffles workers off E-cores at higher
+      // counts). We don't have an API to detect P vs E cores, so
+      // we err toward a heuristic that works well on Macs (the
+      // common dev/laptop target) and let server users override
+      // explicitly via the `numThreads` option:
+      //
+      //   const filter = await PrivacyFilter.create({
+      //     backend: "wasm",
+      //     numThreads: 16,  // use all cores on this 32-core box
+      //   });
       const cores = (typeof navigator !== "undefined" ? navigator.hardwareConcurrency : 4) || 4;
       const desired = this.opts.numThreads ??
         Math.max(2, Math.min(6, cores - 1));

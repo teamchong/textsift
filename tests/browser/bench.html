@@ -76,6 +76,22 @@
         return med;
       }
 
+      // Sustained-load throughput: process N independent forwards
+      // back-to-back, report sequences/sec and tokens/sec. Single-
+      // forward latency is what one user feels; throughput is what
+      // a batch processor or AI proxy sees.
+      const THROUGHPUT_ITERS = 30;
+      async function measureThroughput(label, filter, text, approxTokens) {
+        for (let i = 0; i < WARMUP; i++) await filter.detect(text);
+        const t0 = performance.now();
+        for (let i = 0; i < THROUGHPUT_ITERS; i++) await filter.detect(text);
+        const elapsed = performance.now() - t0;
+        const seqPerSec = (THROUGHPUT_ITERS / elapsed) * 1000;
+        const tokPerSec = seqPerSec * approxTokens;
+        log(`  ${label.padEnd(18)} ${seqPerSec.toFixed(1)} seq/s, ${tokPerSec.toFixed(0)} tok/s (${THROUGHPUT_ITERS} iters in ${elapsed.toFixed(0)}ms)`);
+        return { seqPerSec, tokPerSec };
+      }
+
       try {
         const hasWebGPU = !!navigator.gpu;
         log(`WebGPU available: ${hasWebGPU}`);
@@ -99,16 +115,29 @@
         log("warmup done");
 
         const rows = [];
-        for (const text of SEEDS) {
-          log(`\ntext: "${text.slice(0, 60)}${text.length > 60 ? "…" : ""}"`);
+        // Approximate token counts for the throughput rows. Tokenizer
+        // gives the real number; rough char/4 is close enough for
+        // reporting tok/s.
+        const APPROX_TOKENS = [7, 25, 80];
+        for (let si = 0; si < SEEDS.length; si++) {
+          const text = SEEDS[si];
+          const approxTokens = APPROX_TOKENS[si];
+          log(`\ntext: "${text.slice(0, 60)}${text.length > 60 ? "…" : ""}" (~${approxTokens} tokens)`);
+          log(`  -- latency (median of ${ITERS}) --`);
           const tjsMs = await measure("transformers.js", tjs, text);
           const wasmMs = await measure("wasm (core)", wasm, text);
           const gpuMs = await measure("webgpu (core)", gpu, text);
+          log(`  -- throughput (${THROUGHPUT_ITERS}-forward sustained) --`);
+          const tjsTp = await measureThroughput("transformers.js", tjs, text, approxTokens);
+          const wasmTp = await measureThroughput("wasm (core)", wasm, text, approxTokens);
+          const gpuTp = await measureThroughput("webgpu (core)", gpu, text, approxTokens);
           rows.push({
             text: text.slice(0, 80),
+            approxTokens,
             tjsMs, wasmMs, gpuMs,
-            wasmSpeedup: tjsMs / wasmMs,
-            gpuSpeedup: tjsMs / gpuMs,
+            tjsTokPerSec: tjsTp.tokPerSec,
+            wasmTokPerSec: wasmTp.tokPerSec,
+            gpuTokPerSec: gpuTp.tokPerSec,
           });
         }
 

@@ -9,13 +9,29 @@ These numbers will look different on your hardware. They're a snapshot, not a gu
 
 ## Per-forward latency
 
+Median of 5 samples after 2 warmup iterations.
+
 | Input length | textsift (WebGPU) | textsift (WASM MT) | tjs (WebGPU default) |
 |---|---:|---:|---:|
-| ~7 tokens | 7.6 ms | 28.5 ms | 30.8 ms |
-| ~25 tokens | 11.6 ms | 46.7 ms | 38.4 ms |
-| ~80 tokens | 22.2 ms | 97.9 ms | 56.3 ms |
+| ~7 tokens | **8.9 ms** | 29.0 ms | 32.7 ms |
+| ~25 tokens | **11.8 ms** | 44.6 ms | 38.5 ms |
+| ~80 tokens | **22.0 ms** | 95.9 ms | 56.4 ms |
 
-Both WebGPU paths are GPU-bound at this model size; the differential reflects the kernels (textsift's hand-tuned int4 matmul / banded attention vs ORT-Web's int4 implementation via WebGPU contrib ops). WASM-MT (6-worker pool, COOP/COEP headers) keeps pace with tjs on short inputs and falls behind by ~1.7× on the 80-token sample, where ORT-Web's WebGPU dispatch wins. Single-thread WASM is roughly 4× slower than MT.
+textsift's WebGPU is **2.6–3.7× faster than transformers.js across every input length**, with the largest gap on shorter inputs where ORT-Web's per-dispatch overhead is more visible. The differential reflects the kernels (textsift's hand-tuned int4 matmul / banded attention vs ORT-Web's int4 contrib ops).
+
+WASM-MT (6-worker pool, COOP/COEP headers) keeps pace with tjs on short inputs and falls ~1.7× behind on the 80-token sample. Note this is comparing CPU SIMD against tjs's GPU path — tjs has no working WASM path for this 770 MB q4f16 model (its WASM CPU backend doesn't implement MatMulNBits + GatherBlockQuantized), so textsift WASM is the only working CPU option here.
+
+## Sustained throughput
+
+30-forward sequential loop; tokens/sec includes per-call overhead.
+
+| Input length | textsift (WebGPU) | textsift (WASM MT) | tjs (WebGPU default) |
+|---|---:|---:|---:|
+| ~7 tokens | **801 tok/s** | 249 tok/s | 249 tok/s |
+| ~25 tokens | **2068 tok/s** | 558 tok/s | 644 tok/s |
+| ~80 tokens | **3644 tok/s** | 840 tok/s | 1396 tok/s |
+
+Same 2.6–3.2× lead. Neither engine pipelines forwards (each `await detect()` blocks on the previous), so throughput ≈ 1/latency × tokens.
 
 ## Cold start
 

@@ -14,7 +14,10 @@ export default defineConfig({
     contextOptions: { bypassCSP: true },
   },
   webServer: {
-    command: "python3 -m http.server 8123",
+    // Custom server adds Cross-Origin-Opener-Policy: same-origin and
+    // Cross-Origin-Embedder-Policy: require-corp so SharedArrayBuffer
+    // is available — required for the multi-threaded WASM backend.
+    command: "python3 scripts/serve-coi.py 8123",
     url: "http://localhost:8123/dist/pii.wasm",
     reuseExistingServer: !process.env.CI,
     cwd: ".",

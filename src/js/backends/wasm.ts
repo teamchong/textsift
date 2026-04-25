@@ -17,6 +17,9 @@ import type {
   Logits,
 } from "./abstract.js";
 import { modelForward, type ModelConfig, type ModelWeights } from "../inference/model.js";
+import { MtPool } from "../inference/mt-pool.js";
+import type { MultiThreadContext } from "../inference/expert.js";
+import type { WorkerScratch } from "../inference/mt-expert.js";
 import type { BlockWeights } from "../inference/block.js";
 import { parseOnnxGraph, resolveTensorBytes } from "../model/onnx-reader.js";
 import { fetchBytesCached } from "../model/opfs-fetch.js";
@@ -468,6 +471,24 @@ export interface WasmBackendOptions extends BackendConstructionOptions {
    * alternative .wasm build separately.
    */
   wasmModuleUrl?: string | URL;
+  /**
+   * Multi-thread mode (experimental).
+   *   "off" (default) — single-thread, no workers.
+   *   "auto" — use multi-threaded WASM if SharedArrayBuffer is
+   *     available; otherwise fall back to single-thread. Currently
+   *     produces small numeric drift (~0.01 per element) vs the
+   *     single-thread reference; opt in only after validating against
+   *     your input distribution.
+   *   "force" — fail loudly if SAB isn't available.
+   */
+  multiThread?: "auto" | "off" | "force";
+  /**
+   * Number of worker threads when multi-thread is enabled. Defaults to
+   * `navigator.hardwareConcurrency` clamped to [2, 4]. Higher counts
+   * have diminishing returns past the model's natural parallelism
+   * (T_chunk per worker shrinks).
+   */
+  numThreads?: number;
 }
 
 function weightByName(map: ReadonlyMap<string, WeightTensorInfo>, name: string): WeightTensorInfo {
@@ -532,24 +553,61 @@ function buildModelWeights(
   };
 }
 
+/**
+ * Per-worker scratch capacity, sized for `MAX_T` tokens at 4
+ * experts-per-token (the model's K). Each worker can therefore handle
+ * up to `MAX_T / numThreads` token rows in its slice.
+ */
+const MAX_T = 2048;
+const MAX_M_PER_WORKER = MAX_T;
+
 export class WasmBackend implements InferenceBackend {
   readonly name = "wasm" as const;
   private wasm: PiiWasmExports | null = null;
   private weightMap: Map<string, WeightTensorInfo> | null = null;
   private modelWeights: ModelWeights | null = null;
   private numExpertsInBlob = 0;
+  /** Multi-thread mode plumbing. Null when running single-threaded. */
+  private mtPool: MtPool | null = null;
+  private mtScratch: WorkerScratch[] | null = null;
+  private mtAccPtr = 0;
   private readonly opts: WasmBackendOptions;
 
   constructor(opts: WasmBackendOptions) {
     this.opts = opts;
   }
 
+  /** Reflects the actual mode after `warmup()`. */
+  get threadingMode(): "single" | "multi" {
+    return this.mtPool ? "multi" : "single";
+  }
+
   async warmup(): Promise<void> {
-    // If the caller provides an explicit URL, fetch from there (useful
-    // if they want to host a different .wasm build). Otherwise use the
-    // bytes baked into the bundle — saves one round trip and avoids
-    // the `new URL(..., import.meta.url)` resolution quirk.
-    this.wasm = await loadPiiWasm(this.opts.wasmModuleUrl);
+    const mtRequest = this.opts.multiThread ?? "off";
+    const supported = sharedMemorySupported();
+    const useMt = mtRequest === "force" || (mtRequest === "auto" && supported);
+    if (mtRequest === "force" && !supported) {
+      throw new Error(
+        "WasmBackend: multiThread:'force' requested but SharedArrayBuffer is not " +
+          "available (in browsers, the page must be served with " +
+          "Cross-Origin-Opener-Policy: same-origin and " +
+          "Cross-Origin-Embedder-Policy: require-corp)",
+      );
+    }
+
+    if (useMt) {
+      // Pre-create a SAB-backed memory big enough for ~770 MB weights
+      // plus per-forward scratch. Overshoot defensively; the host only
+      // commits pages on first touch.
+      const memory = new WebAssembly.Memory({
+        initial: 24576, // 1.5 GB
+        maximum: 32768, // 2 GB hard cap (WASM32 limit)
+        shared: true,
+      });
+      this.wasm = await loadPiiWasmShared(memory);
+    } else {
+      this.wasm = await loadPiiWasm(this.opts.wasmModuleUrl);
+    }
 
     const echoed = this.wasm.echo(42);
     if (echoed !== 42) {
@@ -559,14 +617,47 @@ export class WasmBackend implements InferenceBackend {
     this.weightMap = await loadOnnxWeights(this.wasm, this.opts.bundle.modelSource);
     const numLayers = detectNumLayers(this.weightMap);
     this.modelWeights = buildModelWeights(this.weightMap, numLayers);
-    // numExperts comes from the router's output dim (first shape axis).
     this.numExpertsInBlob = this.modelWeights.blocks[0]!.router.int4.shape[0]!;
 
-    // Prefill: run one dummy forward so V8 JITs every hot-path kernel
-    // and the bump heap hits its steady-state size. Amortizes that
-    // cost out of the user's first real request. T chosen small enough
-    // to keep warmup fast but large enough that the TR-tiled matmul
-    // path (TR=4) is actually exercised.
+    if (useMt) {
+      const D = PF_CONFIG.hiddenSize;
+      const dff = PF_CONFIG.intermediateSize;
+      const desired = this.opts.numThreads ??
+        Math.max(2, Math.min(4,
+          (typeof navigator !== "undefined" ? navigator.hardwareConcurrency : 4) || 4));
+
+      // Allocate per-worker scratch + the f32 MoE accumulator BEFORE
+      // marking the heap, so `reset()` after each forward keeps them.
+      this.mtScratch = [];
+      const M = MAX_M_PER_WORKER;
+      for (let w = 0; w < desired; w++) {
+        const xGatheredPtr = this.wasm.alloc(M * D * 4);
+        const gateUpPtr   = this.wasm.alloc(M * 2 * dff * 4);
+        const gluPtr      = this.wasm.alloc(M * dff * 4);
+        const outF32Ptr   = this.wasm.alloc(M * D * 4);
+        const tokIdxPtr   = this.wasm.alloc(M * 4);
+        const weightsPtr  = this.wasm.alloc(M * 4);
+        if (!xGatheredPtr || !gateUpPtr || !gluPtr || !outF32Ptr || !tokIdxPtr || !weightsPtr) {
+          throw new Error(`WasmBackend: OOM allocating worker scratch (worker ${w})`);
+        }
+        this.mtScratch.push({ xGatheredPtr, gateUpPtr, gluPtr, outF32Ptr, tokIdxPtr, weightsPtr });
+      }
+      // Shared MoE accumulator across all workers. Tokens are
+      // partitioned by index range so writes are disjoint.
+      this.mtAccPtr = this.wasm.alloc(MAX_T * D * 4);
+      if (!this.mtAccPtr) throw new Error("WasmBackend: OOM allocating MoE accumulator");
+      // Re-mark the heap so subsequent `reset()` calls (one per
+      // forward) preserve the worker scratch + accumulator. The mark
+      // only moves up, so calling it again is safe even though
+      // loadOnnxWeights already called it past the weight blob.
+      this.wasm.heap_mark_now();
+
+      this.mtPool = new MtPool(this.wasm.memory, desired);
+      await this.mtPool.warmup();
+    }
+
+    // Prefill: one dummy forward so V8 JITs everything + heap reaches
+    // steady state. Done after pool init so the MT path is also warmed.
     const warmupTokens = new Int32Array(WARMUP_T);
     const dummyMask = new Uint8Array(WARMUP_T).fill(1);
     await this.forward(warmupTokens, dummyMask);
@@ -610,12 +701,15 @@ export class WasmBackend implements InferenceBackend {
       }
     }
 
-    modelForward(wasm, idsPtr, logitsPtr, this.modelWeights, {
+    const mt: MultiThreadContext | undefined = (this.mtPool && this.mtScratch)
+      ? { pool: this.mtPool, workerScratch: this.mtScratch, accPtr: this.mtAccPtr }
+      : undefined;
+    await modelForward(wasm, idsPtr, logitsPtr, this.modelWeights, {
       ...PF_CONFIG,
       vocabSize,
       numExperts: this.numExpertsInBlob,
       numExpertsInBlob: this.numExpertsInBlob,
-    }, T, maskPtr);
+    }, T, maskPtr, mt);
 
     // Upcast fp16 → f32 for the backend contract.
     const fp16View = new Uint16Array(wasm.memory.buffer, logitsPtr, T * PF_CONFIG.numClasses);
@@ -649,6 +743,9 @@ export class WasmBackend implements InferenceBackend {
   }
 
   dispose(): void {
+    this.mtPool?.dispose();
+    this.mtPool = null;
+    this.mtScratch = null;
     this.wasm?.reset();
     this.wasm = null;
     this.weightMap = null;

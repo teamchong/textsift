@@ -27,6 +27,11 @@
  */
 
 import type { PiiWasmExports, WeightTensorInfo } from "../backends/wasm.js";
+import type { MtPool } from "./mt-pool.js";
+import {
+  expertDispatchParallel,
+  type WorkerScratch,
+} from "./mt-expert.js";
 
 export interface ExpertWeights {
   /** uint4 packed, shape [E, 2*d_ff, d_model/2]. */
@@ -83,7 +88,20 @@ function expertBiasPointer(tensor: WeightTensorInfo, expertIdx: number): number 
   return tensor.dataOffset + expertIdx * N * 2;
 }
 
-export function expertDispatch(
+/**
+ * Multi-thread plumbing the dispatcher accepts when running under
+ * `MtPool`. When set, expert dispatch is partitioned across workers
+ * by token slice; each worker runs its own expert-major loop on
+ * disjoint output rows.
+ */
+export interface MultiThreadContext {
+  pool: MtPool;
+  workerScratch: readonly WorkerScratch[];
+  /** Pre-allocated f32 [T, D] accumulator in shared memory. */
+  accPtr: number;
+}
+
+export async function expertDispatch(
   wasm: PiiWasmExports,
   /** f32 [T, D]; the caller has already widened hidden from fp16. */
   hiddenF32Ptr: number,
@@ -93,7 +111,15 @@ export function expertDispatch(
   weights: ExpertWeights,
   config: ExpertConfig,
   T: number,
-): void {
+  mt?: MultiThreadContext,
+): Promise<void> {
+  if (mt) {
+    return expertDispatchParallel(
+      mt.pool, wasm, hiddenF32Ptr, outputPtr,
+      routingIndicesPtr, routingScoresPtr,
+      weights, config, T, mt.workerScratch, mt.accPtr,
+    );
+  }
   const { hiddenSize: D, intermediateSize: dff, numExperts: E, numExpertsPerTok: K } = config;
 
   // Build inverse routing: for each expert, list of (token, k-position) pairs.

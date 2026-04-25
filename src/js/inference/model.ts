@@ -14,6 +14,7 @@
 
 import type { Int4BlockWeight, PiiWasmExports, WeightTensorInfo } from "../backends/wasm.js";
 import { blockForward, type BlockWeights, type BlockConfig } from "./block.js";
+import type { MultiThreadContext } from "./expert.js";
 import { buildRopeTables, type YarnRopeConfig } from "./rope.js";
 
 export interface ModelWeights {
@@ -46,7 +47,7 @@ export interface ModelConfig extends BlockConfig {
  * token IDs. `logitsPtr` must be a `fp16 [T, num_classes]` buffer owned
  * by the caller. All other scratch is bump-alloc'd.
  */
-export function modelForward(
+export async function modelForward(
   wasm: PiiWasmExports,
   inputIdsPtr: number,
   logitsPtr: number,
@@ -55,7 +56,8 @@ export function modelForward(
   T: number,
   /** Optional `u8 [T]` mask pointer (1=valid, 0=padding). 0 = no mask. */
   maskPtr: number = 0,
-): void {
+  mt?: MultiThreadContext,
+): Promise<void> {
   const D = config.hiddenSize;
 
   // Precompute RoPE tables once for this seq len. All blocks share them.
@@ -79,7 +81,7 @@ export function modelForward(
   let srcPtr = h0Ptr;
   let dstPtr = h1Ptr;
   for (const blockWeights of weights.blocks) {
-    blockForward(wasm, srcPtr, dstPtr, blockWeights, tables, config, T, maskPtr);
+    await blockForward(wasm, srcPtr, dstPtr, blockWeights, tables, config, T, maskPtr, mt);
     const tmp = srcPtr;
     srcPtr = dstPtr;
     dstPtr = tmp;

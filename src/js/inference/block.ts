@@ -17,7 +17,7 @@
 
 import type { Int4BlockWeight, PiiWasmExports, WeightTensorInfo } from "../backends/wasm.js";
 import { attentionForward, type AttentionWeights, type AttentionConfig, type AttentionTables } from "./attention.js";
-import { expertDispatch, type ExpertWeights, type ExpertConfig } from "./expert.js";
+import { expertDispatch, type ExpertWeights, type ExpertConfig, type MultiThreadContext } from "./expert.js";
 
 export interface BlockWeights {
   inputLayernorm: WeightTensorInfo;           // fp16 [D]
@@ -73,7 +73,7 @@ export function routerForward(
  * Full transformer block: norms → attention → residual → MoE → residual.
  * Sole production entry point called by `modelForward`.
  */
-export function blockForward(
+export async function blockForward(
   wasm: PiiWasmExports,
   inputPtr: number,
   outputPtr: number,
@@ -82,7 +82,8 @@ export function blockForward(
   config: BlockConfig,
   T: number,
   maskPtr: number = 0,
-): void {
+  mt?: MultiThreadContext,
+): Promise<void> {
   const D = config.hiddenSize;
   const K = config.numExpertsPerTok;
 
@@ -124,11 +125,12 @@ export function blockForward(
   );
 
   const moeOutPtr = wasm.alloc(T * D * 2);
-  expertDispatch(
+  await expertDispatch(
     wasm, normed2F32Ptr, moeOutPtr, routingIdxPtr, routingScoresPtr,
     weights.experts,
     { ...config, numExperts: config.numExpertsInBlob },
     T,
+    mt,
   );
 
   wasm.add_fp16(residual2Ptr, moeOutPtr, outputPtr, T * D);

@@ -19,13 +19,32 @@
       }
     </script>
     <script type="module">
-      // Run both backends in a real browser; measure warm-forward
-      // medians at several T. Playwright reads window.__result.
+      // Run all three backends in a real browser and report:
+      //   - first-visit cold start (model download dominates the first
+      //     backend; subsequent backends benefit from browser HTTP cache
+      //     or our OPFS cache, so order matters — we run tjs first to
+      //     give it the worst-case position)
+      //   - second-visit cold start (caches populated; only parse +
+      //     compile + GPU upload remains)
+      //   - steady-state inference median across several text lengths
       //
-      // Both backends fetch the same `onnx/model_q4f16.onnx` from
-      // `modelSource`. First run hits HF Hub; second run is served
-      // from the browser's HTTP cache.
-      import { PrivacyFilter } from "/packages/textsift/dist/index.js";
+      // Original/baseline = `transformers.js` running the same
+      // openai/privacy-filter ONNX. Forced via createWithResolver so the
+      // umbrella's auto-WebGPU short-circuit doesn't replace tjs with
+      // our WebGPU backend on machines that have one.
+      import { PrivacyFilter, TransformersJsBackend } from "/packages/textsift/dist/index.js";
+
+      const FORCE_TJS_RESOLVER = {
+        async resolveAuto({ bundle, quantization }) {
+          return new TransformersJsBackend({
+            bundle,
+            quantization,
+            device: "auto",
+          });
+        },
+      };
+      const createTjs = (opts = {}) =>
+        PrivacyFilter.createWithResolver(opts, FORCE_TJS_RESOLVER);
 
       const $out = document.getElementById("out");
       const log = (m) => { $out.textContent += "\n" + m; };
@@ -61,13 +80,13 @@
         const hasWebGPU = !!navigator.gpu;
         log(`WebGPU available: ${hasWebGPU}`);
 
-        // "auto" — textsift umbrella with default options. Resolver
-        // returns null when WebGPU is available, so this delegates to
-        // textsift-core's auto choice (webgpu in browsers). On a
-        // browser without WebGPU it would route to transformers.js.
-        log("auto: create + warmup");
+        // Baseline: transformers.js + ORT Web running the same ONNX.
+        // Forced via resolver so we measure the original path even on
+        // machines with WebGPU (where the umbrella's "auto" would
+        // otherwise pick our WebGPU backend).
+        log("transformers.js (baseline): create + warmup");
         const t0 = performance.now();
-        const tjs = await PrivacyFilter.create({
+        const tjs = await createTjs({
           onProgress: (ev) => {
             if (ev.stage === "download") {
               const pct = ev.total ? Math.round((ev.loaded / ev.total) * 100) : 0;
@@ -78,7 +97,7 @@
           },
         });
         const tjsWarmup = performance.now() - t0;
-        log(`auto ready in ${tjsWarmup.toFixed(0)}ms`);
+        log(`transformers.js ready in ${tjsWarmup.toFixed(0)}ms`);
 
         log("wasm backend: create + warmup");
         const t1 = performance.now();
@@ -99,7 +118,7 @@
         const rows = [];
         for (const text of SEEDS) {
           log(`\ntext: "${text.slice(0, 60)}${text.length > 60 ? "…" : ""}"`);
-          const tjsMs = await measure("auto (umbrella)", tjs, text);
+          const tjsMs = await measure("transformers.js", tjs, text);
           const wasmMs = await measure("wasm (core)", wasm, text);
           const gpuMs = await measure("webgpu (core)", gpu, text);
           rows.push({
@@ -120,7 +139,7 @@
         // pipeline compile + GPU upload (or WASM memory pin).
         log("\nsecond-visit cold start:");
         const tjs2t0 = performance.now();
-        const tjs2 = await PrivacyFilter.create({});
+        const tjs2 = await createTjs({});
         const tjsWarmup2 = performance.now() - tjs2t0;
         log(`  transformers.js: ${tjsWarmup2.toFixed(0)}ms`);
 

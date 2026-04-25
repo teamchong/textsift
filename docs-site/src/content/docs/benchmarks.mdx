@@ -3,19 +3,19 @@ title: Benchmarks
 description: Measured numbers comparing the three backends.
 ---
 
-All numbers measured on an M3 Pro MacBook, Chromium 147 with `--enable-unsafe-webgpu --use-angle=metal`. Median of 5 samples after 2 warmup iterations. Reproduce with the test in `tests/browser/bench.spec.ts`.
+All numbers measured on an M3 Pro MacBook, Chromium 147 with `--enable-unsafe-webgpu --use-angle=metal`. Median of 5 samples after 2 warmup iterations. Reproduce with `tests/browser/bench.spec.ts`. Baseline (`tjs`) is forced via `createWithResolver` so the umbrella's auto-WebGPU short-circuit can't accidentally measure WebGPU twice.
 
 These numbers will look different on your hardware. They're a snapshot, not a guarantee.
 
 ## Per-forward latency
 
-| Input length | textsift (WebGPU) | textsift (WASM ST) | tjs (WebGPU default) |
+| Input length | textsift (WebGPU) | textsift (WASM MT) | tjs (WebGPU default) |
 |---|---:|---:|---:|
-| ~12 tokens | 7 ms | 66 ms | 29 ms |
-| ~25 tokens | 12 ms | 158 ms | 39 ms |
-| ~80 tokens | 25 ms | 342 ms | 57 ms |
+| ~7 tokens | 7.6 ms | 28.5 ms | 30.8 ms |
+| ~25 tokens | 11.6 ms | 46.7 ms | 38.4 ms |
+| ~80 tokens | 22.2 ms | 97.9 ms | 56.3 ms |
 
-Both WebGPU paths are GPU-bound at this model size; the difference reflects the kernels (textsift's hand-tuned int4 matmul / banded attention vs ORT-Web's int4 implementation via WebGPU contrib ops). The WASM single-thread number jumps to ~94 ms at 32 tokens with multi-threading enabled (COOP/COEP headers + 6 worker threads).
+Both WebGPU paths are GPU-bound at this model size; the differential reflects the kernels (textsift's hand-tuned int4 matmul / banded attention vs ORT-Web's int4 implementation via WebGPU contrib ops). WASM-MT (6-worker pool, COOP/COEP headers) keeps pace with tjs on short inputs and falls behind by ~1.7× on the 80-token sample, where ORT-Web's WebGPU dispatch wins. Single-thread WASM is roughly 4× slower than MT.
 
 ## Cold start
 
@@ -23,13 +23,13 @@ This is a default-configuration comparison, not an architectural ceiling.
 
 | | First visit | Second visit |
 |---|---:|---:|
-| tjs (Cache API default) | 13.3 s | 11.2 s |
-| textsift WASM (OPFS default) | 14.1 s | 1.8 s |
-| textsift WebGPU (OPFS default) | 14.1 s | 1.1 s |
+| tjs (Cache API default) | 15.4 s | 12.2 s |
+| textsift WASM (OPFS default) | 15.0 s* | 1.5 s |
+| textsift WebGPU (OPFS default) | 2.2 s* | 1.9 s |
 
-First visit is download-bound (~770 MB from HuggingFace CDN); the time goes to bytes, not code.
+*First-visit numbers reflect bench order: `tjs` runs first and pays the network fetch; `wasm` runs second and pays it again into a different cache; `gpu` runs third and reuses the OPFS copy `wasm` wrote. Run any one backend in isolation against an empty cache and the cold number is ~15 s — bytes, not code. The interesting differential is the second visit.
 
-Second visit: textsift writes the 770 MB model to OPFS by default. transformers.js's default cache is the Cache API, which silently rejects payloads this large — so its uncached path runs every visit. A transformers.js user who plugs in a custom OPFS-backed cache can match textsift's second-visit warmup. The factual claim is **"textsift caches large models persistently with no configuration"**, not "textsift can cache and tjs can't".
+Second visit: textsift writes the 770 MB model to OPFS by default. transformers.js's default cache is the Cache API, which silently rejects payloads this large — so its uncached path runs every visit. **textsift WASM is ~8× faster cold and WebGPU ~6×** at the second-visit cold-start measurement. A transformers.js user who plugs in a custom OPFS-backed cache can close that gap. The factual claim is **"textsift caches large models persistently with no configuration"**, not "textsift can cache and tjs can't".
 
 ## Warmup breakdown (cache hit)
 
@@ -37,12 +37,12 @@ From `tests/browser/webgpu-coldstart.spec.ts`, second warmup:
 
 | Step | Cost |
 |---|---:|
-| Adapter + device request | 0.5 s (Metal driver warm-up) |
-| OPFS read (770 MB model) | 0.4 s |
-| ONNX parse | 0.002 s |
-| GPU buffer upload | 0.4 s |
+| Adapter + device request | 0.20 s (Metal driver warm-up) |
+| OPFS read (770 MB model) | 0.36 s |
+| ONNX parse | 0.001 s |
+| GPU buffer upload | 0.38 s |
 | Pipeline compile (14 WGSL shaders, parallel) | 0.002 s |
-| **Total** | **1.3 s** |
+| **Total** | **0.93 s** |
 
 ## Accuracy
 

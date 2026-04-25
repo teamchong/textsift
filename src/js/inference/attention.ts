@@ -145,16 +145,41 @@ export async function attentionForward(
     wasm.rope_apply(kPtr, tables.ropeCosPtr, tables.ropeSinPtr, T, Hkv, hd);
   }
 
-  // Banded attention runs single-threaded — sliding-window attention
-  // crosses arbitrary T boundaries (window=128, T<=128 means every
-  // query attends to every key) so a per-T worker split would force
-  // expensive cross-worker key fetches. An H_q-direction split is the
-  // natural parallelism axis here but needs a kernel-signature change
-  // (h_q_start + h_q_count parameters); that's a separate project.
-  wasm.banded_attention(
-    qPtr, kPtr, vPtr, weights.sinks.dataOffset, maskPtr, attnOutPtr,
-    T, Hq, Hkv, hd, config.slidingWindow,
-  );
+  // Banded attention. Sliding-window attention crosses arbitrary T
+  // boundaries (window=128, T<=128 means every query attends to every
+  // key) so a per-T worker split would force expensive cross-worker
+  // key fetches. The natural parallelism axis is H_q — query heads
+  // are independent and the K/V tensors are read-only across workers.
+  // `banded_attention_partial` takes (h_q_start, h_q_count); we
+  // partition by GQA group to keep each worker's K/V access slice
+  // contiguous when the math allows.
+  if (mt && Hq >= mt.pool.numThreads * 2) {
+    const N = mt.pool.numThreads;
+    const scripts: WorkerScript[] = [];
+    for (let w = 0; w < N; w++) {
+      const hStart = Math.floor((w * Hq) / N);
+      const hEnd = Math.floor(((w + 1) * Hq) / N);
+      const hCount = hEnd - hStart;
+      const calls: KernelCall[] = [];
+      if (hCount > 0) {
+        calls.push({
+          kernel: "banded_attention_partial",
+          args: [qPtr, kPtr, vPtr, weights.sinks.dataOffset, maskPtr, attnOutPtr,
+                 T, Hq, Hkv, hd, config.slidingWindow,
+                 hStart, hCount],
+        });
+      } else {
+        calls.push({ kernel: "echo", args: [0] });
+      }
+      scripts.push(calls);
+    }
+    await mt.pool.run(scripts);
+  } else {
+    wasm.banded_attention(
+      qPtr, kPtr, vPtr, weights.sinks.dataOffset, maskPtr, attnOutPtr,
+      T, Hq, Hkv, hd, config.slidingWindow,
+    );
+  }
 
   // O projection: pre-widen attn_out, then f32-input int4 matmul.
   // Same partition pattern as Q/K/V when MT is on.

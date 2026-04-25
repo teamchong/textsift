@@ -50,6 +50,11 @@ export interface PiiWasmExports {
     q: number, k: number, v: number, sinks: number, mask: number, out: number,
     T: number, H_q: number, H_kv: number, head_dim: number, window: number,
   ): void;
+  banded_attention_partial(
+    q: number, k: number, v: number, sinks: number, mask: number, out: number,
+    T: number, H_q: number, H_kv: number, head_dim: number, window: number,
+    h_q_start: number, h_q_count: number,
+  ): void;
   scale_fp16_inplace(x: number, scale: number, n: number): void;
   add_fp16(a: number, b: number, out: number, n: number): void;
   gather_fp16(src: number, indices: number, dst: number, m: number, D: number): void;
@@ -163,6 +168,7 @@ export async function loadPiiWasm(url?: string | URL | null): Promise<PiiWasmExp
     "topk_partial_f32",
     "rope_apply",
     "banded_attention",
+    "banded_attention_partial",
     "scale_fp16_inplace",
     "add_fp16",
     "gather_fp16",

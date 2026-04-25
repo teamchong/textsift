@@ -1148,37 +1148,35 @@ inline fn saxpyF32Bf16(p: f32, v_ptr: [*]const u16, acc: [*]f32, n: usize) void 
     }
 }
 
-export fn banded_attention(
+/// Inner body of banded attention for one query head range. Shared
+/// between the full kernel and the per-h_q-slice kernel that worker
+/// threads dispatch.
+inline fn bandedAttentionBody(
     q_ptr: [*]const u16,
     k_ptr: [*]const u16,
     v_ptr: [*]const u16,
     sinks_ptr: [*]const f32,
-    mask_ptr: ?[*]const u8,    // NULL = all keys valid
+    mask_ptr: ?[*]const u8,
     out_ptr: [*]u16,
-    T: u32,
-    H_q: u32,
-    H_kv: u32,
-    head_dim: u32,
-    window: u32,
+    Tz: usize,
+    Hqz: usize,
+    Hkvz: usize,
+    Dz: usize,
+    Wz: usize,
+    h_q_start: usize,
+    h_q_end: usize,
 ) void {
-    const Tz: usize = T;
-    const Hqz: usize = H_q;
-    const Hkvz: usize = H_kv;
-    const Dz: usize = head_dim;
-    const Wz: usize = window;
     const kv_group: usize = Hqz / Hkvz;
-
     const q_stride_t: usize = Hqz * Dz;
     const k_stride_t: usize = Hkvz * Dz;
 
-    // Per-query scratch: one entry per key in the window, plus the sink.
     var scores: [MAX_WINDOW_TOTAL + 1]f32 = undefined;
     var acc: [MAX_HEAD_DIM]f32 = undefined;
 
     var t_q: usize = 0;
     while (t_q < Tz) : (t_q += 1) {
-        var h_q: usize = 0;
-        while (h_q < Hqz) : (h_q += 1) {
+        var h_q: usize = h_q_start;
+        while (h_q < h_q_end) : (h_q += 1) {
             const h_kv = h_q / kv_group;
             const q_base: usize = t_q * q_stride_t + h_q * Dz;
             const out_base: usize = t_q * q_stride_t + h_q * Dz;
@@ -1246,6 +1244,59 @@ export fn banded_attention(
             }
         }
     }
+}
+
+/// Full-range banded attention. Equivalent to calling the body with
+/// `h_q_start=0, h_q_end=H_q`. Kept as the default export so the
+/// existing single-thread call site doesn't need to know about the
+/// partition.
+export fn banded_attention(
+    q_ptr: [*]const u16,
+    k_ptr: [*]const u16,
+    v_ptr: [*]const u16,
+    sinks_ptr: [*]const f32,
+    mask_ptr: ?[*]const u8,
+    out_ptr: [*]u16,
+    T: u32,
+    H_q: u32,
+    H_kv: u32,
+    head_dim: u32,
+    window: u32,
+) void {
+    bandedAttentionBody(
+        q_ptr, k_ptr, v_ptr, sinks_ptr, mask_ptr, out_ptr,
+        T, H_q, H_kv, head_dim, window,
+        0, H_q,
+    );
+}
+
+/// H_q-direction partition: process query heads in the half-open
+/// range [h_q_start, h_q_start + h_q_count). Workers in the multi-
+/// thread WASM pool partition the H_q axis so the banded-attention
+/// kernel — the one remaining single-thread step in the layer — runs
+/// concurrently across the worker pool. Each worker writes only its
+/// owned slice of `out`; reads of K/V are read-only and disjoint
+/// after sinks (which is per-h_q anyway).
+export fn banded_attention_partial(
+    q_ptr: [*]const u16,
+    k_ptr: [*]const u16,
+    v_ptr: [*]const u16,
+    sinks_ptr: [*]const f32,
+    mask_ptr: ?[*]const u8,
+    out_ptr: [*]u16,
+    T: u32,
+    H_q: u32,
+    H_kv: u32,
+    head_dim: u32,
+    window: u32,
+    h_q_start: u32,
+    h_q_count: u32,
+) void {
+    bandedAttentionBody(
+        q_ptr, k_ptr, v_ptr, sinks_ptr, mask_ptr, out_ptr,
+        T, H_q, H_kv, head_dim, window,
+        @intCast(h_q_start), @intCast(h_q_start + h_q_count),
+    );
 }
 
 // --------------------------------------------------------------

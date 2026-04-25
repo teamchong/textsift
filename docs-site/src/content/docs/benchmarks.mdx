@@ -19,17 +19,19 @@ Both WebGPU paths are GPU-bound at this model size; the differential reflects th
 
 ## Cold start
 
-This is a default-configuration comparison, not an architectural ceiling.
+What we measure: time from `PrivacyFilter.create()` to the model being ready for inference, **after a separate untimed prelude that pre-populates every backend's persistent cache**. The 770 MB model download is excluded — it's a CDN test, not a backend benchmark.
 
-| | First visit | Second visit |
-|---|---:|---:|
-| tjs (Cache API default) | 15.4 s | 12.2 s |
-| textsift WASM (OPFS default) | 15.0 s* | 1.5 s |
-| textsift WebGPU (OPFS default) | 2.2 s* | 1.9 s |
+| Backend | Cold start |
+|---|---:|
+| tjs (Cache API default) | 14.5 s |
+| textsift WASM (OPFS default) | 2.1 s |
+| textsift WebGPU (OPFS default) | 2.4 s |
 
-*First-visit numbers reflect bench order: `tjs` runs first and pays the network fetch; `wasm` runs second and pays it again into a different cache; `gpu` runs third and reuses the OPFS copy `wasm` wrote. Run any one backend in isolation against an empty cache and the cold number is ~15 s — bytes, not code. The interesting differential is the second visit.
+**textsift is ~7× faster cold than transformers.js in default config.**
 
-Second visit: textsift writes the 770 MB model to OPFS by default. transformers.js's default cache is the Cache API, which silently rejects payloads this large — so its uncached path runs every visit. **textsift WASM is ~8× faster cold and WebGPU ~6×** at the second-visit cold-start measurement. A transformers.js user who plugs in a custom OPFS-backed cache can close that gap. The factual claim is **"textsift caches large models persistently with no configuration"**, not "textsift can cache and tjs can't".
+The gap isn't ONNX parse or GPU pipeline compile — those are negligible (see breakdown below). It's storage. transformers.js's default cache is the [Cache API](https://developer.mozilla.org/en-US/docs/Web/API/Cache), which has per-resource size limits that the 770 MB model exceeds (`QuotaExceededError` in the bench logs). Cache API silently rejects the put, so every visit re-downloads. textsift writes to OPFS, which has no such limit, and the second-load cost is just `~770 MB sequential disk read + ONNX parse + backend-specific upload` ≈ 1–2 s.
+
+A transformers.js user who plugs in a custom OPFS-backed adapter would close the gap. The factual claim is **"textsift caches large models persistently with no configuration"**, not "textsift's inference engine is faster at startup".
 
 ## Warmup breakdown (cache hit)
 

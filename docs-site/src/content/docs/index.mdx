@@ -3,14 +3,14 @@ title: textsift
 description: Browser-native PII detection and redaction using openai/privacy-filter.
 template: splash
 hero:
-  tagline: OpenAI's privacy-filter model, running entirely in your browser. No backend, no network calls, no text ever leaves the device.
+  tagline: OpenAI's privacy-filter model running locally in the browser, Node, and edge runtimes.
   actions:
     - text: Quickstart
       link: /textsift/quickstart/
       icon: right-arrow
       variant: primary
-    - text: API Reference
-      link: /textsift/api/
+    - text: Playground
+      link: /textsift/playground/
       variant: minimal
     - text: GitHub
       link: https://github.com/teamchong/textsift
@@ -20,43 +20,26 @@ hero:
 
 import { Card, CardGrid } from "@astrojs/starlight/components";
 
-## Why
+## What this is
 
-OpenAI released [openai/privacy-filter](https://huggingface.co/openai/privacy-filter) on 2026-04-20 — a 1.5B-parameter MoE token classifier (50M active) for PII detection, Apache 2.0. It reaches **96-97% F1 on PII-Masking-300k** and runs on a laptop.
+A npm package that runs [openai/privacy-filter](https://huggingface.co/openai/privacy-filter) — a 1.5B / 50M-active MoE bidirectional token classifier for PII detection — entirely on the user's device. WebGPU when available, WASM (Zig + SIMD128) otherwise. Apache 2.0.
 
-The gap: the official SDK is Python. transformers.js runs it on WebGPU but has no CPU fallback. **`textsift` is the only package that runs this model end-to-end in the browser with both WebGPU and CPU paths.**
+The model is OpenAI's; the value of this package is packaging:
 
-## Features
+- A native o200k-style BPE tokenizer in pure TypeScript (no `@huggingface/transformers` dep on the lean install).
+- Two custom backends — WGSL kernels for WebGPU and Zig-compiled SIMD WASM — that produce the same logits as transformers.js's WebGPU path on the same input.
+- A WebAssembly path that works at all on this model: ORT-Web's WASM EP (which transformers.js uses under the hood) is missing the `MatMulNBits` and `GatherBlockQuantized` kernels the int4 export needs, so `transformers.js` with `device: "wasm"` fails session creation. textsift's WASM backend is a from-scratch implementation that doesn't go through ORT-Web.
+- Persistent OPFS caching of the 770 MB model weights, configured by default. Same data the model needs anyway, just stored on the user's disk so the second visit doesn't re-download. transformers.js can be configured to do this too — by default it uses the Cache API which silently rejects payloads this big.
+- An incremental `startStream()` API for AI-proxy / LLM-output-filtering use cases. Streams text, yields spans as they become detectable, O(N) total work over a stream of N tokens.
 
-<CardGrid>
-  <Card title="Fully client-side" icon="seti:lock">
-    No backend. No network inference calls. PII text stays on the user's device.
-  </Card>
-  <Card title="Three backends" icon="seti:config">
-    WebGPU (hand-tuned WGSL, fastest), WASM (Zig + SIMD128, universal), or transformers.js (baseline). One public API.
-  </Card>
-  <Card title="Faster than tjs" icon="rocket">
-    2.3–4× faster per forward than transformers.js; 10× faster on repeat-visit cold start.
-  </Card>
-  <Card title="OPFS cache" icon="document">
-    770 MB model downloaded once, persisted across visits. Second launch: 1.1 seconds.
-  </Card>
-  <Card title="Byte-exact decoding" icon="approve-check">
-    Viterbi CRF over BIOES, matching OpenAI's reference decoding.
-  </Card>
-  <Card title="Apache 2.0" icon="open-book">
-    Same license as the model.
-  </Card>
-</CardGrid>
-
-## Two packages, your choice
+## Two packages
 
 ```bash
-npm install textsift-core   # ~76 KB gzipped, no transformers.js dep
-npm install textsift        # ~228 KB gzipped, adds auto fallback
+npm install textsift-core   # 76 KB gzipped, no runtime deps
+npm install textsift        # 226 KB gzipped, adds a transformers.js fallback backend
 ```
 
-Both expose the same `PrivacyFilter` API. The umbrella `textsift` package adds a transformers.js fallback path for runtimes without WebGPU or SIMD-capable WASM. Most apps want `textsift-core` — it's leaner and ships with a native o200k-style BPE tokenizer (no transformers.js dep at all).
+Both expose the same `PrivacyFilter` API. Pick the umbrella `textsift` if you need the transformers.js fallback (typically: browsers without WebGPU and without cross-origin-isolation for SIMD-WASM). Pick `textsift-core` if you don't.
 
 ## 30-second example
 
@@ -70,23 +53,27 @@ const result = await filter.redact(
 
 console.log(result.redactedText);
 // "Hi, my name is [private_person] and my email is [private_email]."
-
-console.log(result.spans);
-// [
-//   { label: "private_person", start: 15, end: 25, text: "John Smith", ... },
-//   { label: "private_email",  start: 43, end: 59, text: "john@example.com", ... },
-// ]
 ```
 
-## How it compares
+## Measured numbers
 
-| | tjs (WebGPU) | **textsift (WebGPU)** | textsift (WASM) |
+M3 Pro MacBook, Chromium 147, median of 5 forward passes after 2 warmups. Reproduce with `npx playwright test bench.spec.ts`.
+
+| Input length | textsift (WebGPU) | textsift (WASM ST) | tjs (WebGPU default) |
 |---|---:|---:|---:|
-| Forward — short | 29 ms | **7 ms** | 66 ms |
-| Forward — medium | 39 ms | **12 ms** | 158 ms |
-| Forward — long | 57 ms | **25 ms** | 342 ms |
-| Second-visit warmup | 11.2 s | **1.1 s** | 1.8 s |
+| ~12 tokens | 7 ms | 66 ms | 29 ms |
+| ~25 tokens | 12 ms | 158 ms | 39 ms |
+| ~80 tokens | 25 ms | 342 ms | 57 ms |
+| Second-visit warmup ¹ | 1.1 s | 1.8 s | 11.2 s |
 
-*M-series MacBook, Chromium 147, median of 5 runs after 2 warmups.*
+¹ With OPFS caching configured (textsift default). transformers.js's default Cache API rejects 770 MB; if you wire OPFS into transformers.js manually, its second-visit warmup is comparable to textsift's.
 
-For **CPU-only environments** (corporate Chrome without WebGPU, Firefox with `dom.webgpu.enabled=false`, server-side Node), textsift is the only working path — transformers.js fails session creation on this model's WASM device due to missing ORT-Web kernels (`GatherBlockQuantized`, `MatMulNBits`).
+The forward-pass numbers reflect kernel-level differences (custom int4 WGSL vs ORT-Web's int4 WGSL via WebGPU contrib ops). They don't depend on caching configuration.
+
+## CPU-only environments
+
+`textsift` is the only currently-working path for `model_q4f16.onnx` outside of WebGPU. transformers.js's WASM EP can't load this model (missing `MatMulNBits` / `GatherBlockQuantized`); textsift's WASM backend is a separate implementation that runs the int4 matmul + GQA + sparse MoE in Zig-compiled SIMD128. Browsers without WebGPU, server-side Node, edge workers — all work.
+
+## Caveats
+
+`openai/privacy-filter` is a detection aid, not an anonymization guarantee. Read the [caveats page](/textsift/caveats/) and OpenAI's [model card](https://cdn.openai.com/pdf/c66281ed-b638-456a-8ce1-97e9f5264a90/OpenAI-Privacy-Filter-Model-Card.pdf) before treating output as compliance-safe.

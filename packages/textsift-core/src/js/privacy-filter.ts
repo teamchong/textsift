@@ -34,6 +34,12 @@ import { loadCalibration } from "./model/calibration.js";
 import { chunkInput, mergeChunkResults, type Chunk } from "./inference/chunking.js";
 import { bioesToSpans } from "./inference/spans.js";
 import { applyRedaction } from "./inference/redact.js";
+import {
+  createDetectStream,
+  resolveStreamOptions,
+  type DetectStreamOptions,
+  type DetectStreamSession,
+} from "./inference/stream.js";
 
 /** Internal ready state. */
 type FilterState =
@@ -155,6 +161,41 @@ export class PrivacyFilter {
       results.push(await this.redact(input, opts));
     }
     return results;
+  }
+
+  /**
+   * Start an incremental detection session. Each `session.append(text)`
+   * runs inference on a trailing window of the accumulated buffer and
+   * yields newly-stable spans; `session.finish()` flushes the rest.
+   *
+   * Total work for a stream of N tokens is O(N), versus O(N²) for the
+   * naive pattern of calling `detect(buffer)` after every chunk
+   * arrives. Designed for AI-proxy / LLM-output-filtering use cases.
+   */
+  async startStream(opts: DetectStreamOptions = {}): Promise<DetectStreamSession> {
+    const ready = await this.ensureReady();
+    const enabledFilter = this.buildEnabledFilter();
+    return createDetectStream(
+      {
+        backend: ready.backend,
+        tokenizer: ready.tokenizer,
+        viterbi: ready.viterbi,
+        options: resolveStreamOptions(opts),
+      },
+      enabledFilter,
+    );
+  }
+
+  /**
+   * Build a span-allow predicate from this session's
+   * `enabledCategories` option (if set), so streaming yields don't
+   * include spans the caller has filtered out at the session level.
+   */
+  private buildEnabledFilter(): ((span: DetectedSpan) => boolean) | undefined {
+    const enabled = this.opts.enabledCategories;
+    if (!enabled || enabled.length === ALL_SPAN_LABELS.length) return undefined;
+    const set = new Set<SpanLabel>(enabled);
+    return (span) => set.has(span.label);
   }
 
   /**

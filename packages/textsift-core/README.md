@@ -1,8 +1,8 @@
 # textsift-core
 
-**Lean PII detection + redaction. ~76 KB gzipped. No transformers.js dependency.**
+PII detection + redaction for browser, Node, and edge runtimes. 76 KB gzipped, no runtime dependencies.
 
-The minimal client-side engine for [openai/privacy-filter](https://huggingface.co/openai/privacy-filter). Custom WebGPU + WASM backends, native o200k-style BPE tokenizer, zero runtime dependencies.
+The lean half of the [textsift](https://www.npmjs.com/package/textsift) split. Custom WebGPU + WASM backends, native o200k-style BPE tokenizer.
 
 ```sh
 npm install textsift-core
@@ -19,30 +19,32 @@ const result = await filter.redact(
 //   "Hi [private_person], your email [private_email] is on file."
 ```
 
-`PrivacyFilter.create()` picks WebGPU when an adapter with `shader-f16` is available, otherwise falls back to the custom Zig+SIMD WASM backend. Force a path with `{ backend: "webgpu" | "wasm" }`.
+`PrivacyFilter.create()` picks WebGPU when an adapter with `shader-f16` is available, otherwise the custom Zig+SIMD WASM backend. Force a path with `{ backend: "webgpu" | "wasm" }`.
 
-## When to pick `textsift-core` vs `textsift`
+## When `textsift-core` vs `textsift`
+
+`textsift-core` ships only the custom backends. If you want a transformers.js fallback for runtimes without WebGPU and without SIMD-capable WASM, install [`textsift`](https://www.npmjs.com/package/textsift) instead — same API, ~226 KB gzipped.
 
 | Scenario | Pick |
 |---|---|
-| Browser app with modern Chromium / Safari 18+ users | **`textsift-core`** |
-| Server-side Node 20+ with optional WebGPU | **`textsift-core`** |
-| Edge worker / Cloudflare Workers / Vercel Edge | **`textsift-core`** |
-| AI proxy that runs everywhere and needs minimum bundle | **`textsift-core`** |
-| Browser app that needs to support Firefox without `dom.webgpu.enabled` | [`textsift`](https://www.npmjs.com/package/textsift) |
-| Drop-in replacement for an existing transformers.js setup | [`textsift`](https://www.npmjs.com/package/textsift) |
+| Browser app on modern Chromium / Safari 18+ | `textsift-core` |
+| Server-side Node 20+ | `textsift-core` |
+| Edge worker, Cloudflare Workers, Vercel Edge | `textsift-core` |
+| AI proxy that needs to ship everywhere | `textsift-core` |
+| Browser that may not have WebGPU OR cross-origin-isolation for SIMD-WASM | `textsift` |
+| You're already using transformers.js elsewhere and want a drop-in replacement | `textsift` |
 
 ## Public API
 
 ```ts
-// Main API
-PrivacyFilter.create(opts?: CreateOptions): Promise<PrivacyFilter>
+PrivacyFilter.create(opts?): Promise<PrivacyFilter>
 filter.redact(text, opts?): Promise<RedactResult>
 filter.detect(text, opts?): Promise<DetectResult>
 filter.redactBatch(inputs, opts?): Promise<RedactResult[]>
+filter.startStream(opts?): Promise<DetectStreamSession>  // incremental, O(N)
 filter.dispose(): void
 
-// Tokenizer (also useful standalone)
+// Standalone tokenizer (token counting, custom chunking, etc.)
 Tokenizer.fromBundle(bundle): Promise<Tokenizer>
 tokenizer.encode(text): EncodeResult
 
@@ -50,16 +52,16 @@ tokenizer.encode(text): EncodeResult
 getCachedModelInfo(): Promise<CachedModelInfo>
 clearCachedModel(): Promise<{ removed, bytes }>
 
-// Advanced
+// Direct backend access
 WasmBackend, WebGpuBackend, ModelLoader
 ```
 
-Full docs at [teamchong.github.io/textsift](https://teamchong.github.io/textsift/).
+Full API reference: [teamchong.github.io/textsift/api/](https://teamchong.github.io/textsift/api/).
 
-## What's NOT in textsift-core
+## Caveats
 
-The transformers.js auto-fallback backend. If you need that — typically because you're targeting browsers without WebGPU and without cross-origin isolation for SIMD-capable WASM — install [`textsift`](https://www.npmjs.com/package/textsift) instead. Same API, ~226 KB gzipped.
+`openai/privacy-filter` is a detection aid, not an anonymization guarantee. Read the [caveats page](https://teamchong.github.io/textsift/caveats/) before treating output as compliance-safe.
 
 ## License
 
-Apache 2.0, matching the upstream model.
+Apache 2.0.

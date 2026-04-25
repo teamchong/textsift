@@ -10,8 +10,9 @@ description: How textsift turns text into redacted output, from tokenizer to spa
     │
     ▼
  ┌─────────────────────┐
- │ Tokenizer           │   @huggingface/transformers AutoTokenizer
- │   (shared JS)       │   + byte-level BPE reverse map for offsets
+ │ Tokenizer           │   Native o200k-style BPE in textsift-core
+ │   (shared JS)       │   (pretokenizer regex + byte-level encoder
+ │                     │    + BPE merge loop + special-token map)
  └──────────┬──────────┘
             │ tokenIds, attentionMask, tokenToCharOffset
             ▼
@@ -22,9 +23,9 @@ description: How textsift turns text into redacted output, from tokenizer to spa
             ▼
  ┌─────────────────────┐
  │ Backend.forward()   │   One of:
- │                     │     transformers.js (ORT-Web WebGPU)
- │                     │     webgpu (our WGSL)
- │                     │     wasm   (our Zig + SIMD128)
+ │                     │     webgpu (custom WGSL)            ← textsift-core
+ │                     │     wasm   (custom Zig + SIMD128)   ← textsift-core
+ │                     │     transformers-js (ORT-Web)       ← umbrella `textsift` only
  └──────────┬──────────┘
             │ Float32Array [T, 33]  (background + 8 labels × BIOES)
             ▼
@@ -73,28 +74,28 @@ We read OpenAI's upstream `onnx/model_q4f16.onnx` + `.onnx_data` directly. No co
 
 ## Backend internals
 
-### transformers.js (Stage 0)
+### Zig + WASM (in `textsift-core`)
 
-Thin wrapper around `AutoModelForTokenClassification`. We bypass `pipeline('token-classification')` because it runs its own argmax / BIOES decode; we need raw logits.
+Hand-written kernels in `packages/textsift-core/src/zig/wasm_exports.zig`, compiled with `-target wasm32-freestanding -mcpu=generic+simd128+relaxed_simd -O ReleaseFast`. The output `textsift.wasm` is ~92 KB, inlined into the JS bundle as base64.
 
-### Zig + WASM (Stage 1)
+Kernels: embed lookup, RMSNorm (incl. fused add+rms+widen variant), int4 matmul (three X×Out type variants), RoPE, banded attention with sinks, swiGLU with clamp, QMoE dispatch, scatter-add, cast, softmax, top-K. Multi-thread version (`textsift-mt.wasm`) builds with `+atomics+bulk_memory` for SAB-backed worker pools.
 
-Hand-written kernels in `src/zig/wasm_exports.zig`, compiled with `-target wasm32-freestanding -mcpu=generic+simd128+relaxed_simd -O ReleaseFast`. `dist/textsift.wasm` is ~25 KB, inlined into the JS bundle.
+### WGSL (in `textsift-core`)
 
-Kernels: embed lookup, RMSNorm, int4 matmul (three X×Out type variants), RoPE, banded attention with sinks, swiGLU with clamp, QMoE dispatch, scatter-add, cast, softmax, topK.
+14 compute shaders in `packages/textsift-core/src/js/backends/webgpu.ts`. Highlights:
 
-### WGSL (Stage 2)
-
-14 compute shaders in `src/js/backends/webgpu.ts`. Highlights:
-
-- `MATMUL_INT4_FP16_F16`: fp16 input → fp16 output, with **8-nibble/word unpack** (one u32 load dispatches 8 FMAs). Used for Q/K/V/O projections.
+- `MATMUL_INT4_FP16_F16`: fp16 input → fp16 output with 8-nibble/word unpack (one u32 load dispatches 8 FMAs). Used for Q/K/V/O projections.
 - `BANDED_ATTENTION`: one workgroup per `(t_query, h_query)`, 64 threads sharing scores/softmax scratch in workgroup memory, one thread per head_dim lane for AV combine.
 - `QMOE_GATE_UP` + `SWIGLU_CLAMP` + `QMOE_DOWN_SCATTER`: token-major MoE (one workgroup per `(token, k_pick)`), atomic CAS on f32-as-u32 bits for the scatter-add. No CPU readback needed.
 
+### transformers.js fallback (in umbrella `textsift` only)
+
+Thin wrapper around `AutoModelForTokenClassification`. We bypass `pipeline('token-classification')` because it runs its own argmax / BIOES decode; we need raw logits. Used by the umbrella's auto resolver only when both WebGPU and SIMD-WASM are unavailable.
+
 ## Design invariants
 
-1. **Public API is narrow** — only `PrivacyFilter.create`, `redact`, `detect`, `redactBatch`, `dispose`, and the 7 exported types.
-2. **Backends are interchangeable** — all three produce byte-identical spans.
-3. **Weights live outside the npm bundle** — package ships ~1.8 MB of JS; model is fetched on first use and persisted via OPFS.
-4. **No server-side fallback** — if inference can't run locally, we error out. We don't silently call home.
+1. **Public API is narrow** — `PrivacyFilter.create`, `redact`, `detect`, `redactBatch`, `startStream`, `dispose`, plus the exported types.
+2. **Backends are interchangeable** — all backends produce byte-identical spans on the same input.
+3. **Weights live outside the npm bundle** — `textsift-core` ships 76 KB gzipped of JS + a 90 KB WASM module. The 770 MB model is fetched on first use and persisted via OPFS by default.
+4. **No server-side fallback** — if inference can't run locally, an error is thrown. The library does not call any server.
 5. **Apache 2.0** — matches the upstream model.

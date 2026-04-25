@@ -1,0 +1,99 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>textsift-core — DetectStream session</title>
+  </head>
+  <body>
+    <pre id="out">starting</pre>
+    <script type="module">
+      // Verify the incremental DetectStream API behaves the same as the
+      // batch detect() pipeline once the buffer is fully accumulated.
+      // For proxy use, what matters is that a stream of append() calls
+      // ending in finish() yields the same total span set as a single
+      // detect(fullText) call.
+
+      import { PrivacyFilter } from "/packages/textsift-core/dist/index.js";
+
+      const $out = document.getElementById("out");
+      const log = (m) => { $out.textContent += "\n" + m; };
+
+      const TEXT =
+        "Hi support, my name is John Smith and my email is john@example.com. " +
+        "Please call me at (617) 555-0199 or write to 456 Oak Avenue, Boston, MA 02134. " +
+        "My account number is 9876543210 and the SSN is 123-45-6789. " +
+        "For more, visit https://support.example.com/tickets/TKT-48211.";
+
+      // Split the text into ~20-char chunks to simulate an LLM token stream.
+      function makeChunks(text, chunkSize) {
+        const out = [];
+        for (let i = 0; i < text.length; i += chunkSize) {
+          out.push(text.slice(i, i + chunkSize));
+        }
+        return out;
+      }
+
+      try {
+        log("create filter (backend=wasm)");
+        const filter = await PrivacyFilter.create({ backend: "wasm" });
+
+        log("\n[1] batch detect");
+        const t0 = performance.now();
+        const batchResult = await filter.detect(TEXT);
+        const tBatch = performance.now() - t0;
+        log(`  ${batchResult.spans.length} spans in ${tBatch.toFixed(0)}ms`);
+        for (const s of batchResult.spans) {
+          log(`    [${s.label}] ${JSON.stringify(s.text)} (${s.start}..${s.end})`);
+        }
+
+        log("\n[2] streaming detect (24-char chunks)");
+        const session = await filter.startStream();
+        const streamSpans = [];
+        const chunks = makeChunks(TEXT, 24);
+        const t1 = performance.now();
+        for (let i = 0; i < chunks.length; i++) {
+          for await (const span of session.append(chunks[i])) {
+            streamSpans.push(span);
+            log(`    chunk ${i}: yielded [${span.label}] ${JSON.stringify(span.text)}`);
+          }
+        }
+        for await (const span of session.finish()) {
+          streamSpans.push(span);
+          log(`    finish: yielded [${span.label}] ${JSON.stringify(span.text)}`);
+        }
+        const tStream = performance.now() - t1;
+        log(`  ${streamSpans.length} spans in ${tStream.toFixed(0)}ms`);
+
+        // Compare span sets (label + start + end).
+        const key = (s) => `${s.label}:${s.start}:${s.end}`;
+        const batchKeys = new Set(batchResult.spans.map(key));
+        const streamKeys = new Set(streamSpans.map(key));
+        const onlyBatch = [...batchKeys].filter((k) => !streamKeys.has(k));
+        const onlyStream = [...streamKeys].filter((k) => !batchKeys.has(k));
+
+        const same = onlyBatch.length === 0 && onlyStream.length === 0;
+
+        filter.dispose();
+
+        window.__result = {
+          ok: same,
+          batchCount: batchResult.spans.length,
+          streamCount: streamSpans.length,
+          tBatchMs: tBatch,
+          tStreamMs: tStream,
+          onlyBatch,
+          onlyStream,
+        };
+        log(`\ndone: same=${same} batch=${batchResult.spans.length} stream=${streamSpans.length}`);
+        if (!same) {
+          log(`  only-batch:  ${JSON.stringify(onlyBatch)}`);
+          log(`  only-stream: ${JSON.stringify(onlyStream)}`);
+        }
+      } catch (e) {
+        window.__result = { ok: false, error: String(e), stack: e.stack };
+        log("ERROR: " + e);
+        throw e;
+      }
+    </script>
+  </body>
+</html>

@@ -54,6 +54,7 @@ if (_isNode) {
 
 let wasm;
 let signal;
+let memFence;  // Int32Array view on the WASM-memory SAB for cross-thread fencing
 
 _onMessage(async (e) => {
   const msg = e.data;
@@ -63,17 +64,16 @@ _onMessage(async (e) => {
     });
     wasm = instance.exports;
     signal = new Int32Array(msg.signalBuffer);
+    memFence = new Int32Array(msg.memory.buffer, msg.memFenceOffset, 1);
     _postMessage({ type: "ready" });
     return;
   }
   if (msg.type === "script") {
-    // Acquire fence on the signal SAB. The JS memory model says an
-    // atomic load reads the most recent atomic store from any thread,
-    // and that read includes all writes that were sequenced-before
-    // the corresponding store. Main's pre-dispatch Atomics.add on
-    // EPOCH_OFFSET releases all the input-buffer writes it did before
-    // postMessage; this load makes them visible here.
-    Atomics.load(signal, ${EPOCH_OFFSET});
+    // Acquire fence on the WASM memory SAB itself — this is what
+    // publishes main's plain shared-memory writes (kernel outputs,
+    // staging) to this worker. An atomic on the signal SAB only
+    // synchronizes accesses on that buffer.
+    Atomics.load(memFence, 0);
     const calls = msg.calls;
     for (let i = 0; i < calls.length; i++) {
       const call = calls[i];
@@ -84,6 +84,8 @@ _onMessage(async (e) => {
       }
       fn.apply(null, call.args);
     }
+    // Release fence before signalling done.
+    Atomics.add(memFence, 0, 0);
     Atomics.add(signal, ${DONE_OFFSET}, 1);
     Atomics.notify(signal, ${DONE_OFFSET});
   }
@@ -180,11 +182,31 @@ export class MtPool {
   readonly numThreads: number;
   private workers: WorkerLike[] = [];
   private signal: Int32Array;
+  /**
+   * A slot inside the *WASM memory* SAB used as a fence target.
+   * Atomics.store/load on this slot synchronizes plain WASM-memory
+   * reads/writes across threads — Atomics on a *different* SAB
+   * (e.g. our signal buffer) doesn't fence accesses on the memory
+   * SAB by spec.
+   *
+   * The slot offset is set externally via `setMemoryFenceSlot()` so
+   * the caller can pin a 4-byte location they aren't using for data.
+   */
+  private memFence: Int32Array | null = null;
 
   constructor(public readonly memory: WebAssembly.Memory, numThreads: number) {
     this.numThreads = Math.max(1, numThreads);
     const sigBuf = new SharedArrayBuffer(SIGNAL_BYTES);
     this.signal = new Int32Array(sigBuf);
+  }
+
+  /**
+   * Pin a 4-byte slot inside the WASM memory as the cross-thread
+   * memory fence target. Caller is responsible for not using these
+   * 4 bytes for data.
+   */
+  setMemoryFenceSlot(byteOffset: number): void {
+    this.memFence = new Int32Array(this.memory.buffer, byteOffset, 1);
   }
 
   async warmup(): Promise<void> {
@@ -208,6 +230,7 @@ export class MtPool {
             type: "init",
             memory: this.memory,
             signalBuffer: this.signal.buffer,
+            memFenceOffset: this.memFence ? this.memFence.byteOffset : 0,
             wasmBytes: PII_WASM_MT_BYTES,
           });
         }),
@@ -232,12 +255,31 @@ export class MtPool {
         `MtPool.run: expected ${this.numThreads} scripts, got ${scripts.length}`,
       );
     }
-    Atomics.store(this.signal, DONE_OFFSET, 0);
-    Atomics.add(this.signal, EPOCH_OFFSET, 1);
+    // Serial dispatch: dispatch worker i, wait for it, then i+1.
+    //
+    // Truly-parallel dispatch (every worker fires concurrently) was
+    // tried and produced numeric drift vs the single-thread reference
+    // — verified with `serial vs parallel` A/B test where serial
+    // matched ST within fp16 noise (maxDiff 1.6e-2) and parallel
+    // diverged by maxDiff > 0.6 with run-to-run non-determinism. All
+    // suspects were ruled out (per-worker scratch verified disjoint,
+    // acc rows verified disjoint, expert-weight reads are read-only,
+    // basic shared-memory message-passing verified working
+    // independently). Atomic fences on both the signal SAB and the
+    // WASM-memory SAB did not eliminate the race.
+    //
+    // Serial dispatch keeps the multi-thread API + worker pool
+    // infrastructure correct while we keep digging on the underlying
+    // race. Once the race is identified, this loop becomes parallel
+    // and we recover the speedup.
+    if (this.memFence) Atomics.add(this.memFence, 0, 0);
     for (let i = 0; i < this.numThreads; i++) {
+      Atomics.store(this.signal, DONE_OFFSET, 0);
+      Atomics.add(this.signal, EPOCH_OFFSET, 1);
       this.workers[i]!.postMessage({ type: "script", calls: scripts[i] });
+      await waitForCount(this.signal, DONE_OFFSET, 1);
     }
-    await waitForCount(this.signal, DONE_OFFSET, this.numThreads);
+    if (this.memFence) Atomics.add(this.memFence, 0, 0);
   }
 
   dispose(): void {

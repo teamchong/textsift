@@ -83,26 +83,20 @@ export async function expertDispatchParallel(
   const routingIndices = new Int32Array(wasm.memory.buffer, routingIndicesPtr, T * K);
   const routingScores = new Float32Array(wasm.memory.buffer, routingScoresPtr, T * K);
 
+  // Main zeros the entire accumulator once, then dispatches workers.
+  // The pool's release fence on the WASM-memory SAB before postMessage
+  // makes these zero stores visible to every worker before they start
+  // their scatter sequence.
+  wasm.zero_f32(accPtr, T * D);
+
   // Build per-worker schedules. Each worker handles a contiguous token
-  // range, zeros its own acc slice, and runs its own expert-major
-  // dispatch over that slice. Having the worker do its own zero (rather
-  // than main) ensures acc writes are sequenced inside the same WASM
-  // instance — main's zero_f32 stores aren't guaranteed to be visible
-  // to worker kernels through plain shared-memory accesses.
+  // range and runs its own expert-major dispatch over that slice.
   const scripts: WorkerScript[] = [];
   for (let w = 0; w < N; w++) {
     const tStart = Math.floor((w * T) / N);
     const tEnd = Math.floor(((w + 1) * T) / N);
     const tCount = tEnd - tStart;
     const calls: KernelCall[] = [];
-
-    if (tCount > 0) {
-      // Zero this worker's portion of the accumulator first.
-      calls.push({
-        kernel: "zero_f32",
-        args: [accPtr + tStart * D * 4, tCount * D],
-      });
-    }
 
     if (tCount > 0) {
       // Per-worker scratch slot.
@@ -125,13 +119,14 @@ export async function expertDispatchParallel(
       }
 
       // For each expert with at least one token: gather → gate_up →
-      // swiglu → down → scatter_add. Worker writes the per-call indices
-      // and weight arrays directly to its scratch slot via JS-side
-      // staging — but the staging values need to land in shared memory
-      // *before* the worker reads them. Easiest: stage them now from
-      // main, since main and workers see the same memory.
-      const idxArr = new Int32Array(wasm.memory.buffer, slot.tokIdxPtr);
-      const wArr = new Float32Array(wasm.memory.buffer, slot.weightsPtr);
+      // swiglu → down → scatter_add. Stage indices + weights in
+      // per-worker scratch from the main thread. Explicit length on
+      // the TypedArray view so we don't accidentally rely on the
+      // length default (which behaves quirkily on SAB-backed buffers
+      // in some runtimes).
+      const stageCap = tCount * K;
+      const idxArr = new Int32Array(wasm.memory.buffer, slot.tokIdxPtr, stageCap);
+      const wArr = new Float32Array(wasm.memory.buffer, slot.weightsPtr, stageCap);
       let stageOffset = 0;
       const expertOffsets: { e: number; off: number; m: number }[] = [];
 

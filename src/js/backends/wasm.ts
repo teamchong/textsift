@@ -646,13 +646,19 @@ export class WasmBackend implements InferenceBackend {
       // partitioned by index range so writes are disjoint.
       this.mtAccPtr = this.wasm.alloc(MAX_T * D * 4);
       if (!this.mtAccPtr) throw new Error("WasmBackend: OOM allocating MoE accumulator");
+      // 4-byte slot used as the cross-thread WASM-memory fence
+      // target. Atomics on a different SAB (the pool's signal buffer)
+      // don't synchronize plain WASM-memory accesses; this slot
+      // gives the pool an atomic location *inside* the memory SAB
+      // it can release/acquire on.
+      const fencePtr = this.wasm.alloc(4);
+      if (!fencePtr) throw new Error("WasmBackend: OOM allocating fence slot");
       // Re-mark the heap so subsequent `reset()` calls (one per
-      // forward) preserve the worker scratch + accumulator. The mark
-      // only moves up, so calling it again is safe even though
-      // loadOnnxWeights already called it past the weight blob.
+      // forward) preserve the worker scratch + accumulator + fence.
       this.wasm.heap_mark_now();
 
       this.mtPool = new MtPool(this.wasm.memory, desired);
+      this.mtPool.setMemoryFenceSlot(fencePtr);
       await this.mtPool.warmup();
     }
 

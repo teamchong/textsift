@@ -17,7 +17,7 @@ import type {
   Logits,
 } from "./abstract.js";
 import { modelForward, type ModelConfig, type ModelWeights } from "../inference/model.js";
-import { MtPool } from "../inference/mt-pool.js";
+import { MtPool, MT_POOL_SLOT_BYTES } from "../inference/mt-pool.js";
 import type { MultiThreadContext } from "../inference/expert.js";
 import type { WorkerScratch } from "../inference/mt-expert.js";
 import type { BlockWeights } from "../inference/block.js";
@@ -687,6 +687,11 @@ export class WasmBackend implements InferenceBackend {
       // it can release/acquire on.
       const fencePtr = this.wasm.alloc(4);
       if (!fencePtr) throw new Error("WasmBackend: OOM allocating fence slot");
+      // Per-worker kernel-call slots inside WASM memory. Workers read
+      // their slot directly on each dispatch instead of receiving a
+      // postMessage, dropping per-task delivery from ~50µs to ~1µs.
+      const slotsPtr = this.wasm.alloc(MT_POOL_SLOT_BYTES * desired);
+      if (!slotsPtr) throw new Error("WasmBackend: OOM allocating mt-pool slots");
       // Per-worker shadow stacks. Each WebAssembly.Instance has its
       // own `__stack_pointer` global, but the stack memory those
       // pointers reference lives in the shared linear memory — so
@@ -703,11 +708,12 @@ export class WasmBackend implements InferenceBackend {
       }
       // Re-mark the heap so subsequent `reset()` calls (one per
       // forward) preserve the worker scratch + accumulator + fence
-      // + stacks.
+      // + slots + stacks.
       this.wasm.heap_mark_now();
 
       this.mtPool = new MtPool(this.wasm.memory, desired);
       this.mtPool.setMemoryFenceSlot(fencePtr);
+      this.mtPool.setSlotsBuffer(slotsPtr);
       this.mtPool.setWorkerStackTops(stackTops);
       await this.mtPool.warmup();
     }

@@ -110,7 +110,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n_blocks = K / BLOCK;
     let zp_per_row = (n_blocks + 1u) >> 1u;
 
-    let int4_nibble_base = n * K;
+    let nibble_row_base = n * K;
     let scale_row = n * n_blocks;
     let x_row = t * K;
 
@@ -122,21 +122,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let zp_nib = select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (b & 1u) == 1u);
         let zp_f: f32 = f32(zp_nib);
 
-        let base_nibble = int4_nibble_base + b * BLOCK;
+        let word_base = (nibble_row_base + b * BLOCK) >> 3u;
+        let xb = x_row + b * BLOCK;
+
         var block_sum: f32 = 0.0;
-        for (var k: u32 = 0u; k < BLOCK; k = k + 4u) {
-            let q0 = f32(load_nibble(&w_int4, base_nibble + k + 0u)) - zp_f;
-            let q1 = f32(load_nibble(&w_int4, base_nibble + k + 1u)) - zp_f;
-            let q2 = f32(load_nibble(&w_int4, base_nibble + k + 2u)) - zp_f;
-            let q3 = f32(load_nibble(&w_int4, base_nibble + k + 3u)) - zp_f;
-            let x0 = x[x_row + b * BLOCK + k + 0u];
-            let x1 = x[x_row + b * BLOCK + k + 1u];
-            let x2 = x[x_row + b * BLOCK + k + 2u];
-            let x3 = x[x_row + b * BLOCK + k + 3u];
-            block_sum = fma(q0, x0, block_sum);
-            block_sum = fma(q1, x1, block_sum);
-            block_sum = fma(q2, x2, block_sum);
-            block_sum = fma(q3, x3, block_sum);
+        for (var w: u32 = 0u; w < 4u; w = w + 1u) {
+            let word = w_int4[word_base + w];
+            let kb = w * 8u;
+            let q0 = f32( word        & 0xFu) - zp_f;
+            let q1 = f32((word >>  4u) & 0xFu) - zp_f;
+            let q2 = f32((word >>  8u) & 0xFu) - zp_f;
+            let q3 = f32((word >> 12u) & 0xFu) - zp_f;
+            let q4 = f32((word >> 16u) & 0xFu) - zp_f;
+            let q5 = f32((word >> 20u) & 0xFu) - zp_f;
+            let q6 = f32((word >> 24u) & 0xFu) - zp_f;
+            let q7 = f32((word >> 28u) & 0xFu) - zp_f;
+            block_sum = fma(q0, x[xb + kb + 0u], block_sum);
+            block_sum = fma(q1, x[xb + kb + 1u], block_sum);
+            block_sum = fma(q2, x[xb + kb + 2u], block_sum);
+            block_sum = fma(q3, x[xb + kb + 3u], block_sum);
+            block_sum = fma(q4, x[xb + kb + 4u], block_sum);
+            block_sum = fma(q5, x[xb + kb + 5u], block_sum);
+            block_sum = fma(q6, x[xb + kb + 6u], block_sum);
+            block_sum = fma(q7, x[xb + kb + 7u], block_sum);
         }
         acc = fma(block_sum, scale, acc);
     }
@@ -145,22 +153,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 `;
 
-// ---------- WGSL: int4 matmul, f32 x → f16 out ----------
+// ---------- WGSL: int4 matmul, fp16 x → f16 out ----------
 
 /**
- * Same dequant + MAC chain as MATMUL_INT4_F32_F32, but rounds the final
- * result to fp16 on store. Used for Q/K/V/O projections (outputs feed
- * fp16 RoPE + fp16 banded attention) and the classifier head's fp16
- * baseline — though the classifier here returns f32 directly since the
- * backend contract is f32 logits.
+ * fp16 x variant of the int4 matmul: reads X as f16 directly, widens
+ * per-load to f32 for the MAC chain. Used for Q/K/V/O projections to
+ * skip the explicit pre-widen cast dispatch — the activation traffic
+ * is halved (f16 vs f32) which offsets the extra per-load widen work.
  */
-const MATMUL_INT4_F32_F16_WGSL = /* wgsl */ `
+const MATMUL_INT4_FP16_F16_WGSL = /* wgsl */ `
 enable f16;
 
 struct Dims { T: u32, N: u32, K: u32, _pad: u32 };
 
 @group(0) @binding(0) var<uniform> dims: Dims;
-@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> x: array<f16>;
 @group(0) @binding(2) var<storage, read> w_int4: array<u32>;
 @group(0) @binding(3) var<storage, read> w_scales: array<f16>;
 @group(0) @binding(4) var<storage, read> w_zp: array<u32>;
@@ -182,7 +189,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n_blocks = K / BLOCK;
     let zp_per_row = (n_blocks + 1u) >> 1u;
 
-    let int4_nibble_base = n * K;
+    let nibble_row_base = n * K;
     let scale_row = n * n_blocks;
     let x_row = t * K;
 
@@ -194,21 +201,32 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let zp_nib = select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (b & 1u) == 1u);
         let zp_f: f32 = f32(zp_nib);
 
-        let base_nibble = int4_nibble_base + b * BLOCK;
+        // 32 nibbles per block = 4 u32 words × 8 nibbles each. Explicit
+        // u32 loads amortize the int4 unpack: one word dispatches 8
+        // (nibble, x, fma) triples instead of 8 scalar load_nibble calls.
+        let word_base = (nibble_row_base + b * BLOCK) >> 3u;
+        let xb = x_row + b * BLOCK;
+
         var block_sum: f32 = 0.0;
-        for (var k: u32 = 0u; k < BLOCK; k = k + 4u) {
-            let q0 = f32(load_nibble(&w_int4, base_nibble + k + 0u)) - zp_f;
-            let q1 = f32(load_nibble(&w_int4, base_nibble + k + 1u)) - zp_f;
-            let q2 = f32(load_nibble(&w_int4, base_nibble + k + 2u)) - zp_f;
-            let q3 = f32(load_nibble(&w_int4, base_nibble + k + 3u)) - zp_f;
-            let x0 = x[x_row + b * BLOCK + k + 0u];
-            let x1 = x[x_row + b * BLOCK + k + 1u];
-            let x2 = x[x_row + b * BLOCK + k + 2u];
-            let x3 = x[x_row + b * BLOCK + k + 3u];
-            block_sum = fma(q0, x0, block_sum);
-            block_sum = fma(q1, x1, block_sum);
-            block_sum = fma(q2, x2, block_sum);
-            block_sum = fma(q3, x3, block_sum);
+        for (var w: u32 = 0u; w < 4u; w = w + 1u) {
+            let word = w_int4[word_base + w];
+            let kb = w * 8u;
+            let q0 = f32( word        & 0xFu) - zp_f;
+            let q1 = f32((word >>  4u) & 0xFu) - zp_f;
+            let q2 = f32((word >>  8u) & 0xFu) - zp_f;
+            let q3 = f32((word >> 12u) & 0xFu) - zp_f;
+            let q4 = f32((word >> 16u) & 0xFu) - zp_f;
+            let q5 = f32((word >> 20u) & 0xFu) - zp_f;
+            let q6 = f32((word >> 24u) & 0xFu) - zp_f;
+            let q7 = f32((word >> 28u) & 0xFu) - zp_f;
+            block_sum = fma(q0, f32(x[xb + kb + 0u]), block_sum);
+            block_sum = fma(q1, f32(x[xb + kb + 1u]), block_sum);
+            block_sum = fma(q2, f32(x[xb + kb + 2u]), block_sum);
+            block_sum = fma(q3, f32(x[xb + kb + 3u]), block_sum);
+            block_sum = fma(q4, f32(x[xb + kb + 4u]), block_sum);
+            block_sum = fma(q5, f32(x[xb + kb + 5u]), block_sum);
+            block_sum = fma(q6, f32(x[xb + kb + 6u]), block_sum);
+            block_sum = fma(q7, f32(x[xb + kb + 7u]), block_sum);
         }
         acc = fma(block_sum, scale, acc);
     }
@@ -842,21 +860,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let zp_nib = select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (b & 1u) == 1u);
         let zp_f: f32 = f32(zp_nib);
 
-        let base_nibble = expert_nibble_base + b * BLOCK;
+        let word_base = (expert_nibble_base + b * BLOCK) >> 3u;
+        let xb = x_row + b * BLOCK;
+
         var block_sum: f32 = 0.0;
-        for (var k: u32 = 0u; k < BLOCK; k = k + 4u) {
-            let q0 = f32(load_nibble(&w_int4, base_nibble + k + 0u)) - zp_f;
-            let q1 = f32(load_nibble(&w_int4, base_nibble + k + 1u)) - zp_f;
-            let q2 = f32(load_nibble(&w_int4, base_nibble + k + 2u)) - zp_f;
-            let q3 = f32(load_nibble(&w_int4, base_nibble + k + 3u)) - zp_f;
-            let x0 = x[x_row + b * BLOCK + k + 0u];
-            let x1 = x[x_row + b * BLOCK + k + 1u];
-            let x2 = x[x_row + b * BLOCK + k + 2u];
-            let x3 = x[x_row + b * BLOCK + k + 3u];
-            block_sum = fma(q0, x0, block_sum);
-            block_sum = fma(q1, x1, block_sum);
-            block_sum = fma(q2, x2, block_sum);
-            block_sum = fma(q3, x3, block_sum);
+        for (var w: u32 = 0u; w < 4u; w = w + 1u) {
+            let word = w_int4[word_base + w];
+            let kb = w * 8u;
+            let q0 = f32( word        & 0xFu) - zp_f;
+            let q1 = f32((word >>  4u) & 0xFu) - zp_f;
+            let q2 = f32((word >>  8u) & 0xFu) - zp_f;
+            let q3 = f32((word >> 12u) & 0xFu) - zp_f;
+            let q4 = f32((word >> 16u) & 0xFu) - zp_f;
+            let q5 = f32((word >> 20u) & 0xFu) - zp_f;
+            let q6 = f32((word >> 24u) & 0xFu) - zp_f;
+            let q7 = f32((word >> 28u) & 0xFu) - zp_f;
+            block_sum = fma(q0, x[xb + kb + 0u], block_sum);
+            block_sum = fma(q1, x[xb + kb + 1u], block_sum);
+            block_sum = fma(q2, x[xb + kb + 2u], block_sum);
+            block_sum = fma(q3, x[xb + kb + 3u], block_sum);
+            block_sum = fma(q4, x[xb + kb + 4u], block_sum);
+            block_sum = fma(q5, x[xb + kb + 5u], block_sum);
+            block_sum = fma(q6, x[xb + kb + 6u], block_sum);
+            block_sum = fma(q7, x[xb + kb + 7u], block_sum);
         }
         acc = fma(block_sum, scale, acc);
     }
@@ -942,21 +968,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let zp_nib = select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (b & 1u) == 1u);
         let zp_f: f32 = f32(zp_nib);
 
-        let base_nibble = expert_nibble_base + b * BLOCK;
+        let word_base = (expert_nibble_base + b * BLOCK) >> 3u;
+        let xb = glu_row + b * BLOCK;
+
         var block_sum: f32 = 0.0;
-        for (var k: u32 = 0u; k < BLOCK; k = k + 4u) {
-            let q0 = f32(load_nibble(&w_int4, base_nibble + k + 0u)) - zp_f;
-            let q1 = f32(load_nibble(&w_int4, base_nibble + k + 1u)) - zp_f;
-            let q2 = f32(load_nibble(&w_int4, base_nibble + k + 2u)) - zp_f;
-            let q3 = f32(load_nibble(&w_int4, base_nibble + k + 3u)) - zp_f;
-            let x0 = glu[glu_row + b * BLOCK + k + 0u];
-            let x1 = glu[glu_row + b * BLOCK + k + 1u];
-            let x2 = glu[glu_row + b * BLOCK + k + 2u];
-            let x3 = glu[glu_row + b * BLOCK + k + 3u];
-            block_sum = fma(q0, x0, block_sum);
-            block_sum = fma(q1, x1, block_sum);
-            block_sum = fma(q2, x2, block_sum);
-            block_sum = fma(q3, x3, block_sum);
+        for (var wi: u32 = 0u; wi < 4u; wi = wi + 1u) {
+            let word = w_int4[word_base + wi];
+            let kb = wi * 8u;
+            let q0 = f32( word        & 0xFu) - zp_f;
+            let q1 = f32((word >>  4u) & 0xFu) - zp_f;
+            let q2 = f32((word >>  8u) & 0xFu) - zp_f;
+            let q3 = f32((word >> 12u) & 0xFu) - zp_f;
+            let q4 = f32((word >> 16u) & 0xFu) - zp_f;
+            let q5 = f32((word >> 20u) & 0xFu) - zp_f;
+            let q6 = f32((word >> 24u) & 0xFu) - zp_f;
+            let q7 = f32((word >> 28u) & 0xFu) - zp_f;
+            block_sum = fma(q0, glu[xb + kb + 0u], block_sum);
+            block_sum = fma(q1, glu[xb + kb + 1u], block_sum);
+            block_sum = fma(q2, glu[xb + kb + 2u], block_sum);
+            block_sum = fma(q3, glu[xb + kb + 3u], block_sum);
+            block_sum = fma(q4, glu[xb + kb + 4u], block_sum);
+            block_sum = fma(q5, glu[xb + kb + 5u], block_sum);
+            block_sum = fma(q6, glu[xb + kb + 6u], block_sum);
+            block_sum = fma(q7, glu[xb + kb + 7u], block_sum);
         }
         acc_local = fma(block_sum, scale, acc_local);
     }
@@ -976,7 +1010,7 @@ interface Pipelines {
   embed: GPUComputePipeline;
   rmsNorm: GPUComputePipeline;
   matmulF32F32: GPUComputePipeline;
-  matmulF32F16: GPUComputePipeline;
+  matmulFp16F16: GPUComputePipeline;
   castFp16ToF32: GPUComputePipeline;
   castF32ToFp16Scaled: GPUComputePipeline;
   addFp16: GPUComputePipeline;
@@ -1022,7 +1056,6 @@ interface Scratch {
   kBuf: GPUBuffer;
   vBuf: GPUBuffer;
   attnOut: GPUBuffer;
-  attnF32: GPUBuffer;
   oOut: GPUBuffer;
   routerLogits: GPUBuffer;
   routingIdx: GPUBuffer;
@@ -1272,22 +1305,10 @@ export class WebGpuBackend implements InferenceBackend {
         T,
       );
 
-      // Widen normed1 → hiddenF32 for Q/K/V matmul.
-      dispatch(
-        this.pipelines.castFp16ToF32,
-        device.createBindGroup({
-          layout: this.bgls.cast1to1,
-          entries: [
-            { binding: 0, resource: { buffer: u(dims4(T * D, 0, 0, 0)) } },
-            { binding: 1, resource: { buffer: scratch.normed1 } },
-            { binding: 2, resource: { buffer: scratch.hiddenF32 } },
-          ],
-        }),
-        T * D,
-      );
-
-      // Q/K/V projections.
-      const runMatmulF16 = (
+      // Q/K/V projections read fp16 normed1 directly via the fp16-in
+      // matmul variant — saves one cast dispatch per layer plus the
+      // corresponding T * D f32 write + read.
+      const runMatmulFp16F16 = (
         weightsBase: string,
         xBuf: GPUBuffer,
         yBuf: GPUBuffer,
@@ -1309,11 +1330,11 @@ export class WebGpuBackend implements InferenceBackend {
             { binding: 6, resource: { buffer: yBuf } },
           ],
         });
-        dispatch(this.pipelines!.matmulF32F16, bg, T * N);
+        dispatch(this.pipelines!.matmulFp16F16, bg, T * N);
       };
-      runMatmulF16(`layers.${L}.attn.q_proj`, scratch.hiddenF32, scratch.qBuf, Hq * hd, D);
-      runMatmulF16(`layers.${L}.attn.k_proj`, scratch.hiddenF32, scratch.kBuf, Hkv * hd, D);
-      runMatmulF16(`layers.${L}.attn.v_proj`, scratch.hiddenF32, scratch.vBuf, Hkv * hd, D);
+      runMatmulFp16F16(`layers.${L}.attn.q_proj`, scratch.normed1, scratch.qBuf, Hq * hd, D);
+      runMatmulFp16F16(`layers.${L}.attn.k_proj`, scratch.normed1, scratch.kBuf, Hkv * hd, D);
+      runMatmulFp16F16(`layers.${L}.attn.v_proj`, scratch.normed1, scratch.vBuf, Hkv * hd, D);
 
       // RoPE on Q and K.
       const runRope = (qkBuf: GPUBuffer, heads: number): void => {
@@ -1350,22 +1371,8 @@ export class WebGpuBackend implements InferenceBackend {
         T * Hq,
       );
 
-      // Widen attn_out → attnF32 for O-projection.
-      dispatch(
-        this.pipelines.castFp16ToF32,
-        device.createBindGroup({
-          layout: this.bgls.cast1to1,
-          entries: [
-            { binding: 0, resource: { buffer: u(dims4(T * Hq * hd, 0, 0, 0)) } },
-            { binding: 1, resource: { buffer: scratch.attnOut } },
-            { binding: 2, resource: { buffer: scratch.attnF32 } },
-          ],
-        }),
-        T * Hq * hd,
-      );
-
-      // O projection.
-      runMatmulF16(`layers.${L}.attn.o_proj`, scratch.attnF32, scratch.oOut, D, Hq * hd);
+      // O projection reads fp16 attnOut directly (same fusion as Q/K/V).
+      runMatmulFp16F16(`layers.${L}.attn.o_proj`, scratch.attnOut, scratch.oOut, D, Hq * hd);
 
       // Residual: hCur + oOut → h1 (scratch).
       dispatch(
@@ -1765,7 +1772,6 @@ export class WebGpuBackend implements InferenceBackend {
       kBuf:          mk("k", T * Hkv * hd * 2, STORE),
       vBuf:          mk("v", T * Hkv * hd * 2, STORE),
       attnOut:       mk("attnOut", T * Hq * hd * 2, STORE),
-      attnF32:       mk("attnF32", T * Hq * hd * 4, STORE),
       oOut:          mk("oOut", T * D * 2, STORE),
       routerLogits:  mk("routerLogits", T * E * 4, STORE),
       routingIdx:    mk("routingIdx", T * Kpick * 4, STORE),
@@ -1881,14 +1887,14 @@ async function createPipelines(
   };
 
   const [
-    embed, rmsNorm, matmulF32F32, matmulF32F16, castFp16ToF32,
+    embed, rmsNorm, matmulF32F32, matmulFp16F16, castFp16ToF32,
     castF32ToFp16Scaled, addFp16, zero, rope, banded,
     routerTopk, swiglu, qmoeGateUp, qmoeDownScatter,
   ] = await Promise.all([
     mk("embed",              EMBED_LOOKUP_INT4_WGSL,       bgls.embed),
     mk("rmsnorm",            RMS_NORM_WGSL,                 bgls.rmsNorm),
     mk("matmul_int4_f32_f32",MATMUL_INT4_F32_F32_WGSL,      bgls.matmul),
-    mk("matmul_int4_f32_f16",MATMUL_INT4_F32_F16_WGSL,      bgls.matmul),
+    mk("matmul_int4_fp16_f16",MATMUL_INT4_FP16_F16_WGSL,    bgls.matmul),
     mk("cast_fp16_to_f32",   CAST_FP16_TO_F32_WGSL,         bgls.cast1to1),
     mk("cast_f32_to_fp16_scaled", CAST_F32_TO_FP16_SCALED_WGSL, bgls.castScaled),
     mk("add_fp16",           ADD_FP16_WGSL,                 bgls.add),
@@ -1902,7 +1908,7 @@ async function createPipelines(
   ]);
 
   return {
-    embed, rmsNorm, matmulF32F32, matmulF32F16, castFp16ToF32,
+    embed, rmsNorm, matmulF32F32, matmulFp16F16, castFp16ToF32,
     castF32ToFp16Scaled, addFp16, zero, rope, banded,
     routerTopk, swiglu, qmoeGateUp, qmoeDownScatter,
   };
@@ -1930,7 +1936,7 @@ function destroyScratch(s: Scratch): void {
   s.normed1.destroy(); s.normed2.destroy();
   s.hiddenF32.destroy();
   s.qBuf.destroy(); s.kBuf.destroy(); s.vBuf.destroy();
-  s.attnOut.destroy(); s.attnF32.destroy(); s.oOut.destroy();
+  s.attnOut.destroy(); s.oOut.destroy();
   s.routerLogits.destroy();
   s.routingIdx.destroy(); s.routingScores.destroy();
   s.acc.destroy();

@@ -1,0 +1,74 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>pii-wasm — WebGPU per-forward breakdown</title>
+  </head>
+  <body>
+    <pre id="out">starting</pre>
+    <script type="module">
+      // Splits forward latency into JS-build vs GPU-execute. Runs WARMUP
+      // iterations to reach steady state, then ITERS measured passes.
+      // JS-build is everything up to queue.submit(); GPU-execute is the
+      // wait for mapAsync on the readback buffer.
+      import { WebGpuBackend, ModelLoader } from "/dist/index.js";
+
+      const $out = document.getElementById("out");
+      const log = (m) => { $out.textContent += "\n" + m; };
+
+      const WARMUP = 3;
+      const ITERS = 10;
+
+      function median(xs) {
+        const s = [...xs].sort((a, b) => a - b);
+        return s[Math.floor(s.length / 2)];
+      }
+
+      try {
+        if (!navigator.gpu) throw new Error("navigator.gpu not available");
+
+        const loader = new ModelLoader({ source: "openai/privacy-filter" });
+        const bundle = await loader.load();
+        log("warmup webgpu backend");
+        const gpu = new WebGpuBackend({ bundle, quantization: "int4", device: "auto" });
+        await gpu.warmup();
+
+        const shapes = [
+          { label: "T=16",  T: 16 },
+          { label: "T=32",  T: 32 },
+          { label: "T=64",  T: 64 },
+          { label: "T=128", T: 128 },
+          { label: "T=256", T: 256 },
+        ];
+
+        const rows = [];
+        for (const { label, T } of shapes) {
+          const tokens = new Int32Array(T);
+          for (let i = 0; i < T; i++) tokens[i] = (i * 37 + 11) % 50000;
+          const mask = new Uint8Array(T).fill(1);
+
+          for (let i = 0; i < WARMUP; i++) await gpu.forward(tokens, mask);
+
+          const totals = [];
+          for (let i = 0; i < ITERS; i++) {
+            const t0 = performance.now();
+            await gpu.forward(tokens, mask);
+            totals.push(performance.now() - t0);
+          }
+          const med = median(totals);
+          log(`${label.padEnd(8)} forward median=${med.toFixed(1)}ms`);
+          rows.push({ label, T, forwardMs: med });
+        }
+
+        gpu.dispose();
+
+        window.__result = { ok: true, rows };
+        log("done");
+      } catch (e) {
+        window.__result = { ok: false, error: String(e), stack: e.stack };
+        log("ERROR: " + e);
+        throw e;
+      }
+    </script>
+  </body>
+</html>

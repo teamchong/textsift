@@ -30,7 +30,7 @@ The model is OpenAI's; the value of this package is packaging:
 - Two custom backends — WGSL kernels for WebGPU and Zig-compiled SIMD WASM — that produce the same logits as transformers.js's WebGPU path on the same input.
 - A WebAssembly path that works at all on this model: ORT-Web's WASM EP (which transformers.js uses under the hood) is missing the `MatMulNBits` and `GatherBlockQuantized` kernels the int4 export needs, so `transformers.js` with `device: "wasm"` fails session creation. textsift's WASM backend is a from-scratch implementation that doesn't go through ORT-Web.
 - Persistent OPFS caching of the 770 MB model weights, configured by default. Same data the model needs anyway, just stored on the user's disk so the second visit doesn't re-download. transformers.js can be configured to do this too — by default it uses the Cache API which silently rejects payloads this big.
-- An incremental `startStream()` API for AI-proxy / LLM-output-filtering use cases. Streams text, yields spans as they become detectable, O(N) total work over a stream of N tokens.
+- A streaming overload of `detect()` — pass an `AsyncIterable<string>` (LLM token stream, ReadableStream-derived iterable, etc.) instead of a `string`. Yields spans as they become detectable. O(N) total work over a stream of N tokens, vs O(N²) for the naive "call detect after every chunk" pattern.
 
 ## Two packages
 

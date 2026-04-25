@@ -39,9 +39,12 @@ const result = await filter.redact(
 ```ts
 PrivacyFilter.create(opts?): Promise<PrivacyFilter>
 filter.redact(text, opts?): Promise<RedactResult>
-filter.detect(text, opts?): Promise<DetectResult>
+
+// detect() overloads on input type:
+filter.detect(text: string, opts?): Promise<DetectResult>          // batch
+filter.detect(input: AsyncIterable<string>, opts?): DetectStreamHandle  // streaming, O(N)
+
 filter.redactBatch(inputs, opts?): Promise<RedactResult[]>
-filter.startStream(opts?): Promise<DetectStreamSession>  // incremental, O(N)
 filter.dispose(): void
 
 // Standalone tokenizer (token counting, custom chunking, etc.)

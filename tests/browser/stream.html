@@ -37,7 +37,7 @@
         log("create filter (backend=wasm)");
         const filter = await PrivacyFilter.create({ backend: "wasm" });
 
-        log("\n[1] batch detect");
+        log("\n[1] batch detect — pass a string");
         const t0 = performance.now();
         const batchResult = await filter.detect(TEXT);
         const tBatch = performance.now() - t0;
@@ -46,23 +46,21 @@
           log(`    [${s.label}] ${JSON.stringify(s.text)} (${s.start}..${s.end})`);
         }
 
-        log("\n[2] streaming detect (24-char chunks)");
-        const session = await filter.startStream();
-        const streamSpans = [];
+        log("\n[2] streaming detect — pass an AsyncIterable<string>");
         const chunks = makeChunks(TEXT, 24);
+        async function* chunkStream() {
+          for (const c of chunks) yield c;
+        }
+        const streamSpans = [];
         const t1 = performance.now();
-        for (let i = 0; i < chunks.length; i++) {
-          for await (const span of session.append(chunks[i])) {
-            streamSpans.push(span);
-            log(`    chunk ${i}: yielded [${span.label}] ${JSON.stringify(span.text)}`);
-          }
-        }
-        for await (const span of session.finish()) {
+        const handle = filter.detect(chunkStream());
+        for await (const span of handle.spanStream) {
           streamSpans.push(span);
-          log(`    finish: yielded [${span.label}] ${JSON.stringify(span.text)}`);
+          log(`    yielded [${span.label}] ${JSON.stringify(span.text)} (${span.start}..${span.end})`);
         }
+        const finalResult = await handle.result;
         const tStream = performance.now() - t1;
-        log(`  ${streamSpans.length} spans in ${tStream.toFixed(0)}ms`);
+        log(`  ${streamSpans.length} spans in ${tStream.toFixed(0)}ms (result.spans=${finalResult.spans.length})`);
 
         // Compare span sets (label + start + end).
         const key = (s) => `${s.label}:${s.start}:${s.end}`;

@@ -35,10 +35,9 @@ import { chunkInput, mergeChunkResults, type Chunk } from "./inference/chunking.
 import { bioesToSpans } from "./inference/spans.js";
 import { applyRedaction } from "./inference/redact.js";
 import {
-  createDetectStream,
-  resolveStreamOptions,
+  streamDetect,
+  type DetectStreamHandle,
   type DetectStreamOptions,
-  type DetectStreamSession,
 } from "./inference/stream.js";
 
 /** Internal ready state. */
@@ -136,8 +135,56 @@ export class PrivacyFilter {
     });
   }
 
-  /** Detect-only variant: same inference, no redacted-string construction. */
-  async detect(text: string, callOpts: RedactOptions = {}): Promise<DetectResult> {
+  /**
+   * Detect PII in `input`. Two call shapes, picked by the type of
+   * `input`:
+   *
+   *   // (1) Batch — pass a string, await the result.
+   *   const result = await filter.detect("Hi John, my email is x@y.com");
+   *   result.spans;          // DetectedSpan[]
+   *
+   *   // (2) Streaming — pass an AsyncIterable<string> (e.g. an LLM
+   *   //     output stream). Returns sync; iterate spans as they
+   *   //     become detectable, OR await `.result` for the final
+   *   //     DetectResult shape, OR both.
+   *   const handle = filter.detect(llmStream);
+   *   for await (const span of handle.spanStream) {
+   *     if (span.label === "secret") abort();
+   *   }
+   *   const final = await handle.result;
+   *
+   * Cost: batch is O(T) inference. Streaming is O(N) total over a
+   * stream of N tokens — each chunk arrival runs inference on a
+   * trailing window, not the whole buffer.
+   */
+  detect(text: string, opts?: RedactOptions): Promise<DetectResult>;
+  detect(input: AsyncIterable<string>, opts?: DetectStreamOptions): DetectStreamHandle;
+  detect(
+    input: string | AsyncIterable<string>,
+    opts: RedactOptions | DetectStreamOptions = {},
+  ): Promise<DetectResult> | DetectStreamHandle {
+    if (typeof input === "string") {
+      return this.detectBatch(input, opts as RedactOptions);
+    }
+    const merged: DetectStreamOptions = {
+      enabledCategories:
+        (opts as DetectStreamOptions).enabledCategories ?? this.opts.enabledCategories,
+      windowTokens: (opts as DetectStreamOptions).windowTokens,
+      safetyMarginTokens: (opts as DetectStreamOptions).safetyMarginTokens,
+      signal: (opts as DetectStreamOptions).signal,
+    };
+    return streamDetect(
+      this.ensureReady().then((r) => ({
+        backend: r.backend,
+        tokenizer: r.tokenizer,
+        viterbi: r.viterbi,
+      })),
+      input,
+      merged,
+    );
+  }
+
+  private async detectBatch(text: string, callOpts: RedactOptions): Promise<DetectResult> {
     const ready = await this.ensureReady();
     return this.enqueue(async () => {
       const spans = await this.runDetection(ready, text, callOpts);
@@ -163,40 +210,6 @@ export class PrivacyFilter {
     return results;
   }
 
-  /**
-   * Start an incremental detection session. Each `session.append(text)`
-   * runs inference on a trailing window of the accumulated buffer and
-   * yields newly-stable spans; `session.finish()` flushes the rest.
-   *
-   * Total work for a stream of N tokens is O(N), versus O(N²) for the
-   * naive pattern of calling `detect(buffer)` after every chunk
-   * arrives. Designed for AI-proxy / LLM-output-filtering use cases.
-   */
-  async startStream(opts: DetectStreamOptions = {}): Promise<DetectStreamSession> {
-    const ready = await this.ensureReady();
-    const enabledFilter = this.buildEnabledFilter();
-    return createDetectStream(
-      {
-        backend: ready.backend,
-        tokenizer: ready.tokenizer,
-        viterbi: ready.viterbi,
-        options: resolveStreamOptions(opts),
-      },
-      enabledFilter,
-    );
-  }
-
-  /**
-   * Build a span-allow predicate from this session's
-   * `enabledCategories` option (if set), so streaming yields don't
-   * include spans the caller has filtered out at the session level.
-   */
-  private buildEnabledFilter(): ((span: DetectedSpan) => boolean) | undefined {
-    const enabled = this.opts.enabledCategories;
-    if (!enabled || enabled.length === ALL_SPAN_LABELS.length) return undefined;
-    const set = new Set<SpanLabel>(enabled);
-    return (span) => set.has(span.label);
-  }
 
   /**
    * Release GPU / WASM resources. Further calls throw. Safe to call

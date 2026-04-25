@@ -94,7 +94,7 @@ Thin wrapper around `AutoModelForTokenClassification`. We bypass `pipeline('toke
 
 ## Design invariants
 
-1. **Public API is narrow** — `PrivacyFilter.create`, `redact`, `detect`, `redactBatch`, `startStream`, `dispose`, plus the exported types.
+1. **Public API is narrow** — `PrivacyFilter.create`, `redact`, `detect` (overloaded for both `string` and `AsyncIterable<string>`), `redactBatch`, `dispose`, plus the exported types.
 2. **Backends are interchangeable** — all backends produce byte-identical spans on the same input.
 3. **Weights live outside the npm bundle** — `textsift-core` ships 76 KB gzipped of JS + a 90 KB WASM module. The 770 MB model is fetched on first use and persisted via OPFS by default.
 4. **No server-side fallback** — if inference can't run locally, an error is thrown. The library does not call any server.

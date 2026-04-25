@@ -104,6 +104,6 @@ export type {
   TokenizerLoadOptions,
   CachedModelInfo,
   BackendResolver,
-  DetectStreamSession,
+  DetectStreamHandle,
   DetectStreamOptions,
 } from "textsift-core";

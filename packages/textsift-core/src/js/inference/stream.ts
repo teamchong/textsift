@@ -1,21 +1,25 @@
 /**
- * Incremental detection over a growing input buffer.
+ * Streaming-input detection.
  *
- * Designed for the LLM-proxy use case where text arrives in chunks and
- * the caller wants spans as they become detectable, not after the full
- * stream has been received.
+ * Used by the `detect()` overload that accepts an
+ * `AsyncIterable<string>` instead of a `string`. Designed for the
+ * AI-proxy / LLM-output-filtering use case: the caller pipes incoming
+ * text directly into `detect(stream)` and gets back a handle exposing
+ * both the final result Promise and an `AsyncIterable<DetectedSpan>`
+ * that yields spans as they become detectable.
  *
  * Cost model:
- *   - Naive (`detect(buffer)` every chunk): O(N²) over a stream of N
- *     tokens — each call re-tokenizes and re-infers everything seen so
- *     far.
- *   - This API: O(N). Each `append()` runs inference on a trailing
- *     window of `WINDOW_TOKENS` tokens (default 1024). Tokens whose
- *     attention window is entirely behind the trailing edge have
- *     stable logits, so spans ending before a `SAFETY_MARGIN_TOKENS`
- *     buffer (default 256) are emitted permanently and never
- *     re-considered. `finish()` runs a full pass over whatever's
- *     left in the buffer, with no margin restriction.
+ *   - Naive (`detect(buffer)` after every chunk): O(N²) over a stream
+ *     of N tokens — each call re-tokenizes and re-infers everything
+ *     seen so far.
+ *   - This implementation: O(N). Each chunk arrival runs inference on
+ *     a trailing window (default 1024 tokens) of the accumulated
+ *     buffer. Tokens whose attention window is entirely behind the
+ *     trailing edge have stable logits, so spans ending before a
+ *     safety margin (default 256 tokens, ≈1024 chars) are emitted
+ *     permanently and never re-considered. After the input stream
+ *     ends, a full chunked pass over the buffer flushes any spans
+ *     still inside the margin.
  *
  * Spans are deduplicated by `(label, start, end)` so re-running a
  * window over an already-seen region doesn't emit duplicates.
@@ -24,213 +28,290 @@
 import type { InferenceBackend } from "../backends/abstract.js";
 import type { Tokenizer } from "../model/tokenizer.js";
 import type { ViterbiDecoder } from "./viterbi.js";
-import type { DetectedSpan } from "../types.js";
-import { PrivacyFilterError } from "../types.js";
+import type { DetectResult, DetectedSpan, SpanLabel } from "../types.js";
+import { ALL_SPAN_LABELS, PrivacyFilterError } from "../types.js";
 import { bioesToSpans } from "./spans.js";
 import { chunkInput, type Chunk } from "./chunking.js";
 
 /**
- * Options for `PrivacyFilter.startStream()`. Defaults are tuned for
- * the LLM-proxy use case: 1024-token window (~4× the model's
- * `slidingWindow=128`, plenty of context above and below any new
- * token), 256-token safety margin (twice the sliding window — spans
- * ending more than 2× window behind the trailing edge can't be
- * affected by any future token).
+ * Options for streaming detection. Defaults are tuned for the
+ * LLM-proxy use case: 1024-token window (~4× the model's
+ * `slidingWindow=128`), 256-token safety margin (twice the sliding
+ * window — spans ending more than 2× window behind the trailing edge
+ * can't be affected by any future token).
  */
 export interface DetectStreamOptions {
   /**
    * How many trailing tokens to send through the model on each
-   * `append()` pass. Larger windows give more context (better
-   * accuracy near the trailing edge) at the cost of more compute per
-   * append. Default: 1024.
+   * incoming chunk. Larger windows give more context near the
+   * trailing edge at the cost of more compute per chunk. Default: 1024.
    */
   windowTokens?: number;
   /**
    * How many tokens behind the trailing edge a span must end before
-   * it's considered stable and emitted. Set high enough that further
-   * appends can't change predictions for tokens at or before
-   * `currentEnd - safetyMarginTokens`. Default: 256.
+   * it's considered stable and emitted. Default: 256.
    */
   safetyMarginTokens?: number;
-  /** Aborts the underlying forward pass. */
+  /** Aborts the underlying forward passes. */
   signal?: AbortSignal;
+  /** Same as the batch-mode `enabledCategories` option. */
+  enabledCategories?: readonly SpanLabel[];
+}
+
+/**
+ * Handle returned by `detect(asyncIterableInput)`. Both consumption
+ * styles work:
+ *
+ *   const handle = filter.detect(llmStream);
+ *
+ *   // (A) iterate spans as they arrive
+ *   for await (const span of handle.spanStream) { ... }
+ *
+ *   // (B) await the final result (full DetectResult shape)
+ *   const result = await handle.result;
+ *
+ * Mixing styles is safe — the underlying job runs once and both
+ * surfaces share its output through a single multi-consumer queue.
+ */
+export interface DetectStreamHandle {
+  /**
+   * Yields spans as they become stable (their `end` is more than the
+   * safety margin behind the trailing edge of the input stream), plus
+   * any remaining stragglers after the input stream ends.
+   */
+  readonly spanStream: AsyncIterable<DetectedSpan>;
+  /**
+   * Resolves to the same `DetectResult` shape `detect(string)` returns,
+   * once the input stream has ended and all spans have been emitted.
+   */
+  readonly result: Promise<DetectResult>;
 }
 
 const DEFAULT_WINDOW_TOKENS = 1024;
 const DEFAULT_SAFETY_MARGIN_TOKENS = 256;
 
-/**
- * Stateful streaming session. Returned by `PrivacyFilter.startStream()`.
- */
-export interface DetectStreamSession {
-  /**
-   * Append text to the stream. Returns an async iterable that yields
-   * any newly-stable spans. The iterable completes when this append's
-   * inference pass has finished. Subsequent appends keep the buffer.
-   *
-   * Spans whose `end` is before `currentTextLength - safetyMargin (in
-   * chars)` are stable and yielded; spans within the margin wait for
-   * a future append (or the final `finish()`) before being emitted.
-   */
-  append(text: string): AsyncIterable<DetectedSpan>;
-
-  /**
-   * Flush the entire remaining buffer through the full chunked
-   * pipeline. Yields any spans not yet emitted (including those that
-   * were within the safety margin and have now "settled" because
-   * there's no more text to come).
-   */
-  finish(): AsyncIterable<DetectedSpan>;
-
-  /** Current accumulated input text. */
-  readonly text: string;
-}
-
-interface SessionInternals {
+interface StreamInternals {
   backend: InferenceBackend;
   tokenizer: Tokenizer;
   viterbi: ViterbiDecoder;
-  options: Required<Omit<DetectStreamOptions, "signal">> & { signal?: AbortSignal };
-}
-
-export function createDetectStream(
-  internals: SessionInternals,
-  enabledFilter?: (span: DetectedSpan) => boolean,
-): DetectStreamSession {
-  const { backend, tokenizer, viterbi, options } = internals;
-  const windowTokens = options.windowTokens;
-  const safetyMarginTokens = options.safetyMarginTokens;
-
-  let buffer = "";
-  // (label, start, end) → true. Spans we've already yielded.
-  const emitted = new Set<string>();
-
-  function spanKey(s: DetectedSpan): string {
-    return `${s.label}:${s.start}:${s.end}`;
-  }
-
-  function shouldEmit(span: DetectedSpan): boolean {
-    if (enabledFilter && !enabledFilter(span)) return false;
-    const key = spanKey(span);
-    if (emitted.has(key)) return false;
-    emitted.add(key);
-    return true;
-  }
-
-  /**
-   * Run the model on a trailing-window slice of the current buffer
-   * and yield the spans that fall on/before `safetyEdgeChar`.
-   */
-  async function* runWindow(
-    safetyEdgeChar: number,
-  ): AsyncGenerator<DetectedSpan> {
-    if (buffer.length === 0) return;
-    options.signal?.throwIfAborted();
-
-    const enc = tokenizer.encode(buffer);
-    const totalTokens = enc.tokenIds.length;
-    if (totalTokens === 0) return;
-
-    // Pick a trailing window. If the buffer fits, use it whole.
-    const winStart = Math.max(0, totalTokens - windowTokens);
-    const winLen = totalTokens - winStart;
-
-    const windowIds = enc.tokenIds.subarray(winStart, totalTokens);
-    const windowMask = enc.attentionMask.subarray(winStart, totalTokens);
-
-    const logits = await backend.forward(windowIds, windowMask);
-    const tags = viterbi.decode(logits, winLen);
-
-    // Build a Chunk-shaped object so bioesToSpans can do its
-    // standard offset accounting. tokenToCharOffset is the slice of
-    // the global one shifted to chunk-local indices.
-    const winFirstCharOffset = enc.tokenToCharOffset[winStart] ?? 0;
-    const localTokenToChar: number[] = new Array(winLen + 1);
-    for (let i = 0; i <= winLen; i++) {
-      const abs = enc.tokenToCharOffset[winStart + i] ?? buffer.length;
-      localTokenToChar[i] = abs - winFirstCharOffset;
-    }
-    const chunk: Chunk = {
-      tokenIds: windowIds,
-      attentionMask: windowMask,
-      tokenToCharOffset: localTokenToChar,
-      text: buffer.slice(winFirstCharOffset),
-      charOffset: winFirstCharOffset,
-      emitRange: [0, winLen] as const,
-    };
-
-    const spans = bioesToSpans(tags, chunk, tokenizer);
-    for (const span of spans) {
-      if (span.end > safetyEdgeChar) continue; // not stable yet
-      if (shouldEmit(span)) yield span;
-    }
-  }
-
-  return {
-    get text() {
-      return buffer;
-    },
-
-    async *append(text: string) {
-      if (text.length === 0) return;
-      buffer += text;
-
-      // Translate the safety margin from tokens to a character-edge.
-      // Cheap heuristic: assume 1 token ≈ 4 chars. Off-by-some doesn't
-      // matter — the margin only needs to be loose-but-sufficient.
-      const safetyMarginChars = safetyMarginTokens * 4;
-      const safetyEdgeChar = Math.max(0, buffer.length - safetyMarginChars);
-
-      for await (const span of runWindow(safetyEdgeChar)) {
-        yield span;
-      }
-    },
-
-    async *finish() {
-      if (buffer.length === 0) return;
-      // Final pass: full chunked pipeline (handles arbitrarily long
-      // buffers correctly), no safety-margin restriction.
-      const chunks = chunkInput(buffer, tokenizer, {
-        maxChunkTokens: Math.max(windowTokens, 2048),
-      });
-      for (const chunk of chunks) {
-        options.signal?.throwIfAborted();
-        const logits = await backend.forward(chunk.tokenIds, chunk.attentionMask);
-        const tags = viterbi.decode(logits, chunk.tokenIds.length);
-        const spans = bioesToSpans(tags, chunk, tokenizer);
-        for (const span of spans) {
-          if (shouldEmit(span)) yield span;
-        }
-      }
-    },
-  };
 }
 
 /**
- * Type-guard helper exported for users who construct a
- * `DetectStreamOptions` from untyped sources (e.g. a config file).
- * Validates and applies defaults; throws on bad input.
+ * Build a streaming-detection handle. Returns synchronously so
+ * `detect(stream)` matches the no-await call shape Vercel-style
+ * stream APIs use. The driver awaits `internalsReady` before issuing
+ * any forward pass — letting the caller pass an unresolved readiness
+ * Promise from `PrivacyFilter.ensureReady()` without blocking the
+ * factory call.
  */
-export function resolveStreamOptions(
+export function streamDetect(
+  internalsReady: Promise<StreamInternals>,
+  input: AsyncIterable<string>,
   opts: DetectStreamOptions = {},
-): Required<Omit<DetectStreamOptions, "signal">> & { signal?: AbortSignal } {
+): DetectStreamHandle {
+  const resolved = resolveStreamOptions(opts);
+  const enabledFilter = buildEnabledFilter(resolved.enabledCategories);
+  const allSpans: DetectedSpan[] = [];
+  let inputBuffer = "";
+
+  // Multi-consumer queue: one driver pushes spans, two surfaces
+  // (`spanStream` iterator and `result` resolution) both pull. Empty
+  // iterator pulls park as `waiter` resolvers.
+  const queue: DetectedSpan[] = [];
+  let queueClosed = false;
+  let queueError: unknown = undefined;
+  const waiters: Array<(v: IteratorResult<DetectedSpan>) => void> = [];
+
+  function pushQueue(value: DetectedSpan): void {
+    const w = waiters.shift();
+    if (w) w({ value, done: false });
+    else queue.push(value);
+  }
+  function closeQueue(err?: unknown): void {
+    queueClosed = true;
+    queueError = err;
+    while (waiters.length > 0) {
+      const w = waiters.shift()!;
+      w({ value: undefined as unknown as DetectedSpan, done: true });
+    }
+  }
+
+  let resolveResult!: (value: DetectResult) => void;
+  let rejectResult!: (reason: unknown) => void;
+  const result: Promise<DetectResult> = new Promise((res, rej) => {
+    resolveResult = res;
+    rejectResult = rej;
+  });
+
+  // Driver: reads `input`, runs trailing-window inference per chunk,
+  // pushes stable spans into the queue. Runs eagerly so consumers can
+  // iterate at any rate without losing progress.
+  (async () => {
+    try {
+      const internals = await internalsReady;
+      const emitted = new Set<string>();
+      const { backend, tokenizer, viterbi } = internals;
+      const safetyMarginChars = resolved.safetyMarginTokens * 4;
+
+      function shouldEmit(span: DetectedSpan): boolean {
+        if (enabledFilter && !enabledFilter(span)) return false;
+        const key = `${span.label}:${span.start}:${span.end}`;
+        if (emitted.has(key)) return false;
+        emitted.add(key);
+        return true;
+      }
+
+      async function runWindow(safetyEdgeChar: number): Promise<void> {
+        if (inputBuffer.length === 0) return;
+        resolved.signal?.throwIfAborted();
+
+        const enc = tokenizer.encode(inputBuffer);
+        const totalTokens = enc.tokenIds.length;
+        if (totalTokens === 0) return;
+
+        const winStart = Math.max(0, totalTokens - resolved.windowTokens);
+        const winLen = totalTokens - winStart;
+        const windowIds = enc.tokenIds.subarray(winStart, totalTokens);
+        const windowMask = enc.attentionMask.subarray(winStart, totalTokens);
+
+        const logits = await backend.forward(windowIds, windowMask);
+        const tags = viterbi.decode(logits, winLen);
+
+        const winFirstCharOffset = enc.tokenToCharOffset[winStart] ?? 0;
+        const localTokenToChar: number[] = new Array(winLen + 1);
+        for (let i = 0; i <= winLen; i++) {
+          const abs = enc.tokenToCharOffset[winStart + i] ?? inputBuffer.length;
+          localTokenToChar[i] = abs - winFirstCharOffset;
+        }
+        const chunk: Chunk = {
+          tokenIds: windowIds,
+          attentionMask: windowMask,
+          tokenToCharOffset: localTokenToChar,
+          text: inputBuffer.slice(winFirstCharOffset),
+          charOffset: winFirstCharOffset,
+          emitRange: [0, winLen] as const,
+        };
+
+        const spans = bioesToSpans(tags, chunk, tokenizer);
+        for (const span of spans) {
+          if (span.end > safetyEdgeChar) continue;
+          if (shouldEmit(span)) {
+            allSpans.push(span);
+            pushQueue(span);
+          }
+        }
+      }
+
+      for await (const chunk of input) {
+        if (chunk.length === 0) continue;
+        inputBuffer += chunk;
+        const safetyEdgeChar = Math.max(0, inputBuffer.length - safetyMarginChars);
+        await runWindow(safetyEdgeChar);
+      }
+
+      // Stream ended — flush remaining buffer through the full chunked
+      // pipeline. No safety margin; all undetected spans are now stable.
+      if (inputBuffer.length > 0) {
+        const chunks = chunkInput(inputBuffer, internals.tokenizer, {
+          maxChunkTokens: Math.max(resolved.windowTokens, 2048),
+        });
+        for (const c of chunks) {
+          resolved.signal?.throwIfAborted();
+          const logits = await internals.backend.forward(c.tokenIds, c.attentionMask);
+          const tags = internals.viterbi.decode(logits, c.tokenIds.length);
+          const spans = bioesToSpans(tags, c, internals.tokenizer);
+          for (const span of spans) {
+            if (shouldEmit(span)) {
+              allSpans.push(span);
+              pushQueue(span);
+            }
+          }
+        }
+      }
+
+      const summary = buildSummary(allSpans);
+      resolveResult({
+        input: inputBuffer,
+        spans: allSpans,
+        summary,
+        containsPii: allSpans.length > 0,
+      });
+      closeQueue();
+    } catch (err) {
+      rejectResult(err);
+      closeQueue(err);
+    }
+  })();
+
+  const spanStream: AsyncIterable<DetectedSpan> = {
+    [Symbol.asyncIterator]() {
+      return {
+        next(): Promise<IteratorResult<DetectedSpan>> {
+          if (queue.length > 0) {
+            return Promise.resolve({ value: queue.shift()!, done: false });
+          }
+          if (queueClosed) {
+            if (queueError !== undefined) return Promise.reject(queueError);
+            return Promise.resolve({
+              value: undefined as unknown as DetectedSpan,
+              done: true,
+            });
+          }
+          return new Promise((resolve) => waiters.push(resolve));
+        },
+      };
+    },
+  };
+
+  return { spanStream, result };
+}
+
+function buildEnabledFilter(
+  enabled: readonly SpanLabel[] | undefined,
+): ((span: DetectedSpan) => boolean) | undefined {
+  if (!enabled || enabled.length === ALL_SPAN_LABELS.length) return undefined;
+  const set = new Set<SpanLabel>(enabled);
+  return (span) => set.has(span.label);
+}
+
+function buildSummary(
+  spans: readonly DetectedSpan[],
+): Partial<Record<SpanLabel, number>> {
+  const out: Partial<Record<SpanLabel, number>> = {};
+  for (const span of spans) {
+    out[span.label] = (out[span.label] ?? 0) + 1;
+  }
+  return out;
+}
+
+/**
+ * Validate and apply defaults to a partial `DetectStreamOptions`.
+ * Exported so the umbrella package can re-validate user-supplied
+ * config without duplicating the logic.
+ */
+export function resolveStreamOptions(opts: DetectStreamOptions = {}): {
+  windowTokens: number;
+  safetyMarginTokens: number;
+  signal?: AbortSignal;
+  enabledCategories?: readonly SpanLabel[];
+} {
   const windowTokens = opts.windowTokens ?? DEFAULT_WINDOW_TOKENS;
   const safetyMarginTokens = opts.safetyMarginTokens ?? DEFAULT_SAFETY_MARGIN_TOKENS;
   if (windowTokens <= 0 || !Number.isFinite(windowTokens)) {
     throw new PrivacyFilterError(
-      `DetectStream: invalid windowTokens=${windowTokens}; must be > 0`,
+      `detect(stream): invalid windowTokens=${windowTokens}; must be > 0`,
       "INTERNAL",
     );
   }
   if (safetyMarginTokens < 0 || !Number.isFinite(safetyMarginTokens)) {
     throw new PrivacyFilterError(
-      `DetectStream: invalid safetyMarginTokens=${safetyMarginTokens}; must be ≥ 0`,
+      `detect(stream): invalid safetyMarginTokens=${safetyMarginTokens}; must be ≥ 0`,
       "INTERNAL",
     );
   }
   if (safetyMarginTokens >= windowTokens) {
     throw new PrivacyFilterError(
-      `DetectStream: safetyMarginTokens (${safetyMarginTokens}) must be < windowTokens (${windowTokens})`,
+      `detect(stream): safetyMarginTokens (${safetyMarginTokens}) must be < windowTokens (${windowTokens})`,
       "INTERNAL",
     );
   }
@@ -238,5 +319,6 @@ export function resolveStreamOptions(
     windowTokens,
     safetyMarginTokens,
     signal: opts.signal,
+    enabledCategories: opts.enabledCategories,
   };
 }

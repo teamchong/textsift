@@ -19,7 +19,7 @@ The model is OpenAI's; the value here is packaging:
 - Two custom backends — WGSL for WebGPU and Zig-compiled SIMD WASM — that produce byte-identical span output to transformers.js's WebGPU path.
 - A WASM path that loads `model_q4f16.onnx` at all. transformers.js's WASM EP doesn't, because ORT-Web's WASM bundle has no `MatMulNBits` / `GatherBlockQuantized` kernel.
 - Persistent OPFS caching of the 770 MB model weights, configured by default.
-- An incremental `startStream()` API for AI-proxy / LLM-output-filtering use cases. O(N) over a stream of N tokens, vs O(N²) for the naive `detect(buffer)` pattern.
+- A streaming overload of `detect()` for AI-proxy / LLM-output-filtering use cases — pass an `AsyncIterable<string>` instead of a `string`. O(N) over a stream of N tokens, vs O(N²) for the naive "call detect after every chunk" pattern.
 
 ## Use
 
@@ -45,16 +45,24 @@ Detect-only:
 const { spans, containsPii } = await filter.detect(text);
 ```
 
-Streaming detect (proxy use case):
+Streaming detect (proxy use case) — same `detect()`, just pass an async source:
 
 ```ts
-const session = await filter.startStream();
-for (const llmChunk of llmStream) {
-  for await (const span of session.append(llmChunk)) {
-    if (span.label === "secret" && span.confidence > 0.9) abort();
+async function* llmStream() {
+  for await (const chunk of openai.chat.completions.create({ stream: true, ... })) {
+    yield chunk.choices[0]?.delta?.content ?? "";
   }
 }
-for await (const span of session.finish()) handle(span);
+
+const handle = filter.detect(llmStream());
+
+// Iterate spans as they become detectable...
+for await (const span of handle.spanStream) {
+  if (span.label === "secret" && span.confidence > 0.9) abort();
+}
+
+// ...and/or await the final result.
+const result = await handle.result;
 ```
 
 Batch inputs, custom markers, per-category enabling — see the [API reference](https://teamchong.github.io/textsift/api/).

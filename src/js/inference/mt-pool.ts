@@ -119,6 +119,7 @@ let memFence;
 let slotsF64;
 let workerIdx;
 let kernelTable;
+let numThreads;
 
 _onMessage(async (e) => {
   const msg = e.data;
@@ -131,6 +132,7 @@ _onMessage(async (e) => {
     memFence = new Int32Array(msg.memory.buffer, msg.memFenceOffset, 1);
     slotsF64 = new Float64Array(msg.memory.buffer, msg.slotsByteOffset, SLOT_F64S * msg.numThreads);
     workerIdx = msg.workerIdx;
+    numThreads = msg.numThreads;
     kernelTable = msg.kernelNames.map((name) => {
       const fn = wasm[name];
       if (!fn) throw new Error("worker missing kernel: " + name);
@@ -203,10 +205,14 @@ function runDispatchLoop() {
       }
     }
 
-    // Release fence then signal completion.
+    // Release fence then signal completion. Only the worker whose
+    // increment brings done == numThreads notifies main — earlier
+    // workers don't need to wake main into a still-incomplete state.
     Atomics.add(memFence, 0, 0);
-    Atomics.add(signal, DONE_OFFSET, 1);
-    Atomics.notify(signal, DONE_OFFSET);
+    const oldDone = Atomics.add(signal, DONE_OFFSET, 1);
+    if (oldDone + 1 === numThreads) {
+      Atomics.notify(signal, DONE_OFFSET);
+    }
   }
 }
 `;

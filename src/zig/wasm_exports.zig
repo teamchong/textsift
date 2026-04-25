@@ -217,6 +217,138 @@ export fn rms_norm(
     }
 }
 
+// --------------------------------------------------------------
+// Kernel: fused RMSNorm (fp16 in) → f32 out
+// --------------------------------------------------------------
+//
+// Every rms_norm caller in this model is followed immediately by a
+// `convert_fp16_to_f32` of the result (Q/K/V matmul input, classifier
+// matmul input). Fusing eliminates the round-trip through fp16 plus
+// one full pass through T*D bytes of memory. SIMD-widens 4 lanes per
+// step via `fp16x4ToF32x4`.
+export fn rms_norm_fp16_to_f32(
+    x_ptr: [*]const u16,
+    gamma_ptr: [*]const u16,
+    out_ptr: [*]f32,
+    T: u32,
+    D: u32,
+    eps: f32,
+) void {
+    const Tz: usize = T;
+    const Dz: usize = D;
+    const LANES: usize = 4;
+    const d_inv: f32 = 1.0 / @as(f32, @floatFromInt(Dz));
+
+    var t: usize = 0;
+    while (t < Tz) : (t += 1) {
+        const x_row = x_ptr + t * Dz;
+        const out_row = out_ptr + t * Dz;
+
+        // Pass 1: accumulate sumsq using SIMD widen.
+        var sumsq_vec: @Vector(4, f32) = @splat(0);
+        var d: usize = 0;
+        while (d + LANES <= Dz) : (d += LANES) {
+            const xu: @Vector(4, u16) = x_row[d ..][0..LANES].*;
+            const xv: @Vector(4, f32) = fp16x4ToF32x4(xu);
+            sumsq_vec += xv * xv;
+        }
+        var sumsq: f32 = sumsq_vec[0] + sumsq_vec[1] + sumsq_vec[2] + sumsq_vec[3];
+        while (d < Dz) : (d += 1) {
+            const v = fp16ToF32(x_row[d]);
+            sumsq += v * v;
+        }
+
+        const inv_rms: f32 = 1.0 / @sqrt(sumsq * d_inv + eps);
+        const inv_rms_vec: @Vector(4, f32) = @splat(inv_rms);
+
+        // Pass 2: x * gamma * inv_rms → f32 out (no fp16 round-trip).
+        d = 0;
+        while (d + LANES <= Dz) : (d += LANES) {
+            const xu: @Vector(4, u16) = x_row[d ..][0..LANES].*;
+            const gu: @Vector(4, u16) = gamma_ptr[d ..][0..LANES].*;
+            const xv = fp16x4ToF32x4(xu);
+            const gv = fp16x4ToF32x4(gu);
+            out_row[d ..][0..LANES].* = xv * inv_rms_vec * gv;
+        }
+        while (d < Dz) : (d += 1) {
+            out_row[d] = fp16ToF32(x_row[d]) * inv_rms * fp16ToF32(gamma_ptr[d]);
+        }
+    }
+}
+
+// --------------------------------------------------------------
+// Kernel: fused (a + b) → fp16 sum + RMSNorm → f32 out
+// --------------------------------------------------------------
+//
+// Post-attention sequence collapses three kernels into one pass per
+// row: residual+attn add (writes new residual stream as fp16), then
+// rmsnorm+widen on the same row (writes f32 input for router/expert
+// matmuls). Eliminates the intermediate fp16-normed buffer and the
+// explicit residual copy.
+export fn add_rmsnorm_fp16_to_f32(
+    a_ptr: [*]const u16,
+    b_ptr: [*]const u16,
+    gamma_ptr: [*]const u16,
+    sum_out_ptr: [*]u16,
+    norm_out_ptr: [*]f32,
+    T: u32,
+    D: u32,
+    eps: f32,
+) void {
+    const Tz: usize = T;
+    const Dz: usize = D;
+    const LANES: usize = 4;
+    const d_inv: f32 = 1.0 / @as(f32, @floatFromInt(Dz));
+
+    var t: usize = 0;
+    while (t < Tz) : (t += 1) {
+        const a_row = a_ptr + t * Dz;
+        const b_row = b_ptr + t * Dz;
+        const sum_row = sum_out_ptr + t * Dz;
+        const norm_row = norm_out_ptr + t * Dz;
+
+        // Pass 1: sum = a + b (fp16 store, residual stream carries on),
+        // accumulate sumsq for the norm in the same vector pass.
+        var sumsq_vec: @Vector(4, f32) = @splat(0);
+        var d: usize = 0;
+        while (d + LANES <= Dz) : (d += LANES) {
+            const av: @Vector(4, u16) = a_row[d ..][0..LANES].*;
+            const bv: @Vector(4, u16) = b_row[d ..][0..LANES].*;
+            const sv: @Vector(4, f32) = fp16x4ToF32x4(av) + fp16x4ToF32x4(bv);
+            sum_row[d + 0] = f32ToFp16(sv[0]);
+            sum_row[d + 1] = f32ToFp16(sv[1]);
+            sum_row[d + 2] = f32ToFp16(sv[2]);
+            sum_row[d + 3] = f32ToFp16(sv[3]);
+            sumsq_vec += sv * sv;
+        }
+        var sumsq: f32 = sumsq_vec[0] + sumsq_vec[1] + sumsq_vec[2] + sumsq_vec[3];
+        while (d < Dz) : (d += 1) {
+            const sv = fp16ToF32(a_row[d]) + fp16ToF32(b_row[d]);
+            sum_row[d] = f32ToFp16(sv);
+            sumsq += sv * sv;
+        }
+
+        const inv_rms: f32 = 1.0 / @sqrt(sumsq * d_inv + eps);
+        const inv_rms_vec: @Vector(4, f32) = @splat(inv_rms);
+
+        // Pass 2: re-load fp16 sum we just wrote (still hot in L1) and
+        // produce normalized f32 in one shot. Re-rounding through fp16
+        // here matches what the unfused pipeline did (add_fp16 → rms_norm
+        // reads fp16) so cross-backend numerics stay bit-equivalent.
+        d = 0;
+        while (d + LANES <= Dz) : (d += LANES) {
+            const su: @Vector(4, u16) = sum_row[d ..][0..LANES].*;
+            const gu: @Vector(4, u16) = gamma_ptr[d ..][0..LANES].*;
+            const sv = fp16x4ToF32x4(su);
+            const gv = fp16x4ToF32x4(gu);
+            norm_row[d ..][0..LANES].* = sv * inv_rms_vec * gv;
+        }
+        while (d < Dz) : (d += 1) {
+            norm_row[d] = fp16ToF32(sum_row[d]) * inv_rms * fp16ToF32(gamma_ptr[d]);
+        }
+    }
+}
+
 
 // --------------------------------------------------------------
 // Kernel: row-wise top-k (partial selection)

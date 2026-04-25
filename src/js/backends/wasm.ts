@@ -38,6 +38,12 @@ export interface PiiWasmExports {
   echo(x: number): number;
   sum_i32(ptr: number, len: number): number;
   rms_norm(x: number, gamma: number, out: number, T: number, D: number, eps: number): void;
+  rms_norm_fp16_to_f32(x: number, gamma: number, out: number, T: number, D: number, eps: number): void;
+  add_rmsnorm_fp16_to_f32(
+    a: number, b: number, gamma: number,
+    sum_out: number, norm_out: number,
+    T: number, D: number, eps: number,
+  ): void;
   // int4-block matmul variants: `w_zp` is `0` for symmetric decode (no zero-points),
   // or a pointer into WASM memory for asymmetric (ONNX MatMulNBits semantics).
   matmul_fp16_x_int4block(x: number, w_int4: number, w_scales: number, w_zp: number, bias: number, out: number, T: number, N: number, D: number): void;
@@ -161,6 +167,8 @@ export async function loadPiiWasm(url?: string | URL | null): Promise<PiiWasmExp
     "echo",
     "sum_i32",
     "rms_norm",
+    "rms_norm_fp16_to_f32",
+    "add_rmsnorm_fp16_to_f32",
     "matmul_fp16_x_int4block",
     "matmul_fp16_x_int4block_out_f32",
     "matmul_f32_x_int4block",

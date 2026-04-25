@@ -44,7 +44,12 @@ export interface AttentionTables {
 
 export async function attentionForward(
   wasm: PiiWasmExports,
-  hiddenPtr: number,
+  /**
+   * f32 [T, D]; the caller has already widened hidden via the fused
+   * `rms_norm_fp16_to_f32` so the Q/K/V int4 matmuls can run directly
+   * against an f32 input without an extra widening pass.
+   */
+  hiddenF32Ptr: number,
   outputPtr: number,
   weights: AttentionWeights,
   config: AttentionConfig,
@@ -70,15 +75,10 @@ export async function attentionForward(
   const kPtr = wasm.alloc(T * Hkv * hd * 2);
   const vPtr = wasm.alloc(T * Hkv * hd * 2);
   const attnOutPtr = wasm.alloc(T * Hq * hd * 2);
-  // Pre-convert hidden (fp16) → f32 once so the Q/K/V int4 matmuls can
-  // use the f32-input kernel and skip the per-load fp16 widening.
-  const hiddenF32Ptr = wasm.alloc(T * D * 4);
   const attnF32Ptr = wasm.alloc(T * Hq * hd * 4);
-  if (qPtr === 0 || kPtr === 0 || vPtr === 0 || attnOutPtr === 0
-      || hiddenF32Ptr === 0 || attnF32Ptr === 0) {
+  if (qPtr === 0 || kPtr === 0 || vPtr === 0 || attnOutPtr === 0 || attnF32Ptr === 0) {
     throw new Error("attentionForward: scratch alloc OOM");
   }
-  wasm.convert_fp16_to_f32(hiddenPtr, hiddenF32Ptr, T * D);
 
   // Q/K/V projections. Single-threaded by default; with an MtPool the
   // T axis is partitioned across workers — each worker calls all three

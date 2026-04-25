@@ -1,15 +1,14 @@
 /**
  * Transformer block forward composition.
  *
- *   residual = h
- *   h = input_layernorm(h)
- *   h = self_attn(h, cos, sin)
- *   h = residual + h
+ *   residual = input
+ *   h_f32    = rms_norm(input) → f32           # fused norm + widen
+ *   attn_out = self_attn(h_f32, cos, sin)
  *
- *   residual = h
- *   h = post_attention_layernorm(h)
- *   h = mlp(h)                         # router + experts + scale-by-K
- *   h = residual + h
+ *   residual2, h_f32 = add+rmsnorm(residual, attn_out) → (fp16, f32)
+ *                                              # fused add + norm + widen
+ *   moe_out  = mlp(h_f32)                      # router + experts + scale-by-K
+ *   output   = residual2 + moe_out
  *
  * All intermediate buffers are bump-alloc'd; caller resets the heap
  * between forward passes.
@@ -88,29 +87,29 @@ export async function blockForward(
   const D = config.hiddenSize;
   const K = config.numExpertsPerTok;
 
-  // Residual save 1.
-  const residualPtr = wasm.alloc(T * D * 2);
-  new Uint8Array(wasm.memory.buffer, residualPtr, T * D * 2).set(
-    new Uint8Array(wasm.memory.buffer, inputPtr, T * D * 2),
+  // Pre-attention norm + widen, fused. `inputPtr` is the residual stream
+  // for the attention add — attention reads only the f32 normed copy, so
+  // the residual lives on inside the caller's input buffer with no
+  // explicit copy.
+  const hiddenF32Ptr = wasm.alloc(T * D * 4);
+  if (hiddenF32Ptr === 0) throw new Error("blockForward: hidden f32 alloc OOM");
+  wasm.rms_norm_fp16_to_f32(
+    inputPtr, weights.inputLayernorm.dataOffset, hiddenF32Ptr,
+    T, D, config.rmsNormEps,
   );
 
-  const normed1Ptr = wasm.alloc(T * D * 2);
-  wasm.rms_norm(inputPtr, weights.inputLayernorm.dataOffset, normed1Ptr, T, D, config.rmsNormEps);
-
   const attnOutPtr = wasm.alloc(T * D * 2);
-  await attentionForward(wasm, normed1Ptr, attnOutPtr, weights.attn, config, tables, T, maskPtr, mt);
+  await attentionForward(wasm, hiddenF32Ptr, attnOutPtr, weights.attn, config, tables, T, maskPtr, mt);
 
-  const h1Ptr = wasm.alloc(T * D * 2);
+  // Post-attention add+norm+widen, fused. Writes the new residual stream
+  // (fp16) and the f32 input the router/experts consume in one pass per
+  // row. `inputPtr` carries the pre-attention residual1 directly.
   const residual2Ptr = wasm.alloc(T * D * 2);
-  const normed2Ptr = wasm.alloc(T * D * 2);
-  // Pre-widen normed2 once — used by both the router matmul and
-  // every expert's gate_up, so a single conversion here avoids per-
-  // caller duplication.
   const normed2F32Ptr = wasm.alloc(T * D * 4);
+  if (residual2Ptr === 0 || normed2F32Ptr === 0) {
+    throw new Error("blockForward: post-attention scratch alloc OOM");
+  }
 
-  // Post-attention sequence: residual add, rmsnorm, cast → f32.
-  // Parallelize per-T slice when MT is on; same kernels and
-  // semantics, just sliced pointers.
   if (mt && T >= mt.pool.numThreads * 2) {
     const N = mt.pool.numThreads;
     const scripts: WorkerScript[] = [];
@@ -122,28 +121,26 @@ export async function blockForward(
       if (tCount > 0) {
         const off2 = tStart * D * 2;
         const off4 = tStart * D * 4;
-        calls.push(
-          { kernel: "add_fp16", args: [residualPtr + off2, attnOutPtr + off2, h1Ptr + off2, tCount * D] },
-          { kernel: "rms_norm", args: [h1Ptr + off2, weights.postAttentionLayernorm.dataOffset, normed2Ptr + off2, tCount, D, config.rmsNormEps] },
-          { kernel: "convert_fp16_to_f32", args: [normed2Ptr + off2, normed2F32Ptr + off4, tCount * D] },
-        );
+        calls.push({
+          kernel: "add_rmsnorm_fp16_to_f32",
+          args: [
+            inputPtr + off2, attnOutPtr + off2, weights.postAttentionLayernorm.dataOffset,
+            residual2Ptr + off2, normed2F32Ptr + off4,
+            tCount, D, config.rmsNormEps,
+          ],
+        });
       } else {
         calls.push({ kernel: "echo", args: [0] });
       }
       scripts.push(calls);
     }
     await mt.pool.run(scripts);
-    // Snapshot h1 → residual2 on main; small, sync, no kernel needed.
-    new Uint8Array(wasm.memory.buffer, residual2Ptr, T * D * 2).set(
-      new Uint8Array(wasm.memory.buffer, h1Ptr, T * D * 2),
-    );
   } else {
-    wasm.add_fp16(residualPtr, attnOutPtr, h1Ptr, T * D);
-    new Uint8Array(wasm.memory.buffer, residual2Ptr, T * D * 2).set(
-      new Uint8Array(wasm.memory.buffer, h1Ptr, T * D * 2),
+    wasm.add_rmsnorm_fp16_to_f32(
+      inputPtr, attnOutPtr, weights.postAttentionLayernorm.dataOffset,
+      residual2Ptr, normed2F32Ptr,
+      T, D, config.rmsNormEps,
     );
-    wasm.rms_norm(h1Ptr, weights.postAttentionLayernorm.dataOffset, normed2Ptr, T, D, config.rmsNormEps);
-    wasm.convert_fp16_to_f32(normed2Ptr, normed2F32Ptr, T * D);
   }
 
   // Router + expert dispatch (both read f32 hidden).

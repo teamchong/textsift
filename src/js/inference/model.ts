@@ -87,13 +87,13 @@ export async function modelForward(
     dstPtr = tmp;
   }
 
-  // Final rmsnorm → overwrite `dstPtr` (was tmp scratch).
-  wasm.rms_norm(srcPtr, weights.finalLayernorm.dataOffset, dstPtr, T, D, config.rmsNormEps);
-
-  // Classifier head: [T, D] × [num_classes, D]^T + [num_classes] → [T, num_classes].
-  // Pre-widen the final-norm output so the int4 matmul runs against f32.
+  // Final rmsnorm + widen, fused. The classifier matmul reads f32, so
+  // skip the fp16 round-trip and write straight into its input buffer.
   const classifierXPtr = wasm.alloc(T * D * 4);
-  wasm.convert_fp16_to_f32(dstPtr, classifierXPtr, T * D);
+  wasm.rms_norm_fp16_to_f32(
+    srcPtr, weights.finalLayernorm.dataOffset, classifierXPtr,
+    T, D, config.rmsNormEps,
+  );
   wasm.matmul_f32_x_int4block(
     classifierXPtr,
     weights.classifier.int4.dataOffset,

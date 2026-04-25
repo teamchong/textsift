@@ -178,115 +178,141 @@ struct Dims { T: u32, N: u32, K: u32, _pad: u32 };
 const BLOCK: u32 = 32u;
 const TR: u32 = 4u;
 const WG: u32 = 64u;
+const X_TILE_SIZE: u32 = TR * BLOCK;  // 4 * 32 = 128 floats per tile
+
+// Workgroup-shared X tile: each iteration of the K loop loads
+// (TR rows × BLOCK cols) of X into on-chip memory once, and all 64
+// threads read from this tile rather than reissuing 64 × TR global
+// loads per K block.
+var<workgroup> x_tile: array<f32, X_TILE_SIZE>;
 
 ${INT4_ACCESS_WGSL}
 
 // 2D dispatch: workgroup_id.x indexes 64-wide N tiles, .y indexes
 // 4-wide T tiles. Each thread owns one N column and four T rows; the
-// int4 weight decode (8 nibbles per u32 word) is reused across the
-// four T accumulators, matching the WASM Zig kernel's TR=8 amortization
-// pattern (TR=4 here keeps register pressure low — Apple Silicon
-// has limited GPU registers per thread).
+// int4 weight decode for that (n, k_block) is reused across the four
+// T accumulators, and the X reads are amortized across the workgroup
+// via on-chip x_tile.
 @compute @workgroup_size(64, 1, 1)
 fn main(
     @builtin(workgroup_id) wg_id: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
+    let tid = lid.x;
     let n = wg_id.x * WG + lid.x;
     let t_base = wg_id.y * TR;
-    if (n >= dims.N) { return; }
 
     let K = dims.K;
     let n_blocks = K / BLOCK;
     let zp_per_row = (n_blocks + 1u) >> 1u;
-    let nibble_row_base = n * K;
-    let scale_row = n * n_blocks;
 
     var acc0: f32 = 0.0;
     var acc1: f32 = 0.0;
     var acc2: f32 = 0.0;
     var acc3: f32 = 0.0;
 
+    let n_active = n < dims.N;
+    let nibble_row_base = select(0u, n * K, n_active);
+    let scale_row = select(0u, n * n_blocks, n_active);
+
     for (var b: u32 = 0u; b < n_blocks; b = b + 1u) {
-        let scale: f32 = f32(w_scales[scale_row + b]);
-        let zp_byte = load_byte(&w_zp, n * zp_per_row + (b >> 1u));
-        let zp_nib = select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (b & 1u) == 1u);
-        let zp_f: f32 = f32(zp_nib);
-        let word_base = (nibble_row_base + b * BLOCK) >> 3u;
-        let kbase = b * BLOCK;
+        // Cooperative X load: 128 elements across 64 threads = 2 per
+        // thread, pulling block-b's slice of all four T rows into x_tile.
+        let i0 = tid * 2u;
+        let i1 = i0 + 1u;
+        let t0_row = i0 / BLOCK;
+        let k0 = i0 % BLOCK;
+        let t1_row = i1 / BLOCK;
+        let k1 = i1 % BLOCK;
+        let g0 = t_base + t0_row;
+        let g1 = t_base + t1_row;
+        x_tile[i0] = select(0.0, f32(x[g0 * K + b * BLOCK + k0]), g0 < dims.T);
+        x_tile[i1] = select(0.0, f32(x[g1 * K + b * BLOCK + k1]), g1 < dims.T);
+        workgroupBarrier();
 
-        var blk0: f32 = 0.0;
-        var blk1: f32 = 0.0;
-        var blk2: f32 = 0.0;
-        var blk3: f32 = 0.0;
+        if (n_active) {
+            let scale: f32 = f32(w_scales[scale_row + b]);
+            let zp_byte = load_byte(&w_zp, n * zp_per_row + (b >> 1u));
+            let zp_nib = select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (b & 1u) == 1u);
+            let zp_f: f32 = f32(zp_nib);
+            let word_base = (nibble_row_base + b * BLOCK) >> 3u;
 
-        for (var w: u32 = 0u; w < 4u; w = w + 1u) {
-            let word = w_int4[word_base + w];
-            let kb = kbase + w * 8u;
-            let q0 = f32( word        & 0xFu) - zp_f;
-            let q1 = f32((word >>  4u) & 0xFu) - zp_f;
-            let q2 = f32((word >>  8u) & 0xFu) - zp_f;
-            let q3 = f32((word >> 12u) & 0xFu) - zp_f;
-            let q4 = f32((word >> 16u) & 0xFu) - zp_f;
-            let q5 = f32((word >> 20u) & 0xFu) - zp_f;
-            let q6 = f32((word >> 24u) & 0xFu) - zp_f;
-            let q7 = f32((word >> 28u) & 0xFu) - zp_f;
+            var blk0: f32 = 0.0;
+            var blk1: f32 = 0.0;
+            var blk2: f32 = 0.0;
+            var blk3: f32 = 0.0;
 
-            let r0 = (t_base + 0u) * K + kb;
-            blk0 = fma(q0, f32(x[r0 + 0u]), blk0);
-            blk0 = fma(q1, f32(x[r0 + 1u]), blk0);
-            blk0 = fma(q2, f32(x[r0 + 2u]), blk0);
-            blk0 = fma(q3, f32(x[r0 + 3u]), blk0);
-            blk0 = fma(q4, f32(x[r0 + 4u]), blk0);
-            blk0 = fma(q5, f32(x[r0 + 5u]), blk0);
-            blk0 = fma(q6, f32(x[r0 + 6u]), blk0);
-            blk0 = fma(q7, f32(x[r0 + 7u]), blk0);
+            for (var w: u32 = 0u; w < 4u; w = w + 1u) {
+                let word = w_int4[word_base + w];
+                let kb = w * 8u;
+                let q0 = f32( word        & 0xFu) - zp_f;
+                let q1 = f32((word >>  4u) & 0xFu) - zp_f;
+                let q2 = f32((word >>  8u) & 0xFu) - zp_f;
+                let q3 = f32((word >> 12u) & 0xFu) - zp_f;
+                let q4 = f32((word >> 16u) & 0xFu) - zp_f;
+                let q5 = f32((word >> 20u) & 0xFu) - zp_f;
+                let q6 = f32((word >> 24u) & 0xFu) - zp_f;
+                let q7 = f32((word >> 28u) & 0xFu) - zp_f;
 
-            let r1 = (t_base + 1u) * K + kb;
-            blk1 = fma(q0, f32(x[r1 + 0u]), blk1);
-            blk1 = fma(q1, f32(x[r1 + 1u]), blk1);
-            blk1 = fma(q2, f32(x[r1 + 2u]), blk1);
-            blk1 = fma(q3, f32(x[r1 + 3u]), blk1);
-            blk1 = fma(q4, f32(x[r1 + 4u]), blk1);
-            blk1 = fma(q5, f32(x[r1 + 5u]), blk1);
-            blk1 = fma(q6, f32(x[r1 + 6u]), blk1);
-            blk1 = fma(q7, f32(x[r1 + 7u]), blk1);
+                let xb0 = 0u * BLOCK + kb;
+                blk0 = fma(q0, x_tile[xb0 + 0u], blk0);
+                blk0 = fma(q1, x_tile[xb0 + 1u], blk0);
+                blk0 = fma(q2, x_tile[xb0 + 2u], blk0);
+                blk0 = fma(q3, x_tile[xb0 + 3u], blk0);
+                blk0 = fma(q4, x_tile[xb0 + 4u], blk0);
+                blk0 = fma(q5, x_tile[xb0 + 5u], blk0);
+                blk0 = fma(q6, x_tile[xb0 + 6u], blk0);
+                blk0 = fma(q7, x_tile[xb0 + 7u], blk0);
 
-            let r2 = (t_base + 2u) * K + kb;
-            blk2 = fma(q0, f32(x[r2 + 0u]), blk2);
-            blk2 = fma(q1, f32(x[r2 + 1u]), blk2);
-            blk2 = fma(q2, f32(x[r2 + 2u]), blk2);
-            blk2 = fma(q3, f32(x[r2 + 3u]), blk2);
-            blk2 = fma(q4, f32(x[r2 + 4u]), blk2);
-            blk2 = fma(q5, f32(x[r2 + 5u]), blk2);
-            blk2 = fma(q6, f32(x[r2 + 6u]), blk2);
-            blk2 = fma(q7, f32(x[r2 + 7u]), blk2);
+                let xb1 = 1u * BLOCK + kb;
+                blk1 = fma(q0, x_tile[xb1 + 0u], blk1);
+                blk1 = fma(q1, x_tile[xb1 + 1u], blk1);
+                blk1 = fma(q2, x_tile[xb1 + 2u], blk1);
+                blk1 = fma(q3, x_tile[xb1 + 3u], blk1);
+                blk1 = fma(q4, x_tile[xb1 + 4u], blk1);
+                blk1 = fma(q5, x_tile[xb1 + 5u], blk1);
+                blk1 = fma(q6, x_tile[xb1 + 6u], blk1);
+                blk1 = fma(q7, x_tile[xb1 + 7u], blk1);
 
-            let r3 = (t_base + 3u) * K + kb;
-            blk3 = fma(q0, f32(x[r3 + 0u]), blk3);
-            blk3 = fma(q1, f32(x[r3 + 1u]), blk3);
-            blk3 = fma(q2, f32(x[r3 + 2u]), blk3);
-            blk3 = fma(q3, f32(x[r3 + 3u]), blk3);
-            blk3 = fma(q4, f32(x[r3 + 4u]), blk3);
-            blk3 = fma(q5, f32(x[r3 + 5u]), blk3);
-            blk3 = fma(q6, f32(x[r3 + 6u]), blk3);
-            blk3 = fma(q7, f32(x[r3 + 7u]), blk3);
+                let xb2 = 2u * BLOCK + kb;
+                blk2 = fma(q0, x_tile[xb2 + 0u], blk2);
+                blk2 = fma(q1, x_tile[xb2 + 1u], blk2);
+                blk2 = fma(q2, x_tile[xb2 + 2u], blk2);
+                blk2 = fma(q3, x_tile[xb2 + 3u], blk2);
+                blk2 = fma(q4, x_tile[xb2 + 4u], blk2);
+                blk2 = fma(q5, x_tile[xb2 + 5u], blk2);
+                blk2 = fma(q6, x_tile[xb2 + 6u], blk2);
+                blk2 = fma(q7, x_tile[xb2 + 7u], blk2);
+
+                let xb3 = 3u * BLOCK + kb;
+                blk3 = fma(q0, x_tile[xb3 + 0u], blk3);
+                blk3 = fma(q1, x_tile[xb3 + 1u], blk3);
+                blk3 = fma(q2, x_tile[xb3 + 2u], blk3);
+                blk3 = fma(q3, x_tile[xb3 + 3u], blk3);
+                blk3 = fma(q4, x_tile[xb3 + 4u], blk3);
+                blk3 = fma(q5, x_tile[xb3 + 5u], blk3);
+                blk3 = fma(q6, x_tile[xb3 + 6u], blk3);
+                blk3 = fma(q7, x_tile[xb3 + 7u], blk3);
+            }
+            acc0 = fma(blk0, scale, acc0);
+            acc1 = fma(blk1, scale, acc1);
+            acc2 = fma(blk2, scale, acc2);
+            acc3 = fma(blk3, scale, acc3);
         }
-        acc0 = fma(blk0, scale, acc0);
-        acc1 = fma(blk1, scale, acc1);
-        acc2 = fma(blk2, scale, acc2);
-        acc3 = fma(blk3, scale, acc3);
+        workgroupBarrier();
     }
 
-    let bias_f = f32(bias[n]);
-    let t0 = t_base + 0u;
-    let t1 = t_base + 1u;
-    let t2 = t_base + 2u;
-    let t3 = t_base + 3u;
-    if (t0 < dims.T) { y[t0 * dims.N + n] = f16(acc0 + bias_f); }
-    if (t1 < dims.T) { y[t1 * dims.N + n] = f16(acc1 + bias_f); }
-    if (t2 < dims.T) { y[t2 * dims.N + n] = f16(acc2 + bias_f); }
-    if (t3 < dims.T) { y[t3 * dims.N + n] = f16(acc3 + bias_f); }
+    if (n_active) {
+        let bias_f = f32(bias[n]);
+        let t0 = t_base + 0u;
+        let t1 = t_base + 1u;
+        let t2 = t_base + 2u;
+        let t3 = t_base + 3u;
+        if (t0 < dims.T) { y[t0 * dims.N + n] = f16(acc0 + bias_f); }
+        if (t1 < dims.T) { y[t1 * dims.N + n] = f16(acc1 + bias_f); }
+        if (t2 < dims.T) { y[t2 * dims.N + n] = f16(acc2 + bias_f); }
+        if (t3 < dims.T) { y[t3 * dims.N + n] = f16(acc3 + bias_f); }
+    }
 }
 `;
 

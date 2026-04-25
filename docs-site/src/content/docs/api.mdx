@@ -25,6 +25,8 @@ static create(options?: CreateOptions): Promise<PrivacyFilter>;
 | `markers` | `MarkerStrategy` | `"[<label>]"` | Per-category replacement text. |
 | `enabledCategories` | `SpanLabel[]` | all 8 | Only redact these categories. |
 | `maxChunkTokens` | `number` | `2048` | Chunk size for long inputs. |
+| `rules` | `Rule[]` | `[]` | Custom regex / function detectors merged with model spans. |
+| `presets` | `string[]` | `[]` | Built-in rule sets. Currently: `"secrets"`. |
 
 ## Instance methods
 
@@ -117,6 +119,42 @@ const markers = (span, i) => `[${span.label.toUpperCase()}_${i}]`;
 ```
 
 Return `null` to leave a given span unredacted.
+
+### `Rule`
+
+Custom detector that runs alongside the model. Either a regex (must have `/g`) or a function returning `{ start, end }` ranges:
+
+```ts
+type RuleSeverity = "block" | "warn" | "track";
+
+type Rule =
+  | { label: string; severity?: RuleSeverity; marker?: string; pattern: RegExp }
+  | { label: string; severity?: RuleSeverity; marker?: string; match: (text: string) => Array<{ start: number; end: number }> };
+```
+
+Output spans carry `source: "rule"` and the declared `severity` so an AI proxy can dispatch on them (`block` → refuse, `warn` → log, `track` → annotate). Rules and model spans coexist; on overlap the rule wins.
+
+### Built-in presets
+
+```ts
+import { PrivacyFilter, secretRules } from "textsift";
+
+// Stupidly easy: just enable the preset.
+const filter = await PrivacyFilter.create({ presets: ["secrets"] });
+
+// Same thing, explicit:
+const filter = await PrivacyFilter.create({ rules: secretRules });
+
+// Mix presets with your own:
+const filter = await PrivacyFilter.create({
+  presets: ["secrets"],
+  rules: [{ label: "JIRA_TICKET", pattern: /\b[A-Z]{2,}-\d+\b/g }],
+});
+```
+
+The `"secrets"` preset covers credentials/API keys the model wasn't trained on: JWT, GitHub PAT (all variants), AWS access key, Slack tokens + webhooks, OpenAI/Anthropic/Google API keys, Stripe live/test keys, Stripe webhook secrets, npm tokens, PEM private-key headers. All default to `severity: "block"`.
+
+Performance note: the runtime unions all regex rules into one alternation and scans the input once, regardless of preset count. N rules ≈ 1 scan.
 
 ### `ProgressEvent`
 

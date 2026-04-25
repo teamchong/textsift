@@ -23,6 +23,7 @@ import {
   PrivacyFilterError,
   type RedactOptions,
   type RedactResult,
+  type Rule,
   type SpanLabel,
 } from "./types.js";
 import type { InferenceBackend } from "./backends/abstract.js";
@@ -35,6 +36,7 @@ import { chunkInput, mergeChunkResults, type Chunk } from "./inference/chunking.
 import { bioesToSpans } from "./inference/spans.js";
 import { applyRedaction } from "./inference/redact.js";
 import { runRules, mergeRuleSpans } from "./inference/rules.js";
+import { resolvePresets } from "./inference/rule-presets.js";
 import {
   streamDetect,
   streamRedact,
@@ -150,7 +152,10 @@ export class PrivacyFilter {
       enabledCategories:
         (opts as RedactStreamOptions).enabledCategories ?? this.opts.enabledCategories,
       markers: (opts as RedactStreamOptions).markers ?? this.opts.markers,
-      rules: (opts as RedactStreamOptions).rules ?? this.opts.rules,
+      rules: resolveRules(
+        (opts as RedactStreamOptions).rules ?? this.opts.rules,
+        (opts as RedactStreamOptions).presets ?? this.opts.presets,
+      ),
       windowTokens: (opts as RedactStreamOptions).windowTokens,
       safetyMarginTokens: (opts as RedactStreamOptions).safetyMarginTokens,
       signal: (opts as RedactStreamOptions).signal,
@@ -218,7 +223,10 @@ export class PrivacyFilter {
     const merged: DetectStreamOptions = {
       enabledCategories:
         (opts as DetectStreamOptions).enabledCategories ?? this.opts.enabledCategories,
-      rules: (opts as DetectStreamOptions).rules ?? this.opts.rules,
+      rules: resolveRules(
+        (opts as DetectStreamOptions).rules ?? this.opts.rules,
+        (opts as DetectStreamOptions).presets ?? this.opts.presets,
+      ),
       windowTokens: (opts as DetectStreamOptions).windowTokens,
       safetyMarginTokens: (opts as DetectStreamOptions).safetyMarginTokens,
       signal: (opts as DetectStreamOptions).signal,
@@ -397,8 +405,11 @@ export class PrivacyFilter {
     }
 
     const modelSpans = mergeChunkResults(perChunkSpans, chunks);
-    const rules = opts.rules ?? this.opts.rules;
-    if (!rules || rules.length === 0) return modelSpans;
+    const rules = resolveRules(
+      opts.rules ?? this.opts.rules,
+      opts.presets ?? this.opts.presets,
+    );
+    if (rules.length === 0) return modelSpans;
     const ruleSpans = runRules(text, rules);
     return mergeRuleSpans(modelSpans, ruleSpans);
   }
@@ -408,6 +419,23 @@ export class PrivacyFilter {
     this.queue = next.catch(() => undefined);
     return next;
   }
+}
+
+/**
+ * Compose `presets` and `rules` into a single rule list. Both
+ * sources contribute; presets resolve to a fixed rule set defined
+ * in `rule-presets.ts`. Returns `[]` when neither is set so callers
+ * can short-circuit.
+ */
+function resolveRules(
+  rules: readonly Rule[] | undefined,
+  presets: readonly string[] | undefined,
+): readonly Rule[] {
+  const presetRules = presets && presets.length > 0 ? resolvePresets(presets) : [];
+  const userRules = rules ?? [];
+  if (presetRules.length === 0) return userRules;
+  if (userRules.length === 0) return presetRules;
+  return [...presetRules, ...userRules];
 }
 
 function buildSummary(

@@ -82,6 +82,8 @@ export {
   loadTextsiftShared,
   getCachedModelInfo,
   clearCachedModel,
+  secretRules,
+  RULE_PRESETS,
 } from "textsift-core";
 
 export type {
@@ -96,6 +98,7 @@ export type {
   MarkerStrategy,
   Rule,
   RuleSeverity,
+  RulePresetName,
   PrivacyFilterErrorCode,
   InferenceBackend,
   Logits,

@@ -25,6 +25,15 @@
         "Linked to ticket PROJ-4821 in our tracker. " +
         "Backup card: 5500 0000 0000 0004 expires soon.";
 
+      // Separate text for the preset run — the secret patterns shouldn't
+      // overlap with the model's PII categories or the custom rules above.
+      const SECRET_TEXT =
+        "Auth header: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NSJ9.abc-DEF_xyz123 " +
+        "GitHub: ghp_1234567890abcdefABCDEF1234567890abcd " +
+        "AWS: AKIAIOSFODNN7EXAMPLE " +
+        "OpenAI: sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz1234567890 " +
+        "Slack webhook: https://hooks.slack.com/services/T01ABC2DEFG/B01HIJ3KLMN/abcdefghijklmnopqr";
+
       const rules = [
         {
           label: "CREDIT_CARD",
@@ -103,6 +112,29 @@
         const textsAgree = streamedText === batch.redactedText;
         const ruleCountsAgree = streamRuleSpans.length === ruleSpans.length;
 
+        // ── presets path ──
+        log("\n[4] preset shorthand: presets=['secrets']");
+        const secretFilter = await PrivacyFilter.create({
+          backend: "wasm",
+          presets: ["secrets"],
+        });
+        const secretDetect = await secretFilter.detect(SECRET_TEXT);
+        const secretRuleSpans = secretDetect.spans.filter((s) => s.source === "rule");
+        log(`  detected ${secretRuleSpans.length} secret span(s):`);
+        for (const s of secretRuleSpans) {
+          log(`    [${s.label}] ${JSON.stringify(s.text.slice(0, 40))} (${s.severity})`);
+        }
+        const labels = new Set(secretRuleSpans.map((s) => s.label));
+        const expectedLabels = ["JWT", "GITHUB_PAT_CLASSIC", "AWS_ACCESS_KEY_ID", "OPENAI_API_KEY", "SLACK_WEBHOOK"];
+        const missingLabels = expectedLabels.filter((l) => !labels.has(l));
+        const allBlock = secretRuleSpans.every((s) => s.severity === "block");
+
+        const secretRedact = await secretFilter.redact(SECRET_TEXT);
+        const tokenLeaked = secretRedact.redactedText.includes("ghp_1234567890");
+        const jwtLeaked = secretRedact.redactedText.includes("eyJhbGciOi");
+        secretFilter.dispose();
+        log(`  preset redact: tokenLeaked=${tokenLeaked} jwtLeaked=${jwtLeaked}`);
+
         filter.dispose();
 
         const ok =
@@ -114,7 +146,11 @@
           ticketRedacted &&
           !cardLeaked &&
           textsAgree &&
-          ruleCountsAgree;
+          ruleCountsAgree &&
+          missingLabels.length === 0 &&
+          allBlock &&
+          !tokenLeaked &&
+          !jwtLeaked;
 
         window.__result = {
           ok,
@@ -135,6 +171,13 @@
           finalResultRuleSpanCount: finalResult.spans.filter(
             (s) => s.source === "rule",
           ).length,
+          secretRuleSpanCount: secretRuleSpans.length,
+          secretLabelsFound: [...labels],
+          secretLabelsMissing: missingLabels,
+          secretAllBlock: allBlock,
+          tokenLeaked,
+          jwtLeaked,
+          secretRedactedExcerpt: secretRedact.redactedText,
         };
         log(`\ndone: ok=${ok}`);
       } catch (e) {

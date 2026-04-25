@@ -65,5 +65,10 @@ export type {
   RuleSeverity,
 } from "./types.js";
 
+// Built-in rule presets. `secretRules` is the curated array; the
+// `presets: ["secrets"]` shorthand on `create()` resolves to this.
+export { secretRules, RULE_PRESETS } from "./inference/rule-presets.js";
+export type { RulePresetName } from "./inference/rule-presets.js";
+
 export { ALL_SPAN_LABELS, PrivacyFilterError } from "./types.js";
 export type { PrivacyFilterErrorCode } from "./types.js";

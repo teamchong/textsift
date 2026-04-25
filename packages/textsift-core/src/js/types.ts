@@ -245,6 +245,16 @@ export interface CreateOptions {
    * overridden per-call via `RedactOptions.rules`.
    */
   rules?: readonly Rule[];
+
+  /**
+   * Built-in rule presets to enable. Currently supported:
+   *   - `"secrets"` — high-precision detectors for credentials/API keys
+   *     not in the model's training set (JWT, GitHub PAT, AWS, Slack,
+   *     OpenAI/Anthropic/Google keys, Stripe, npm, PEM private keys).
+   *
+   * Presets and `rules` compose — both run, both contribute spans.
+   */
+  presets?: readonly string[];
 }
 
 /** Per-call options passed to `redact()` / `detect()`. */
@@ -259,6 +269,11 @@ export interface RedactOptions {
    * merging). To extend, splice them at the call site.
    */
   rules?: readonly Rule[];
+  /**
+   * Override the session's preset list for this call only. Same
+   * semantics as the create-time option.
+   */
+  presets?: readonly string[];
   /** AbortSignal for cancelling a long inference. */
   signal?: AbortSignal;
 }

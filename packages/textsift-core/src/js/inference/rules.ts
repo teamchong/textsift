@@ -26,28 +26,108 @@ import { PrivacyFilterError } from "../types.js";
  * Run all rules against `input` and return the resulting spans.
  * Doesn't dedup against model spans — caller does that via
  * `mergeRuleSpans()`.
+ *
+ * Performance: regex rules are unioned into a single alternation
+ * scanned once via `matchAll`, so N regex rules cost ~1 scan worth
+ * of work instead of N. Function rules (`match: (text) => ...`) and
+ * any regex with non-`g` flags can't be safely unioned and run
+ * individually. Union dispatch uses named groups (`g0`, `g1`, ...)
+ * so per-match attribution is O(N) in the rule index — fine for
+ * any realistic preset count.
  */
 export function runRules(input: string, rules: readonly Rule[]): DetectedSpan[] {
+  if (rules.length === 0) return [];
+
   const out: DetectedSpan[] = [];
+  const unionable: Array<{ rule: Rule & { pattern: RegExp }; index: number }> = [];
+  const standalone: Rule[] = [];
+
   for (const rule of rules) {
-    const matches = collectMatches(input, rule);
-    for (const m of matches) {
-      if (m.start >= m.end) continue;
-      if (m.start < 0 || m.end > input.length) continue;
-      out.push({
-        label: rule.label as SpanLabel | string,
-        source: "rule",
-        severity: rule.severity ?? "warn",
-        start: m.start,
-        end: m.end,
-        text: input.slice(m.start, m.end),
-        marker: rule.marker ?? `[${rule.label}]`,
-        confidence: 1.0,
-      });
+    if ("pattern" in rule && canUnion(rule.pattern, rule.label)) {
+      unionable.push({ rule, index: unionable.length });
+    } else {
+      standalone.push(rule);
     }
   }
+
+  if (unionable.length > 0) {
+    const union = buildUnionRegex(unionable.map((u) => u.rule.pattern.source));
+    if (union) {
+      for (const m of input.matchAll(union)) {
+        const groups = m.groups;
+        if (!groups) continue;
+        // Find which alternative matched.
+        for (let i = 0; i < unionable.length; i++) {
+          if (groups[`g${i}`] !== undefined) {
+            const rule = unionable[i]!.rule;
+            const start = m.index ?? 0;
+            const end = start + m[0].length;
+            if (start < end) pushSpan(out, input, rule, start, end);
+            break;
+          }
+        }
+      }
+    } else {
+      // Union construction failed (shouldn't happen given canUnion,
+      // but defensively fall back to per-rule).
+      for (const u of unionable) standalone.push(u.rule);
+    }
+  }
+
+  for (const rule of standalone) {
+    for (const m of collectMatches(input, rule)) {
+      if (m.start >= m.end) continue;
+      if (m.start < 0 || m.end > input.length) continue;
+      pushSpan(out, input, rule, m.start, m.end);
+    }
+  }
+
   out.sort((a, b) => a.start - b.start);
   return out;
+}
+
+function pushSpan(
+  out: DetectedSpan[],
+  input: string,
+  rule: Rule,
+  start: number,
+  end: number,
+): void {
+  out.push({
+    label: rule.label as SpanLabel | string,
+    source: "rule",
+    severity: rule.severity ?? "warn",
+    start,
+    end,
+    text: input.slice(start, end),
+    marker: rule.marker ?? `[${rule.label}]`,
+    confidence: 1.0,
+  });
+}
+
+/**
+ * A regex is union-safe when it has no flags besides `g` — any other
+ * flag (i, m, s, u, y) would silently change semantics for the other
+ * alternatives once we wrap them all in one combined regex.
+ */
+function canUnion(pattern: RegExp, label: string): boolean {
+  if (!pattern.global) {
+    throw new PrivacyFilterError(
+      `Rule "${label}": pattern must be a global regex (use the /g flag); got ${String(pattern)}`,
+      "INTERNAL",
+    );
+  }
+  // pattern.flags is a sorted string like "gi"; "g" alone means safe.
+  return pattern.flags === "g";
+}
+
+function buildUnionRegex(sources: readonly string[]): RegExp | null {
+  try {
+    const parts = sources.map((s, i) => `(?<g${i}>${s})`);
+    return new RegExp(parts.join("|"), "g");
+  } catch {
+    return null;
+  }
 }
 
 function collectMatches(

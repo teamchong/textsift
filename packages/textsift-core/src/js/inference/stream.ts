@@ -71,6 +71,11 @@ export interface DetectStreamOptions {
    * `(label, start, end)` like model spans.
    */
   rules?: readonly Rule[];
+  /**
+   * Built-in rule preset names — same shape as `CreateOptions.presets`.
+   * Composes with `rules` when both are set.
+   */
+  presets?: readonly string[];
 }
 
 /** Options for streaming redaction. Same as detect plus a marker strategy. */

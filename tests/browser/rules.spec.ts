@@ -33,6 +33,10 @@ test("custom rules merge with model spans (batch + stream)", async ({ page }) =>
         `  ticketSpans=${result.ticketSpanCount} (severity=${JSON.stringify(result.ticketSeverity)})\n` +
         `  cardRedacted=${result.cardRedacted} ticketRedacted=${result.ticketRedacted} cardLeaked=${result.cardLeaked}\n` +
         `  textsAgree=${result.textsAgree} ruleCountsAgree=${result.ruleCountsAgree}\n` +
+        `  secretLabelsFound=${JSON.stringify(result.secretLabelsFound)}\n` +
+        `  secretLabelsMissing=${JSON.stringify(result.secretLabelsMissing)}\n` +
+        `  tokenLeaked=${result.tokenLeaked} jwtLeaked=${result.jwtLeaked}\n` +
+        `  secretRedacted=${JSON.stringify(result.secretRedactedExcerpt)}\n` +
         `  batch=${JSON.stringify(result.batchExcerpt)}\n` +
         `  stream=${JSON.stringify(result.streamExcerpt)}`,
     );
@@ -45,9 +49,13 @@ test("custom rules merge with model spans (batch + stream)", async ({ page }) =>
   expect(result.ticketRedacted).toBe(true);
   expect(result.textsAgree).toBe(true);
   expect(result.ruleCountsAgree).toBe(true);
+  expect(result.secretLabelsMissing).toEqual([]);
+  expect(result.secretAllBlock).toBe(true);
+  expect(result.tokenLeaked).toBe(false);
+  expect(result.jwtLeaked).toBe(false);
   expect(consoleErrors, `console errors: ${consoleErrors.join("\n")}`).toEqual([]);
   console.log(
     `[rules] card=${result.cardSpanCount} ticket=${result.ticketSpanCount} ` +
-      `batch=${result.batchTextLen}c stream=${result.streamTextLen}c`,
+      `secrets=${result.secretRuleSpanCount} (${result.secretLabelsFound.join(",")})`,
   );
 });

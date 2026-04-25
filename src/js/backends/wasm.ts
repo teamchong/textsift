@@ -20,7 +20,7 @@ import { modelForward, type ModelConfig, type ModelWeights } from "../inference/
 import type { BlockWeights } from "../inference/block.js";
 import { parseOnnxGraph, resolveTensorBytes } from "../model/onnx-reader.js";
 import { fetchBytesCached } from "../model/opfs-fetch.js";
-import { PII_WASM_BYTES } from "./pii-wasm-inline.js";
+import { PII_WASM_BYTES, PII_WASM_MT_BYTES } from "./pii-wasm-inline.js";
 
 /** Exports declared in `src/zig/wasm_exports.zig`. Keep in sync. */
 export interface PiiWasmExports {
@@ -103,6 +103,20 @@ export interface Int4BlockWeight {
 }
 
 /**
+ * Detect whether SharedArrayBuffer is usable in the current
+ * environment. Node has it unconditionally; browsers require the page
+ * to be served with `Cross-Origin-Opener-Policy: same-origin` and
+ * `Cross-Origin-Embedder-Policy: require-corp` (cross-origin
+ * isolation) before SAB is exposed.
+ */
+export function sharedMemorySupported(): boolean {
+  if (typeof SharedArrayBuffer === "undefined") return false;
+  // crossOriginIsolated is undefined in Node and true/false in browsers.
+  const coi = (globalThis as { crossOriginIsolated?: boolean }).crossOriginIsolated;
+  return coi !== false;
+}
+
+/**
  * Load `pii.wasm` and return its typed exports plus a readiness check.
  * If `url` is `null` or undefined, uses the inlined bytes baked into
  * the bundle (`PII_WASM_BYTES`) — this is the default and avoids the
@@ -160,6 +174,56 @@ export async function loadPiiWasm(url?: string | URL | null): Promise<PiiWasmExp
     }
   }
 
+  return exports;
+}
+
+/**
+ * Load `pii-mt.wasm` — same kernels as `pii.wasm` but built with the
+ * WASM atomics + bulk_memory features and an imported shared memory.
+ * The returned exports use `memory.buffer` as a SharedArrayBuffer, which
+ * means the same `WebAssembly.Memory` can be passed to Worker threads
+ * and they all see the same address space. Single-threaded callers can
+ * use this build identically to `loadPiiWasm` — atomics are opt-in per
+ * kernel call, not required for correctness.
+ *
+ * Throws if SAB isn't available in this environment (no
+ * cross-origin-isolated context in browsers, etc.). Caller should
+ * feature-check via `sharedMemorySupported()` first.
+ */
+export async function loadPiiWasmShared(
+  sharedMemory?: WebAssembly.Memory,
+): Promise<PiiWasmExports> {
+  if (!sharedMemorySupported()) {
+    throw new Error(
+      "loadPiiWasmShared: SharedArrayBuffer is not available in this environment " +
+        "(in browsers, the page must be served with " +
+        "Cross-Origin-Opener-Policy: same-origin and " +
+        "Cross-Origin-Embedder-Policy: require-corp)",
+    );
+  }
+  // 64 pages = 4 MB initial; max 32768 pages = 2 GB (matches the WASM
+  // build's --max-memory). Caller can pre-create a memory of any
+  // larger initial size and pass it in (handy for sharing across
+  // workers — main creates it once, workers receive the same handle).
+  const memory = sharedMemory ?? new WebAssembly.Memory({
+    initial: 64,
+    maximum: 32768,
+    shared: true,
+  });
+  if (!(memory.buffer instanceof SharedArrayBuffer)) {
+    throw new Error("loadPiiWasmShared: provided memory is not SAB-backed");
+  }
+  const result = await WebAssembly.instantiate(
+    PII_WASM_MT_BYTES as BufferSource,
+    { env: { memory } },
+  );
+  // The mt-WASM imports memory rather than exporting it; expose the
+  // imported memory via the same `exports.memory` shape so callers
+  // can use the returned object identically to `loadPiiWasm`.
+  const exports = {
+    ...(result.instance.exports as object),
+    memory,
+  } as unknown as PiiWasmExports;
   return exports;
 }
 

@@ -922,6 +922,31 @@ export fn scatter_add_weighted_f32(
     }
 }
 
+/// Scalar-only variant of `scatter_add_weighted_f32`. Bit-exact same
+/// semantics, just no SIMD. Used to disambiguate whether multi-thread
+/// numeric drift is caused by SIMD stores on shared memory across
+/// concurrent threads.
+export fn scatter_add_weighted_f32_scalar(
+    target_ptr: [*]f32,
+    values_ptr: [*]const f32,
+    indices_ptr: [*]const i32,
+    weights_ptr: [*]const f32,
+    m: u32,
+    D: u32,
+) void {
+    const mz: usize = m;
+    const Dz: usize = D;
+    var i: usize = 0;
+    while (i < mz) : (i += 1) {
+        const t: usize = @intCast(indices_ptr[i]);
+        const w: f32 = weights_ptr[i];
+        const val_row = values_ptr + i * Dz;
+        const tgt_row = target_ptr + t * Dz;
+        var d: usize = 0;
+        while (d < Dz) : (d += 1) tgt_row[d] += w * val_row[d];
+    }
+}
+
 // --------------------------------------------------------------
 // Kernel: zero-fill f32 buffer (bump-alloc'd scratch comes uninit)
 // --------------------------------------------------------------

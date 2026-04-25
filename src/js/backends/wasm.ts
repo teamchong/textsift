@@ -58,6 +58,10 @@ export interface PiiWasmExports {
     target: number, values: number, indices: number, weights: number,
     m: number, D: number,
   ): void;
+  scatter_add_weighted_f32_scalar(
+    target: number, values: number, indices: number, weights: number,
+    m: number, D: number,
+  ): void;
   zero_f32(ptr: number, n: number): void;
   convert_fp16_to_f32(src: number, dst: number, n: number): void;
   cast_f32_to_fp16_scaled(src: number, dst: number, n: number, scale: number): void;
@@ -164,6 +168,7 @@ export async function loadPiiWasm(url?: string | URL | null): Promise<PiiWasmExp
     "gather_fp16",
     "gather_f32",
     "scatter_add_weighted_f32",
+    "scatter_add_weighted_f32_scalar",
     "zero_f32",
     "convert_fp16_to_f32",
     "cast_f32_to_fp16_scaled",
@@ -472,14 +477,14 @@ export interface WasmBackendOptions extends BackendConstructionOptions {
    */
   wasmModuleUrl?: string | URL;
   /**
-   * Multi-thread mode (experimental).
-   *   "off" (default) — single-thread, no workers.
-   *   "auto" — use multi-threaded WASM if SharedArrayBuffer is
-   *     available; otherwise fall back to single-thread. Currently
-   *     produces small numeric drift (~0.01 per element) vs the
-   *     single-thread reference; opt in only after validating against
-   *     your input distribution.
-   *   "force" — fail loudly if SAB isn't available.
+   * Multi-thread mode.
+   *   "auto" (default) — use multi-threaded WASM if SharedArrayBuffer
+   *     is available; otherwise fall back to single-thread. In
+   *     browsers SAB requires cross-origin isolation (COOP/COEP
+   *     response headers); in Node it's always available.
+   *   "off" — always single-thread, no worker pool.
+   *   "force" — fail loudly if SAB isn't available, surfacing the
+   *     COOP/COEP misconfiguration instead of silently degrading.
    */
   multiThread?: "auto" | "off" | "force";
   /**
@@ -583,7 +588,7 @@ export class WasmBackend implements InferenceBackend {
   }
 
   async warmup(): Promise<void> {
-    const mtRequest = this.opts.multiThread ?? "off";
+    const mtRequest = this.opts.multiThread ?? "auto";
     const supported = sharedMemorySupported();
     const useMt = mtRequest === "force" || (mtRequest === "auto" && supported);
     if (mtRequest === "force" && !supported) {
@@ -653,12 +658,28 @@ export class WasmBackend implements InferenceBackend {
       // it can release/acquire on.
       const fencePtr = this.wasm.alloc(4);
       if (!fencePtr) throw new Error("WasmBackend: OOM allocating fence slot");
+      // Per-worker shadow stacks. Each WebAssembly.Instance has its
+      // own `__stack_pointer` global, but the stack memory those
+      // pointers reference lives in the shared linear memory — so
+      // without per-instance stack regions every worker pushes
+      // locals to the same address and corrupts each other's frames.
+      // 256 KB per worker is comfortable for our deepest call chain.
+      const STACK_BYTES = 256 * 1024;
+      const stackTops: number[] = [];
+      for (let w = 0; w < desired; w++) {
+        const base = this.wasm.alloc(STACK_BYTES);
+        if (!base) throw new Error(`WasmBackend: OOM allocating worker ${w} stack`);
+        // Stack grows downward from the top.
+        stackTops.push(base + STACK_BYTES);
+      }
       // Re-mark the heap so subsequent `reset()` calls (one per
-      // forward) preserve the worker scratch + accumulator + fence.
+      // forward) preserve the worker scratch + accumulator + fence
+      // + stacks.
       this.wasm.heap_mark_now();
 
       this.mtPool = new MtPool(this.wasm.memory, desired);
       this.mtPool.setMemoryFenceSlot(fencePtr);
+      this.mtPool.setWorkerStackTops(stackTops);
       await this.mtPool.warmup();
     }
 

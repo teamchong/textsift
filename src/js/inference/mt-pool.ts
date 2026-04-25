@@ -65,6 +65,15 @@ _onMessage(async (e) => {
     wasm = instance.exports;
     signal = new Int32Array(msg.signalBuffer);
     memFence = new Int32Array(msg.memory.buffer, msg.memFenceOffset, 1);
+    // Each WebAssembly.Instance has its own __stack_pointer global
+    // initialized to the same default — but the *stack memory itself*
+    // lives in shared linear memory, so without per-instance stacks
+    // every worker pushes locals to the same address and corrupts
+    // each other's stack frames. Point this worker's stack at the
+    // dedicated region the main thread allocated for it.
+    if (typeof msg.stackTop === "number" && wasm.__stack_pointer) {
+      wasm.__stack_pointer.value = msg.stackTop;
+    }
     _postMessage({ type: "ready" });
     return;
   }
@@ -209,6 +218,23 @@ export class MtPool {
     this.memFence = new Int32Array(this.memory.buffer, byteOffset, 1);
   }
 
+  /**
+   * Per-worker shadow-stack tops. Each worker's `__stack_pointer` is
+   * initialized to the corresponding `stackTops[i]` so workers don't
+   * collide on the default shared shadow-stack region. Stack grows
+   * downward from the top, so each top should be at the END of a
+   * dedicated per-worker region.
+   */
+  private stackTops: number[] = [];
+  setWorkerStackTops(tops: readonly number[]): void {
+    if (tops.length !== this.numThreads) {
+      throw new Error(
+        `MtPool.setWorkerStackTops: need ${this.numThreads} entries, got ${tops.length}`,
+      );
+    }
+    this.stackTops = [...tops];
+  }
+
   async warmup(): Promise<void> {
     const inits: Promise<void>[] = [];
     for (let i = 0; i < this.numThreads; i++) {
@@ -231,6 +257,7 @@ export class MtPool {
             memory: this.memory,
             signalBuffer: this.signal.buffer,
             memFenceOffset: this.memFence ? this.memFence.byteOffset : 0,
+            stackTop: this.stackTops[i] ?? null,
             wasmBytes: PII_WASM_MT_BYTES,
           });
         }),
@@ -255,30 +282,13 @@ export class MtPool {
         `MtPool.run: expected ${this.numThreads} scripts, got ${scripts.length}`,
       );
     }
-    // Serial dispatch: dispatch worker i, wait for it, then i+1.
-    //
-    // Truly-parallel dispatch (every worker fires concurrently) was
-    // tried and produced numeric drift vs the single-thread reference
-    // — verified with `serial vs parallel` A/B test where serial
-    // matched ST within fp16 noise (maxDiff 1.6e-2) and parallel
-    // diverged by maxDiff > 0.6 with run-to-run non-determinism. All
-    // suspects were ruled out (per-worker scratch verified disjoint,
-    // acc rows verified disjoint, expert-weight reads are read-only,
-    // basic shared-memory message-passing verified working
-    // independently). Atomic fences on both the signal SAB and the
-    // WASM-memory SAB did not eliminate the race.
-    //
-    // Serial dispatch keeps the multi-thread API + worker pool
-    // infrastructure correct while we keep digging on the underlying
-    // race. Once the race is identified, this loop becomes parallel
-    // and we recover the speedup.
+    Atomics.store(this.signal, DONE_OFFSET, 0);
+    Atomics.add(this.signal, EPOCH_OFFSET, 1);
     if (this.memFence) Atomics.add(this.memFence, 0, 0);
     for (let i = 0; i < this.numThreads; i++) {
-      Atomics.store(this.signal, DONE_OFFSET, 0);
-      Atomics.add(this.signal, EPOCH_OFFSET, 1);
       this.workers[i]!.postMessage({ type: "script", calls: scripts[i] });
-      await waitForCount(this.signal, DONE_OFFSET, 1);
     }
+    await waitForCount(this.signal, DONE_OFFSET, this.numThreads);
     if (this.memFence) Atomics.add(this.memFence, 0, 0);
   }
 

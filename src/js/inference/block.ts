@@ -18,6 +18,7 @@
 import type { Int4BlockWeight, PiiWasmExports, WeightTensorInfo } from "../backends/wasm.js";
 import { attentionForward, type AttentionWeights, type AttentionConfig, type AttentionTables } from "./attention.js";
 import { expertDispatch, type ExpertWeights, type ExpertConfig, type MultiThreadContext } from "./expert.js";
+import type { KernelCall, WorkerScript } from "./mt-pool.js";
 
 export interface BlockWeights {
   inputLayernorm: WeightTensorInfo;           // fp16 [D]
@@ -100,21 +101,50 @@ export async function blockForward(
   await attentionForward(wasm, normed1Ptr, attnOutPtr, weights.attn, config, tables, T, maskPtr, mt);
 
   const h1Ptr = wasm.alloc(T * D * 2);
-  wasm.add_fp16(residualPtr, attnOutPtr, h1Ptr, T * D);
-
   const residual2Ptr = wasm.alloc(T * D * 2);
-  new Uint8Array(wasm.memory.buffer, residual2Ptr, T * D * 2).set(
-    new Uint8Array(wasm.memory.buffer, h1Ptr, T * D * 2),
-  );
-
   const normed2Ptr = wasm.alloc(T * D * 2);
-  wasm.rms_norm(h1Ptr, weights.postAttentionLayernorm.dataOffset, normed2Ptr, T, D, config.rmsNormEps);
-
   // Pre-widen normed2 once — used by both the router matmul and
   // every expert's gate_up, so a single conversion here avoids per-
   // caller duplication.
   const normed2F32Ptr = wasm.alloc(T * D * 4);
-  wasm.convert_fp16_to_f32(normed2Ptr, normed2F32Ptr, T * D);
+
+  // Post-attention sequence: residual add, rmsnorm, cast → f32.
+  // Parallelize per-T slice when MT is on; same kernels and
+  // semantics, just sliced pointers.
+  if (mt && T >= mt.pool.numThreads * 2) {
+    const N = mt.pool.numThreads;
+    const scripts: WorkerScript[] = [];
+    for (let w = 0; w < N; w++) {
+      const tStart = Math.floor((w * T) / N);
+      const tEnd = Math.floor(((w + 1) * T) / N);
+      const tCount = tEnd - tStart;
+      const calls: KernelCall[] = [];
+      if (tCount > 0) {
+        const off2 = tStart * D * 2;
+        const off4 = tStart * D * 4;
+        calls.push(
+          { kernel: "add_fp16", args: [residualPtr + off2, attnOutPtr + off2, h1Ptr + off2, tCount * D] },
+          { kernel: "rms_norm", args: [h1Ptr + off2, weights.postAttentionLayernorm.dataOffset, normed2Ptr + off2, tCount, D, config.rmsNormEps] },
+          { kernel: "convert_fp16_to_f32", args: [normed2Ptr + off2, normed2F32Ptr + off4, tCount * D] },
+        );
+      } else {
+        calls.push({ kernel: "echo", args: [0] });
+      }
+      scripts.push(calls);
+    }
+    await mt.pool.run(scripts);
+    // Snapshot h1 → residual2 on main; small, sync, no kernel needed.
+    new Uint8Array(wasm.memory.buffer, residual2Ptr, T * D * 2).set(
+      new Uint8Array(wasm.memory.buffer, h1Ptr, T * D * 2),
+    );
+  } else {
+    wasm.add_fp16(residualPtr, attnOutPtr, h1Ptr, T * D);
+    new Uint8Array(wasm.memory.buffer, residual2Ptr, T * D * 2).set(
+      new Uint8Array(wasm.memory.buffer, h1Ptr, T * D * 2),
+    );
+    wasm.rms_norm(h1Ptr, weights.postAttentionLayernorm.dataOffset, normed2Ptr, T, D, config.rmsNormEps);
+    wasm.convert_fp16_to_f32(normed2Ptr, normed2F32Ptr, T * D);
+  }
 
   // Router + expert dispatch (both read f32 hidden).
   const routingIdxPtr = wasm.alloc(T * K * 4);

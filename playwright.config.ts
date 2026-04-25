@@ -3,7 +3,9 @@ import { defineConfig } from "@playwright/test";
 export default defineConfig({
   testDir: "tests/browser",
   fullyParallel: false,
-  timeout: 120_000,
+  // Cold-cache runs download ~770 MB. Set a generous default timeout
+  // so tests don't fail the first time they touch a new model source.
+  timeout: 5 * 60_000,
   expect: { timeout: 10_000 },
   reporter: "list",
   use: {
@@ -17,8 +19,10 @@ export default defineConfig({
     // Custom server adds Cross-Origin-Opener-Policy: same-origin and
     // Cross-Origin-Embedder-Policy: require-corp so SharedArrayBuffer
     // is available — required for the multi-threaded WASM backend.
-    command: "python3 scripts/serve-coi.py 8123",
-    url: "http://localhost:8123/dist/textsift.wasm",
+    // Lives under packages/textsift-core/scripts after the monorepo
+    // restructure.
+    command: "python3 packages/textsift-core/scripts/serve-coi.py 8123",
+    url: "http://localhost:8123/packages/textsift-core/dist/textsift.wasm",
     reuseExistingServer: !process.env.CI,
     cwd: ".",
     timeout: 15_000,

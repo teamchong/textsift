@@ -1,20 +1,18 @@
 /**
- * `PrivacyFilter` — the clean API surface the library exports.
+ * `PrivacyFilter` — the clean API surface textsift-core exports.
  *
  * All internal machinery lives behind this class:
- *   - Model weights: downloaded + cached by ModelLoader.
- *   - Tokenizer: SentencePiece/BPE wrapper, shared across calls.
- *   - Backend: WebGPU or WASM, chosen once in `create()`.
+ *   - Model weights: downloaded + cached by ModelLoader / OPFS.
+ *   - Tokenizer: native o200k-style BPE, no transformers.js dependency.
+ *   - Backend: WebGPU or WASM (textsift-core); the umbrella `textsift`
+ *     package can inject a transformers.js backend via the `backend`
+ *     option when `"auto"` falls through.
  *   - Viterbi CRF decoder: constructed from the calibration artifact
  *     shipped alongside the weights.
  *   - Chunking: inputs over `maxChunkTokens` are split with a sliding
  *     window and re-merged at span level.
  *   - Redaction applicator: character-level placement with marker
  *     strategy resolution.
- *
- * A consumer calls `create()` once and then `redact()` / `detect()` /
- * `redactBatch()` many times. The class is reusable across calls and
- * thread-safe within a single runtime (it queues concurrent calls).
  */
 
 import {
@@ -22,7 +20,6 @@ import {
   type CreateOptions,
   type DetectResult,
   type DetectedSpan,
-  type MarkerStrategy,
   PrivacyFilterError,
   type RedactOptions,
   type RedactResult,
@@ -30,7 +27,7 @@ import {
 } from "./types.js";
 import type { InferenceBackend } from "./backends/abstract.js";
 import { selectBackend } from "./backends/select.js";
-import { ModelLoader } from "./model/loader.js";
+import { ModelLoader, type LoadedModelBundle } from "./model/loader.js";
 import { Tokenizer } from "./model/tokenizer.js";
 import { ViterbiDecoder } from "./inference/viterbi.js";
 import { loadCalibration } from "./model/calibration.js";
@@ -50,14 +47,39 @@ type FilterState =
     }
   | { kind: "disposed" };
 
+/**
+ * Per-create extension hook used by the umbrella `textsift` package to
+ * resolve the `"auto"` backend to a transformers.js implementation
+ * when WebGPU and SIMD-capable WASM are both unavailable. Most callers
+ * never set this — they let textsift-core's defaults pick.
+ */
+export interface BackendResolver {
+  /**
+   * Called when `opts.backend === "auto"`. Receives the loaded bundle
+   * and the runtime capability flags textsift-core has already
+   * detected. Return:
+   *   - an `InferenceBackend` instance to use it directly, OR
+   *   - `null` to let textsift-core fall back to its built-in choice
+   *     (`"webgpu"` if `hasWebGPU`, else `"wasm"`).
+   */
+  resolveAuto(args: {
+    bundle: LoadedModelBundle;
+    hasWebGPU: boolean;
+    isNode: boolean;
+    quantization: "int4" | "int8" | "fp16";
+  }): Promise<InferenceBackend | null>;
+}
+
 export class PrivacyFilter {
   private state: FilterState = { kind: "uninitialised" };
   private queue: Promise<unknown> = Promise.resolve();
-  private readonly opts: CreateOptions;
+  protected readonly opts: CreateOptions;
+  protected readonly backendResolver: BackendResolver | null;
 
   /** Private constructor; use `PrivacyFilter.create()`. */
-  private constructor(opts: CreateOptions) {
+  protected constructor(opts: CreateOptions, backendResolver: BackendResolver | null) {
     this.opts = opts;
+    this.backendResolver = backendResolver;
   }
 
   /**
@@ -66,7 +88,22 @@ export class PrivacyFilter {
    * `create()` calls with the same options.
    */
   static async create(opts: CreateOptions = {}): Promise<PrivacyFilter> {
-    const instance = new PrivacyFilter(opts);
+    const instance = new PrivacyFilter(opts, null);
+    await instance.ensureReady();
+    return instance;
+  }
+
+  /**
+   * Advanced factory used by the umbrella `textsift` package to inject
+   * a transformers.js fallback into the `"auto"` decision. Public-ish
+   * but documented as advanced — the umbrella is the only intended
+   * caller.
+   */
+  static async createWithResolver(
+    opts: CreateOptions,
+    resolver: BackendResolver,
+  ): Promise<PrivacyFilter> {
+    const instance = new PrivacyFilter(opts, resolver);
     await instance.ensureReady();
     return instance;
   }
@@ -172,22 +209,17 @@ export class PrivacyFilter {
       });
       const bundle = await loader.load();
       const calibration = loadCalibration(bundle.calibrationJson);
-      const tokenizer = await Tokenizer.fromBundle(bundle);
+      const tokenizer = await Tokenizer.fromBundle(bundle, {
+        signal: this.opts.signal,
+        onProgress: progress,
+      });
 
-      // Backend selection: explicit `backend` wins; "auto" (or
+      // Backend selection: explicit `backend` wins; `"auto"` (or
       // unspecified) picks the fastest path available in this
-      // environment. Browser: transformers.js on WebGPU when the
-      // adapter supports it, otherwise our WASM path. Node: our WASM
-      // path — onnxruntime-node's CPU EP has no kernel for
-      // `GatherBlockQuantized` / `MatMulNBits`, which this model
-      // requires, so tjs can't run at all in Node for it.
+      // environment. WebGPU when an adapter with `shader-f16` is
+      // available; otherwise the WASM path. The umbrella `textsift`
+      // package can override the auto fallback via `backendResolver`.
       const requested = this.opts.backend ?? "auto";
-      const wantsStage1 = requested === "wasm";
-      const wantsStage2 = requested === "webgpu";
-      // Node 21+ defines `navigator` globally, so `typeof navigator` isn't
-      // the right environment check any more. `process.versions.node`
-      // is — it's only set when running on the Node runtime (absent in
-      // browsers, Bun, Deno, and workers).
       const isNode =
         typeof process !== "undefined" &&
         !!(process as { versions?: { node?: string } }).versions?.node;
@@ -195,22 +227,36 @@ export class PrivacyFilter {
         !isNode &&
         typeof navigator !== "undefined" &&
         !!(navigator as { gpu?: unknown }).gpu;
-      const chosen: "transformers-js" | "wasm" | "webgpu" =
-        wantsStage2 ? "webgpu"
-        : wantsStage1 ? "wasm"
-        : isNode ? "wasm"
-        : "transformers-js";
-      const device: "auto" | "wasm" | "webgpu" = hasWebGPU ? "webgpu" : "auto";
-      const compileBackend: "webgpu" | "wasm" =
-        chosen === "webgpu" || (chosen === "transformers-js" && device === "webgpu") ? "webgpu" : "wasm";
-      progress?.({ stage: "compile", backend: compileBackend });
-      const backend = await selectBackend({
-        quantization: this.opts.quantization ?? "int8",
-        device,
-        bundle,
-        backend: chosen,
-        wasmModuleUrl: this.opts.wasmModuleUrl,
-      });
+      const quantization = this.opts.quantization ?? "int8";
+
+      let backend: InferenceBackend | null = null;
+
+      if (requested === "auto" && this.backendResolver) {
+        backend = await this.backendResolver.resolveAuto({
+          bundle,
+          hasWebGPU,
+          isNode,
+          quantization,
+        });
+      }
+
+      if (!backend) {
+        const chosen: "webgpu" | "wasm" =
+          requested === "webgpu" ? "webgpu"
+          : requested === "wasm" ? "wasm"
+          : hasWebGPU ? "webgpu"
+          : "wasm";
+        progress?.({ stage: "compile", backend: chosen });
+        backend = await selectBackend({
+          quantization,
+          device: hasWebGPU ? "webgpu" : "auto",
+          bundle,
+          backend: chosen,
+          wasmModuleUrl: this.opts.wasmModuleUrl,
+        });
+      } else {
+        progress?.({ stage: "compile", backend: "wasm" });
+      }
 
       progress?.({ stage: "warmup" });
       await backend.warmup();

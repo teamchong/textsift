@@ -5,15 +5,25 @@ description: Install, detect PII, redact text — in three code blocks.
 
 ## Install
 
+Two packages, same `PrivacyFilter` API. Pick one based on bundle size + auto-fallback need:
+
 ```sh
+# Lean: 76 KB gzipped, native tokenizer, no transformers.js dep.
+# Recommended for browser apps that want the smallest bundle.
+npm install textsift-core
+
+# Full: 228 KB gzipped, adds transformers.js fallback for runtimes
+# without WebGPU and without SIMD-capable WASM. Drop-in for the
+# old single-package install.
 npm install textsift
-# or: pnpm add / bun add / yarn add
 ```
+
+The rest of this page uses `textsift-core` — substitute `textsift` if you went that way.
 
 ## Redact
 
 ```ts
-import { PrivacyFilter } from "textsift";
+import { PrivacyFilter } from "textsift-core";
 
 const filter = await PrivacyFilter.create();
 
@@ -45,13 +55,14 @@ const results = await filter.redactBatch([
 
 ## Pick a backend
 
-By default `PrivacyFilter.create()` uses the transformers.js backend with WebGPU (or CPU fallback in Node). To use our own faster kernels:
+By default `PrivacyFilter.create()` picks WebGPU when available, otherwise the WASM backend. The umbrella `textsift` additionally falls back to transformers.js on browsers without WebGPU. Force a specific path:
 
 ```ts
-// Fastest: Stage-2 WGSL compute shaders, requires WebGPU + shader-f16.
+// Fastest: WGSL compute shaders, requires WebGPU + shader-f16.
 const gpu = await PrivacyFilter.create({ backend: "webgpu" });
 
-// Universal: Stage-1 Zig + WASM + SIMD128. Works everywhere.
+// Universal: Zig + WASM + SIMD128. Works everywhere. Multi-threaded
+// when the page is cross-origin-isolated (COOP/COEP headers set).
 const wasm = await PrivacyFilter.create({ backend: "wasm" });
 ```
 

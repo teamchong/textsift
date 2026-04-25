@@ -1,23 +1,30 @@
 # textsift
 
-**PII detection and redaction for the browser and Node, powered by `openai/privacy-filter`.**
+**PII detection and redaction for the browser, Node, and edge runtimes — powered by `openai/privacy-filter`.**
 
-Runs entirely on the user's device — WebGPU on capable browsers, WebAssembly + SIMD128 everywhere else. No backend, no network calls to inference services, no text ever leaves the device.
+Runs entirely on the user's device. WebGPU on capable browsers, WebAssembly + SIMD128 everywhere else. No backend, no network calls to inference services, no text ever leaves the device.
 
-> The only npm package that runs `openai/privacy-filter` client-side with both GPU and CPU paths.
+[**Docs**](https://teamchong.github.io/textsift/) · [**Quickstart**](https://teamchong.github.io/textsift/quickstart/) · [**Playground**](https://teamchong.github.io/textsift/playground/) · [**API**](https://teamchong.github.io/textsift/api/)
 
-[**Docs**](https://teamchong.github.io/textsift/) · [**Quickstart**](https://teamchong.github.io/textsift/quickstart/) · [**API**](https://teamchong.github.io/textsift/api/) · [**Benchmarks**](https://teamchong.github.io/textsift/benchmarks/)
-
-## Install
+## Two packages
 
 ```sh
+# Lean: 76 KB gzipped, native o200k-style BPE tokenizer, no transformers.js dep.
+# Recommended for browser / edge / proxy apps that want the smallest bundle.
+npm install textsift-core
+
+# Full: 226 KB gzipped, adds a transformers.js fallback for runtimes
+# without WebGPU and without SIMD-capable WASM. Drop-in for the
+# old single-package install.
 npm install textsift
 ```
+
+Both expose the same `PrivacyFilter` API. Same model, same spans, same docs.
 
 ## Use
 
 ```ts
-import { PrivacyFilter } from "textsift";
+import { PrivacyFilter } from "textsift-core"; // or "textsift"
 
 const filter = await PrivacyFilter.create();
 
@@ -45,11 +52,11 @@ Batch inputs, custom markers, per-category enabling — see the [API reference](
 
 OpenAI released [`openai/privacy-filter`](https://huggingface.co/openai/privacy-filter) on 2026-04-20 — a 1.5B-parameter MoE (50M active) bidirectional token classifier for PII detection. Apache 2.0. State-of-the-art on PII-Masking-300k (96% F1).
 
-The official SDK is Python. `transformers.js` runs it on WebGPU but fails on CPU — ORT-Web's WASM bundle is missing `GatherBlockQuantized` and `MatMulNBits` kernels. **textsift is the only package that runs this model end-to-end in the browser on both GPU and CPU**, with a single public API.
+The official SDK is Python. `transformers.js` runs it on WebGPU but fails on CPU — ORT-Web's WASM bundle is missing `GatherBlockQuantized` and `MatMulNBits` kernels. **textsift is the only package that runs this model end-to-end client-side on both GPU and CPU**, with a single public API.
 
 ## Performance
 
-M-series MacBook / Chromium 147, median of 5 runs after 2 warmups. Full table in [/benchmarks](https://teamchong.github.io/textsift/benchmarks/):
+M-series MacBook / Chromium 147, median of 5 runs after 2 warmups:
 
 | | tjs (WebGPU) | **textsift (WebGPU)** | speedup |
 |---|---:|---:|---:|
@@ -62,72 +69,53 @@ Cold-start parity on first visit (both download ~770 MB from HF CDN); repeat vis
 
 ## Backends
 
-Three interchangeable engines, same public API:
+Three interchangeable engines behind one API. `textsift-core` ships the first two; `textsift` adds the third for compatibility with WebGPU-less and SIMD-less runtimes.
 
-| Backend | Path | When |
+| Backend | Engine | Where |
 |---|---|---|
-| `auto` *(default)* | transformers.js, WebGPU via ORT-Web | Drop-in, works everywhere tjs works |
-| `webgpu` | Hand-tuned WGSL compute shaders | **Fastest.** Modern Chromium / Safari / Firefox with WebGPU + `shader-f16` |
-| `wasm` | Zig + SIMD128, compiled to WebAssembly | Universal fallback. Only working CPU path for this model |
+| `webgpu` | Hand-tuned WGSL compute shaders | Modern Chromium / Safari / Firefox with WebGPU + `shader-f16` |
+| `wasm` | Zig + SIMD128, multi-thread when COOP/COEP set | Universal fallback. Only working CPU path for this model |
+| `auto` (transformers.js) | ORT-Web (umbrella `textsift` only) | Final fallback when neither path is viable |
 
 ```ts
 const gpu = await PrivacyFilter.create({ backend: "webgpu" });   // fastest
 const wasm = await PrivacyFilter.create({ backend: "wasm" });    // universal
-const auto = await PrivacyFilter.create({ backend: "auto" });    // tjs baseline
+const auto = await PrivacyFilter.create();                        // pick best
 ```
 
-All three produce byte-identical spans on the same input. See [/backends](https://teamchong.github.io/textsift/backends/).
+All paths produce byte-identical spans on the same input.
 
-## Architecture
+## Repo layout (monorepo)
 
 ```
- ┌─────────────────────────────────────┐
- │ PrivacyFilter (public API)          │
- │ create / redact / detect / dispose  │
- └────────────┬────────────────────────┘
-              │
-              ▼
- ┌─────────────────────────────────────┐
- │ Tokenizer → Chunking → Backend      │
- │ → Viterbi CRF → BIOES merge         │
- │ → Redaction applicator              │
- └────────────┬────────────────────────┘
-              │
-              ▼
-   ┌──────┬──────┬──────┐
-   │ tjs  │ wgpu │ wasm │  backends (interchangeable)
-   └──────┴──────┴──────┘
-              │
-              ▼
-      ONNX weights (770 MB)
-      ↑ cached in OPFS ↑
+packages/
+  textsift-core/     ← lean engine: tokenizer + WebGPU + WASM backends
+    src/js/          ← public API, viterbi, chunking, redaction, native BPE tokenizer
+    src/zig/         ← Zig kernels → WASM
+    src/c/           ← FMA shim for relaxed_simd
+  textsift/          ← umbrella: depends on textsift-core + @huggingface/transformers
+    src/             ← thin wrapper, transformers.js fallback backend
+docs-site/           ← Astro + Starlight docs site (textsift.teamchong.github.io)
+tests/browser/       ← Playwright parity + benchmark tests
+docs/                ← engineering notes (roadmap, benchmarks)
 ```
-
-Full architecture details in [/architecture](https://teamchong.github.io/textsift/architecture/).
-
-## Caveats
-
-`openai/privacy-filter` is a detection aid, **not an anonymization guarantee**. No dedicated SSN / passport label. English-first (Japanese ~88% F1, other languages untested). Short text under-contextualizes.
-
-See the [caveats page](https://teamchong.github.io/textsift/caveats/) and OpenAI's [model card](https://cdn.openai.com/pdf/c66281ed-b638-456a-8ce1-97e9f5264a90/OpenAI-Privacy-Filter-Model-Card.pdf) before treating redacted output as compliance-safe.
 
 ## Development
 
 ```sh
-npm install
-npm run build           # Zig → WASM, JS bundle, .d.ts
-npm run typecheck
-npm run test            # playwright browser tests
+npm install                # workspace bootstrap
+npm run build              # builds both packages (zig → wasm, bundle, .d.ts)
+npm run typecheck          # strict, noUncheckedIndexedAccess on
+npm run test               # playwright browser tests
 ```
 
-Source layout:
+The tokenizer-conformance test (`tests/browser/tokenizer-conformance.spec.ts`) verifies the native BPE tokenizer produces byte-for-byte identical token-id sequences to AutoTokenizer across a 46-case corpus (English, Unicode, code, edge whitespace, special tokens).
 
-- `src/js/` — public API, backends, inference composition (Viterbi, chunking, redaction).
-- `src/zig/` — Zig kernels (int4 matmul, banded attention, RoPE, QMoE dispatch, …) compiled to WASM.
-- `src/js/backends/webgpu.ts` — WGSL shaders for the Stage-2 GPU backend.
-- `docs/` — engineering notes (roadmap, benchmarks, measurement artefacts).
-- `docs-site/` — Astro + Starlight user docs, deployed to GitHub Pages.
-- `tests/browser/` — Playwright parity + benchmark tests.
+## Caveats
+
+`openai/privacy-filter` is a detection aid, **not an anonymization guarantee**. English-first (Japanese ~88% F1, other languages untested). Short text under-contextualizes.
+
+See the [caveats page](https://teamchong.github.io/textsift/caveats/) and OpenAI's [model card](https://cdn.openai.com/pdf/c66281ed-b638-456a-8ce1-97e9f5264a90/OpenAI-Privacy-Filter-Model-Card.pdf) before treating redacted output as compliance-safe.
 
 ## License
 

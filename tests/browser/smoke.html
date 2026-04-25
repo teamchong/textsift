@@ -12,7 +12,7 @@
       // backend, and assert every token's argmax class agrees. Both
       // backends read the same `onnx/model_q4f16.onnx` from HF Hub
       // so any divergence is a kernel bug, not a weight mismatch.
-      import { PrivacyFilter } from "/dist/index.js";
+      import { PrivacyFilter } from "/packages/textsift-core/dist/index.js";
 
       const $out = document.getElementById("out");
       const log = (m) => { $out.textContent += "\n" + m; };

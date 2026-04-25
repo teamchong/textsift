@@ -32,8 +32,12 @@ export interface Logits {
 }
 
 export interface InferenceBackend {
-  /** A debug name used in progress events + error messages. */
-  readonly name: "wasm" | "transformers-js" | "webgpu";
+  /**
+   * A debug name used in progress events + error messages. The umbrella
+   * `textsift` package adds backends with names outside this union (e.g.
+   * `"transformers-js"`); `string` keeps the contract open.
+   */
+  readonly name: string;
 
   /** Run the model once, compiling pipelines if not already done. */
   warmup(): Promise<void>;

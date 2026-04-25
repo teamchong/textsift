@@ -14,7 +14,8 @@ test("webgpu matmul_int4 parity vs wasm", async ({ page }) => {
 
   await page.goto("/tests/browser/webgpu-matmul.html");
   await page.waitForFunction(() => (window as any).__result !== undefined, null, {
-    timeout: 120_000,
+    // Cold-cache runs download ~770 MB across two backends.
+    timeout: 4 * 60_000,
   });
   const result = await page.evaluate(() => (window as any).__result);
 

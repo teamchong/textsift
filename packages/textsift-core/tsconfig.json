@@ -22,5 +22,5 @@
     "types": ["@types/node", "@webgpu/types"]
   },
   "include": ["src/js/**/*.ts"],
-  "exclude": ["node_modules", "dist", "tests", "demo"]
+  "exclude": ["node_modules", "dist"]
 }

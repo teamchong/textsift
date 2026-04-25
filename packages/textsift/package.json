@@ -1,0 +1,48 @@
+{
+  "name": "textsift",
+  "version": "0.1.0",
+  "description": "PII detection + redaction with auto backend selection. Wraps textsift-core and adds a transformers.js-based fallback path so PrivacyFilter.create() works on any browser or Node runtime out of the box.",
+  "type": "module",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/",
+    "LICENSE",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "pii",
+    "privacy",
+    "redaction",
+    "webgpu",
+    "webassembly",
+    "wasm",
+    "browser",
+    "openai",
+    "privacy-filter",
+    "transformers.js",
+    "auto-fallback"
+  ],
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target browser --format esm --sourcemap=external --external textsift-core --external @huggingface/transformers && bun x tsc --emitDeclarationOnly",
+    "typecheck": "bun x tsc --noEmit"
+  },
+  "dependencies": {
+    "textsift-core": "0.1.0",
+    "@huggingface/transformers": "^4.2.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

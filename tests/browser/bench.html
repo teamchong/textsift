@@ -6,6 +6,18 @@
   </head>
   <body>
     <pre id="out">starting</pre>
+    <!-- The umbrella `textsift` package externalizes its deps so a
+         consumer's bundler (Vite/Webpack/etc) can resolve them. The
+         bench page loads ESM directly with no bundler, so we wire the
+         bare-name imports via an import map. -->
+    <script type="importmap">
+      {
+        "imports": {
+          "textsift-core": "/packages/textsift-core/dist/index.js",
+          "@huggingface/transformers": "https://esm.sh/@huggingface/transformers@4.2.0"
+        }
+      }
+    </script>
     <script type="module">
       // Run both backends in a real browser; measure warm-forward
       // medians at several T. Playwright reads window.__result.
@@ -13,7 +25,7 @@
       // Both backends fetch the same `onnx/model_q4f16.onnx` from
       // `modelSource`. First run hits HF Hub; second run is served
       // from the browser's HTTP cache.
-      import { PrivacyFilter } from "/dist/index.js";
+      import { PrivacyFilter } from "/packages/textsift/dist/index.js";
 
       const $out = document.getElementById("out");
       const log = (m) => { $out.textContent += "\n" + m; };
@@ -49,7 +61,11 @@
         const hasWebGPU = !!navigator.gpu;
         log(`WebGPU available: ${hasWebGPU}`);
 
-        log("transformers.js: create + warmup");
+        // "auto" — textsift umbrella with default options. Resolver
+        // returns null when WebGPU is available, so this delegates to
+        // textsift-core's auto choice (webgpu in browsers). On a
+        // browser without WebGPU it would route to transformers.js.
+        log("auto: create + warmup");
         const t0 = performance.now();
         const tjs = await PrivacyFilter.create({
           onProgress: (ev) => {
@@ -62,7 +78,7 @@
           },
         });
         const tjsWarmup = performance.now() - t0;
-        log(`transformers.js ready in ${tjsWarmup.toFixed(0)}ms`);
+        log(`auto ready in ${tjsWarmup.toFixed(0)}ms`);
 
         log("wasm backend: create + warmup");
         const t1 = performance.now();
@@ -83,9 +99,9 @@
         const rows = [];
         for (const text of SEEDS) {
           log(`\ntext: "${text.slice(0, 60)}${text.length > 60 ? "…" : ""}"`);
-          const tjsMs = await measure("transformers.js", tjs, text);
-          const wasmMs = await measure("wasm (Stage 1)", wasm, text);
-          const gpuMs = await measure("webgpu (Stage 2)", gpu, text);
+          const tjsMs = await measure("auto (umbrella)", tjs, text);
+          const wasmMs = await measure("wasm (core)", wasm, text);
+          const gpuMs = await measure("webgpu (core)", gpu, text);
           rows.push({
             text: text.slice(0, 80),
             tjsMs, wasmMs, gpuMs,

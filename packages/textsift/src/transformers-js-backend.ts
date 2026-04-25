@@ -1,16 +1,15 @@
 /**
- * Stage-0 baseline backend: `@huggingface/transformers` (transformers.js).
+ * Transformers.js fallback backend, exclusively part of the umbrella
+ * `textsift` package — never imported from `textsift-core`.
  *
- * Loads `openai/privacy-filter` via the low-level `AutoModelForTokenClassification`
- * and runs one forward pass per chunk, returning raw per-token logits.
+ * Loads `openai/privacy-filter` via the low-level
+ * `AutoModelForTokenClassification` and runs one forward pass per
+ * chunk, returning raw per-token logits.
  *
  * We bypass the `pipeline()` helper because it runs its own argmax /
- * BIOES fusion and only surfaces decoded `entity` strings — we need the
- * raw `[T, 33]` tensor so the same Viterbi decoder and span merger
- * drive every backend (transformers.js today, Zig+WASM later).
- *
- * Migration path: once `./wasm.js` (Zig+WASM) ships, `backends/select.ts`
- * routes around this backend; it stays as the portability fallback.
+ * BIOES fusion and only surfaces decoded `entity` strings — we need
+ * the raw `[T, 33]` tensor so the same Viterbi decoder and span
+ * merger drive every backend (WebGPU, WASM, transformers.js).
  */
 
 import {
@@ -21,7 +20,7 @@ import type {
   BackendConstructionOptions,
   InferenceBackend,
   Logits,
-} from "./abstract.js";
+} from "textsift-core";
 
 type PretrainedModel = Awaited<
   ReturnType<typeof AutoModelForTokenClassification.from_pretrained>
@@ -38,24 +37,18 @@ interface ModelOutput {
 type TransformersDType = "fp16" | "q4f16";
 
 /**
- * Map our `quantization` option onto a transformers.js `dtype` value that
- * ORT Web can dispatch against the ONNX exports in openai/privacy-filter.
+ * Map our `quantization` option onto a transformers.js `dtype` value
+ * that ORT Web can dispatch against the ONNX exports in
+ * openai/privacy-filter.
  *
- * Available exports on the hub:
- *   model.onnx            fp32 (~5.2 GB across three shards) — too large for browsers
- *   model_fp16.onnx       fp16 weights (~2 GB) — OOM in browser even with WebGPU
- *   model_q4f16.onnx      block-int4 weights + fp16 activations (~772 MB)
- *   model_q4.onnx         block-int4 (~875 MB)
- *   model_quantized.onnx  block-int4 (~1.5 GB, "q8" suffix alias)
+ *   model.onnx            fp32 (~5.2 GB) — too large for browsers
+ *   model_fp16.onnx       fp16 weights (~2 GB) — OOM in browser
+ *   model_q4f16.onnx      block-int4 + fp16 activations (~772 MB)
  *
- * model_q4f16.onnx is the smallest export that fits in a browser context.
- * It uses MatMulNBits and GatherBlockQuantized; both are implemented as WebGPU
- * contrib ops in the asyncify WASM bundle and require device: "webgpu" —
- * the WASM CPU path has no implementation for either op.
- *
- * "fp16" requests use model_fp16.onnx for maximum accuracy if the caller
- * explicitly opts in despite the size; it also requires device: "webgpu"
- * because the fp32 ONNX parse buffer (~2 GB) OOMs the WASM heap.
+ * model_q4f16 is the smallest export that fits in a browser context.
+ * It uses MatMulNBits + GatherBlockQuantized (WebGPU-only contrib ops);
+ * the WASM CPU path has no implementation for either, so device must
+ * be "webgpu" or "auto" — never "wasm" with this dtype.
  */
 function dtypeFor(q: "int4" | "int8" | "fp16"): TransformersDType {
   if (q === "fp16") return "fp16";
@@ -103,9 +96,9 @@ export class TransformersJsBackend implements InferenceBackend {
     const input_ids = new Tensor("int64", ids, [1, n]);
     const attention_mask = new Tensor("int64", mask, [1, n]);
 
-    const output = (await (model as unknown as (inputs: Record<string, Tensor>) => Promise<ModelOutput>)(
-      { input_ids, attention_mask },
-    )) as ModelOutput;
+    const output = (await (
+      model as unknown as (inputs: Record<string, Tensor>) => Promise<ModelOutput>
+    )({ input_ids, attention_mask })) as ModelOutput;
 
     const dims = output.logits.dims;
     if (dims.length !== 3 || dims[0] !== 1 || dims[1] !== n) {

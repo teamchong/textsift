@@ -1,0 +1,52 @@
+{
+  "name": "textsift-core",
+  "version": "0.1.0",
+  "description": "Lean PII detection + redaction for browser, Node, and edge runtimes. Custom WebGPU + WASM backends with a native o200k-style BPE tokenizer. Zero runtime dependencies — no transformers.js.",
+  "type": "module",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/",
+    "LICENSE",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "pii",
+    "privacy",
+    "redaction",
+    "webgpu",
+    "webassembly",
+    "wasm",
+    "browser",
+    "openai",
+    "privacy-filter",
+    "token-classification",
+    "ner",
+    "tokenizer",
+    "bpe"
+  ],
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "npm run build:zig && npm run build:opt && node scripts/inline-wasm.mjs && bun build src/js/index.ts --outdir dist --target browser --format esm --sourcemap=external && bun x tsc --emitDeclarationOnly",
+    "build:zig": "npm run build:zig-st && npm run build:zig-mt",
+    "build:zig-st": "mise exec -- zig build-exe -target wasm32-freestanding -mcpu=generic+simd128+relaxed_simd -O ReleaseFast -fstrip -flto src/zig/wasm_exports.zig -cflags -O3 -mrelaxed-simd -flto -- src/c/fma.c --name textsift -fno-entry -rdynamic && mv textsift.wasm dist/",
+    "build:zig-mt": "mise exec -- zig build-exe -target wasm32-freestanding -mcpu=generic+simd128+relaxed_simd+atomics+bulk_memory -O ReleaseFast -fstrip -flto src/zig/wasm_exports.zig -cflags -O3 -mrelaxed-simd -flto -- src/c/fma.c --shared-memory --import-memory --initial-memory=4194304 --max-memory=2147483648 --export=__stack_pointer --name textsift-mt -fno-entry -rdynamic && mv textsift-mt.wasm dist/",
+    "build:opt": "npm run build:opt-st && npm run build:opt-mt",
+    "build:opt-st": "wasm-opt -O3 --strip-producers --strip-target-features dist/textsift.wasm -o dist/textsift.wasm --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals --enable-relaxed-simd --inlining-optimizing --always-inline-max-function-size 256 --flexible-inline-max-function-size 512 --inline-functions-with-loops",
+    "build:opt-mt": "wasm-opt -O3 --strip-producers --strip-target-features dist/textsift-mt.wasm -o dist/textsift-mt.wasm --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals --enable-relaxed-simd --enable-threads --inlining-optimizing --always-inline-max-function-size 256 --flexible-inline-max-function-size 512 --inline-functions-with-loops",
+    "typecheck": "bun x tsc --noEmit"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

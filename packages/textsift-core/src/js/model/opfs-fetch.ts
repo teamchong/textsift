@@ -82,3 +82,81 @@ export async function fetchBytesCached(url: string): Promise<ArrayBuffer> {
   }
   return r.arrayBuffer();
 }
+
+/**
+ * Summary of what textsift has in OPFS for the current origin: total
+ * bytes plus a per-file breakdown. UI surfaces this so users can see
+ * how much disk a model occupies and decide when to wipe.
+ */
+export interface CachedModelInfo {
+  /** True if the runtime supports OPFS at all. */
+  supported: boolean;
+  /** Sum of `bytes` across all entries. 0 when nothing is cached. */
+  totalBytes: number;
+  /** Per-entry list. `name` is the on-disk filename in our OPFS dir. */
+  entries: Array<{ name: string; bytes: number }>;
+}
+
+/**
+ * Inspect the textsift OPFS cache. Cheap — just walks the directory
+ * handle and reads file sizes. Safe to call before any model load.
+ */
+export async function getCachedModelInfo(): Promise<CachedModelInfo> {
+  const dir = await opfsRoot();
+  if (!dir) return { supported: false, totalBytes: 0, entries: [] };
+  const entries: Array<{ name: string; bytes: number }> = [];
+  let total = 0;
+  try {
+    // FileSystemDirectoryHandle exposes async-iterable values() in
+    // every browser that supports OPFS at all (Chrome 86+, Safari
+    // 15.2+, Firefox 111+).
+    // @ts-expect-error: TS DOM lib doesn't yet model values() on the
+    //   directory handle even though every shipped browser exposes it.
+    for await (const handle of dir.values()) {
+      if (handle.kind !== "file") continue;
+      const file = await (handle as FileSystemFileHandle).getFile();
+      entries.push({ name: handle.name, bytes: file.size });
+      total += file.size;
+    }
+  } catch {
+    // Iteration error → return whatever we collected.
+  }
+  return { supported: true, totalBytes: total, entries };
+}
+
+/**
+ * Wipe every textsift entry from OPFS. Idempotent — safe to call
+ * even when nothing is cached. Returns how many bytes were freed.
+ *
+ * Caller is responsible for not having any active sessions that hold
+ * weights in WASM linear memory; clearing OPFS doesn't cancel an in-
+ * flight forward pass, it just forces the next `create()` to re-fetch.
+ */
+export async function clearCachedModel(): Promise<{ removed: number; bytes: number }> {
+  const dir = await opfsRoot();
+  if (!dir) return { removed: 0, bytes: 0 };
+  let removed = 0;
+  let bytes = 0;
+  try {
+    // @ts-expect-error: see note in getCachedModelInfo.
+    for await (const handle of dir.values()) {
+      if (handle.kind !== "file") continue;
+      try {
+        const file = await (handle as FileSystemFileHandle).getFile();
+        bytes += file.size;
+      } catch {
+        // ignore — still try to delete.
+      }
+      try {
+        await dir.removeEntry(handle.name);
+        removed++;
+      } catch {
+        // Permission / lock issue — leave it; UI will show the
+        // remaining bytes after refresh.
+      }
+    }
+  } catch {
+    // Iteration failure — nothing more we can do.
+  }
+  return { removed, bytes };
+}

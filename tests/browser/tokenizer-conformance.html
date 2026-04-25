@@ -1,0 +1,180 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>textsift — tokenizer conformance vs AutoTokenizer</title>
+  </head>
+  <body>
+    <pre id="out">starting</pre>
+    <script type="module">
+      // Load both tokenizers from the same model source and compare
+      // their `encode()` output token-for-token across a varied
+      // corpus. The native tokenizer (textsift-core) must match
+      // AutoTokenizer (@huggingface/transformers) exactly.
+      //
+      // Failure modes we care about:
+      //   - Pretokenizer regex differences (Unicode classes, contractions)
+      //   - Byte-level mapping differences
+      //   - BPE merge ordering differences
+      //   - Special-token handling
+      //   - Character offset alignment
+
+      import { ModelLoader, Tokenizer as NativeTokenizer } from "/packages/textsift-core/dist/index.js";
+      const tjs = await import("https://esm.sh/@huggingface/transformers@4.2.0");
+
+      const $out = document.getElementById("out");
+      const log = (m) => { $out.textContent += "\n" + m; };
+
+      const SOURCE = "https://huggingface.co/openai/privacy-filter/resolve/main/";
+
+      const CORPUS = [
+        // Plain English
+        "Hello, world.",
+        "Hi, my name is John Smith.",
+        "I'm going to the store.",
+        "She said \"don't worry\".",
+        // Multi-paragraph
+        "First line.\n\nSecond paragraph here.\nThird line.",
+        // PII-style content
+        "Email: john.smith@example.com, phone: (617) 555-0199.",
+        "SSN 123-45-6789, account 9876543210, routing 021000089.",
+        // Numbers + dates
+        "On 2026-04-25 at 14:30 the value was $1,234.56 (3.14% growth).",
+        "Order #ABC-12345 shipped 100 units to ZIP 02134.",
+        // Code-like
+        'const x = "test"; if (x !== null) { return x.toUpperCase(); }',
+        "git checkout -b feature/textsift-rewrite",
+        // URLs
+        "Visit https://example.com/path?q=foo&bar=baz#section for details.",
+        "ftp://files.example.org/data.tar.gz",
+        // Punctuation runs
+        "...wait!?!? Really??",
+        "* * * * *",
+        "[bracket][brackets]({{paren}})",
+        // Whitespace edges
+        "   leading and trailing   ",
+        "tabs\tand\nnewlines\rmixed",
+        // Emoji / multi-byte
+        "Hello 🌍 world! Café münü.",
+        "Iñtërnâtiônàlizætiøn",
+        "日本語のテキスト",
+        "中文测试123",
+        "Здравствуй мир",
+        "العربية",
+        "🎉🎂🎈 party time 🥳",
+        // Surrogate pairs
+        "𝐇𝐞𝐥𝐥𝐨 mathematical bold",
+        // Edge: empty + whitespace-only
+        "",
+        " ",
+        "\n\n\n",
+        // Edge: very long word
+        "supercalifragilisticexpialidocious",
+        // Mixed case + contractions
+        "DON'T shout. Don't whisper. don't even.",
+        "I've, I'll, I'd, I'm, you're, we've",
+        "AS-IS — IT'S a TEST.",
+        // Special-token-looking but not actually special
+        "This <|fake|> is not a real special token.",
+        // Real special tokens
+        "<|startoftext|>some prompt<|endoftext|>",
+        "<|start|>user<|message|>hi<|end|>",
+        // Numbers stress
+        "12345 123 12 1 123.456 1,000,000 -42",
+        // Repeated whitespace patterns the regex's last 3 alternatives stress
+        "a    b\t\tc",
+        "trailing space ",
+        " leading space",
+        // Long mixed paragraph
+        "Dear Dr. Smith,\n\nI am writing regarding patient #4711 (born March 12, 2018) " +
+        "whose lab results from 2024-03-15 showed elevated levels. Please call " +
+        "(415) 555-0199 or email j.smith@hospital.org. The patient lives at " +
+        "456 Oak Avenue, Apt 3B, Boston, MA 02134.\n\nBest regards,\nMargaret",
+        // Code with special chars
+        "function f(x) { return x ** 2 + 1; }",
+        "regex = /[a-z0-9_-]+/gi;",
+        // Multi-script in one line
+        "English ελληνικά 日本語 العربية русский 한국어",
+        // Tricky punctuation + apostrophe combinations
+        "rock'n'roll, 'twas the night, ya'll",
+        // Mathematical
+        "∑(i=1, n) x_i = π × √2 ≈ 3.14159",
+      ];
+
+      try {
+        log("loading model bundle (config + calibration)…");
+        const loader = new ModelLoader({ source: SOURCE });
+        const bundle = await loader.load();
+        log(`bundle ready (modelId=${bundle.modelId})`);
+
+        log("creating native tokenizer…");
+        const tNative0 = performance.now();
+        const nativeTok = await NativeTokenizer.fromBundle(bundle);
+        const tNative = performance.now() - tNative0;
+        log(`native ready in ${tNative.toFixed(0)}ms (vocab=${nativeTok.vocabSize()})`);
+
+        log("creating AutoTokenizer (transformers.js)…");
+        const tTjs0 = performance.now();
+        const tjsTok = await tjs.AutoTokenizer.from_pretrained(bundle.modelId);
+        const tTjs = performance.now() - tTjs0;
+        log(`tjs ready in ${tTjs.toFixed(0)}ms`);
+
+        log(`running ${CORPUS.length} comparisons…`);
+
+        const failures = [];
+        for (let i = 0; i < CORPUS.length; i++) {
+          const text = CORPUS[i];
+          const tjsIds = tjsTok.encode(text, { add_special_tokens: false });
+          const nat = nativeTok.encode(text);
+          const nativeIds = Array.from(nat.tokenIds);
+
+          if (tjsIds.length !== nativeIds.length) {
+            failures.push({
+              i, text, reason: "length mismatch",
+              tjsLen: tjsIds.length, nativeLen: nativeIds.length,
+              tjs: tjsIds.slice(0, 30),
+              native: nativeIds.slice(0, 30),
+            });
+            continue;
+          }
+          let allMatch = true;
+          for (let j = 0; j < tjsIds.length; j++) {
+            if (tjsIds[j] !== nativeIds[j]) {
+              failures.push({
+                i, text, reason: "token mismatch at index " + j,
+                tjs: tjsIds.slice(Math.max(0, j - 3), j + 4),
+                native: nativeIds.slice(Math.max(0, j - 3), j + 4),
+                index: j,
+              });
+              allMatch = false;
+              break;
+            }
+          }
+          if (allMatch && i < 5) log(`  [${i}] ok (${tjsIds.length} tokens)`);
+        }
+
+        const ok = failures.length === 0;
+        window.__result = {
+          ok,
+          totalCases: CORPUS.length,
+          failures: failures.slice(0, 20),
+          failureCount: failures.length,
+          nativeReadyMs: tNative,
+          tjsReadyMs: tTjs,
+        };
+        log(`done: ${ok ? "ALL MATCH" : `${failures.length} failure(s)`}`);
+        if (!ok) {
+          for (const f of failures.slice(0, 10)) {
+            log(`  case ${f.i} (${JSON.stringify(f.text.slice(0, 60))}): ${f.reason}`);
+            log(`    tjs:    ${JSON.stringify(f.tjs)}`);
+            log(`    native: ${JSON.stringify(f.native)}`);
+          }
+        }
+      } catch (e) {
+        window.__result = { ok: false, error: String(e), stack: e.stack };
+        log("ERROR: " + e);
+        throw e;
+      }
+    </script>
+  </body>
+</html>

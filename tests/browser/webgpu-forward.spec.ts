@@ -8,6 +8,9 @@
 import { test, expect } from "@playwright/test";
 
 test("webgpu forward parity vs wasm", async ({ page }) => {
+  // Cold-cache run downloads ~770 MB across two backends; allow 5 min.
+  test.setTimeout(5 * 60_000);
+
   const consoleErrors: string[] = [];
   page.on("console", (msg) => {
     if (msg.type() === "error") consoleErrors.push(msg.text());
@@ -15,7 +18,7 @@ test("webgpu forward parity vs wasm", async ({ page }) => {
 
   await page.goto("/tests/browser/webgpu-forward.html");
   await page.waitForFunction(() => (window as any).__result !== undefined, null, {
-    timeout: 180_000,
+    timeout: 4 * 60_000,
   });
   const result = await page.evaluate(() => (window as any).__result);
 

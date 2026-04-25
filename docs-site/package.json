@@ -10,9 +10,8 @@
   "dependencies": {
     "@astrojs/starlight": "^0.34.0",
     "astro": "^5.7.0",
-    "sharp": "^0.33.0"
-  },
-  "overrides": {
-    "zod": "3.25.76"
+    "sharp": "^0.33.0",
+    "textsift-core": "*",
+    "textsift": "*"
   }
 }

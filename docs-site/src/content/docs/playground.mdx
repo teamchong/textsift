@@ -1,0 +1,26 @@
+---
+title: Playground
+description: Interactive in-browser textsift detection — paste text, see the spans the privacy-filter model finds.
+---
+
+import Playground from "../../components/Playground.astro";
+
+Paste any text and click **Detect** to see the spans the
+`openai/privacy-filter` model finds. Click **Redact** to replace each
+span with its category marker. Everything runs in your browser — the
+text never leaves the page.
+
+<Playground />
+
+## What's happening
+
+The first click loads the textsift JS bundle (~2.6 MB) and the
+underlying `model_q4f16.onnx` from the Hugging Face Hub (~770 MB).
+Subsequent clicks are served from the browser's HTTP cache, so the
+slow path only runs once per browser. WebGPU is auto-selected when
+available; the [Backends](/textsift/backends/) page covers fallbacks.
+
+The default backend selection mirrors what
+`PrivacyFilter.create({})` does in your own code — see
+[Quickstart](/textsift/quickstart/) and the
+[API reference](/textsift/api/).

@@ -49,10 +49,19 @@ The gap: the official SDK is Python. transformers.js runs it on WebGPU but has n
   </Card>
 </CardGrid>
 
+## Two packages, your choice
+
+```bash
+npm install textsift-core   # ~76 KB gzipped, no transformers.js dep
+npm install textsift        # ~228 KB gzipped, adds auto fallback
+```
+
+Both expose the same `PrivacyFilter` API. The umbrella `textsift` package adds a transformers.js fallback path for runtimes without WebGPU or SIMD-capable WASM. Most apps want `textsift-core` — it's leaner and ships with a native o200k-style BPE tokenizer (no transformers.js dep at all).
+
 ## 30-second example
 
 ```ts
-import { PrivacyFilter } from "textsift";
+import { PrivacyFilter } from "textsift-core";
 
 const filter = await PrivacyFilter.create();
 const result = await filter.redact(

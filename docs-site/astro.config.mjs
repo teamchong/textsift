@@ -17,6 +17,7 @@ export default defineConfig({
       sidebar: [
         { label: "Overview", slug: "index" },
         { label: "Quickstart", slug: "quickstart" },
+        { label: "Playground", slug: "playground" },
         { label: "API Reference", slug: "api" },
         { label: "Backends", slug: "backends" },
         { label: "Benchmarks", slug: "benchmarks" },

@@ -633,9 +633,14 @@ export class WasmBackend implements InferenceBackend {
     if (useMt) {
       const D = PF_CONFIG.hiddenSize;
       const dff = PF_CONFIG.intermediateSize;
+      // 6-thread default — sweep on M-series shows the sweet spot at 6
+      // (T=32: 4t=93ms, 6t=74ms; T=128: 4t=315ms, 6t=258ms). 8 threads
+      // regresses, likely from E-core contention competing with the
+      // main thread. Cap at hardwareConcurrency-1 so the main thread
+      // always has at least one core.
+      const cores = (typeof navigator !== "undefined" ? navigator.hardwareConcurrency : 4) || 4;
       const desired = this.opts.numThreads ??
-        Math.max(2, Math.min(4,
-          (typeof navigator !== "undefined" ? navigator.hardwareConcurrency : 4) || 4));
+        Math.max(2, Math.min(6, cores - 1));
 
       // Allocate per-worker scratch + the f32 MoE accumulator BEFORE
       // marking the heap, so `reset()` after each forward keeps them.

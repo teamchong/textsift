@@ -421,6 +421,82 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 }
 `;
 
+// ---------- WGSL: fused (a+b) → fp16 sum + RMSNorm → f32 ----------
+
+/**
+ * Mirror of the WASM `add_rmsnorm_fp16_to_f32` kernel: combines the
+ * post-attention residual add, layernorm, and fp16→f32 widen into one
+ * dispatch per layer. Saves two GPU compute barriers per layer plus
+ * the intermediate fp16 normed buffer write.
+ *
+ * Per workgroup: one row of T. 64 threads cooperatively walk D, each
+ * thread accumulating sumsq for its strided slice and writing the
+ * fp16 sum (= a+b) as it goes. After the workgroup-shared sumsq
+ * reduce, threads re-read fp16 sum, apply gamma * inv_rms, and write
+ * the f32 norm output.
+ */
+const ADD_RMSNORM_FP16_TO_F32_WGSL = /* wgsl */ `
+enable f16;
+
+struct Dims { T: u32, D: u32, eps: f32, _pad: u32 };
+
+@group(0) @binding(0) var<uniform> dims: Dims;
+@group(0) @binding(1) var<storage, read> a: array<f16>;
+@group(0) @binding(2) var<storage, read> b: array<f16>;
+@group(0) @binding(3) var<storage, read> gamma: array<f16>;
+@group(0) @binding(4) var<storage, read_write> sum_out: array<f16>;
+@group(0) @binding(5) var<storage, read_write> norm_out: array<f32>;
+
+var<workgroup> wg_sum: array<f32, 64>;
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let t = wg.x;
+    if (t >= dims.T) { return; }
+    let D = dims.D;
+    let row = t * D;
+    let tid = lid.x;
+
+    var ssq: f32 = 0.0;
+    var d = tid;
+    loop {
+        if (d >= D) { break; }
+        let av = f32(a[row + d]);
+        let bv = f32(b[row + d]);
+        let sv = av + bv;
+        sum_out[row + d] = f16(sv);
+        ssq = ssq + sv * sv;
+        d = d + 64u;
+    }
+    wg_sum[tid] = ssq;
+    workgroupBarrier();
+
+    var stride: u32 = 32u;
+    loop {
+        if (tid < stride) {
+            wg_sum[tid] = wg_sum[tid] + wg_sum[tid + stride];
+        }
+        workgroupBarrier();
+        if (stride == 1u) { break; }
+        stride = stride / 2u;
+    }
+
+    let inv_rms = inverseSqrt(wg_sum[0] / f32(D) + dims.eps);
+
+    // Re-read the fp16 sum we just wrote. Each thread reads only its
+    // own writes (strided by 64) so there's no cross-thread dep, and
+    // the write→read of the same fp16 is round-trip identical.
+    d = tid;
+    loop {
+        if (d >= D) { break; }
+        let g = f32(gamma[d]);
+        let sv = f32(sum_out[row + d]);
+        norm_out[row + d] = sv * inv_rms * g;
+        d = d + 64u;
+    }
+}
+`;
+
 // ---------- WGSL: dtype casts ----------
 
 const CAST_FP16_TO_F32_WGSL = /* wgsl */ `
@@ -1118,6 +1194,7 @@ export interface WebGpuBackendOptions extends BackendConstructionOptions {}
 interface Pipelines {
   embed: GPUComputePipeline;
   rmsNorm: GPUComputePipeline;
+  addRmsNormToF32: GPUComputePipeline;
   matmulF32F32: GPUComputePipeline;
   matmulFp16F16: GPUComputePipeline;
   castFp16ToF32: GPUComputePipeline;
@@ -1135,6 +1212,7 @@ interface Pipelines {
 interface BindGroupLayouts {
   embed: GPUBindGroupLayout;
   rmsNorm: GPUBindGroupLayout;
+  addRmsNormToF32: GPUBindGroupLayout;
   matmul: GPUBindGroupLayout;
   cast1to1: GPUBindGroupLayout;       // single in → single out (cast_fp16_to_f32)
   castScaled: GPUBindGroupLayout;     // dims + scale + src + dst
@@ -1534,49 +1612,25 @@ export class WebGpuBackend implements InferenceBackend {
       // O projection reads fp16 attnOut directly (same fusion as Q/K/V).
       runMatmulFp16F16(`layers.${L}.attn.o_proj`, scratch.attnOut, scratch.oOut, D, Hq * hd);
 
-      // Residual: hCur + oOut → h1 (scratch).
-      dispatch(
-        this.pipelines.addFp16,
-        device.createBindGroup({
-          layout: this.bgls.add,
-          entries: [
-            { binding: 0, resource: { buffer: u(dims4(T * D, 0, 0, 0)) } },
-            { binding: 1, resource: { buffer: hCur } },
-            { binding: 2, resource: { buffer: scratch.oOut } },
-            { binding: 3, resource: { buffer: scratch.normed1 } },  // reuse normed1 as h1
-          ],
-        }),
-        T * D,
-      );
-      // `normed1` now holds h1 (post-attention residual).
-
-      // post_attention_layernorm(h1) → normed2.
+      // Fused: (hCur + oOut) → h1 (fp16, written to normed1 buffer)
+      // and rms_norm(h1) widened to f32 → hiddenF32. One dispatch
+      // replaces add_fp16 + rms_norm + cast_fp16_to_f32 (3 dispatches).
+      // The post-attention norm input (`normed1` here) doubles as the
+      // residual stream into the final block add.
       dispatchGroups(
-        this.pipelines.rmsNorm,
+        this.pipelines.addRmsNormToF32,
         device.createBindGroup({
-          layout: this.bgls.rmsNorm,
+          layout: this.bgls.addRmsNormToF32,
           entries: [
             { binding: 0, resource: { buffer: u(dimsEps(T, D, PF_CONFIG.rmsNormEps)) } },
-            { binding: 1, resource: { buffer: scratch.normed1 } },
-            resBinding(2, w("post_attention_layernorm")),
-            { binding: 3, resource: { buffer: scratch.normed2 } },
+            { binding: 1, resource: { buffer: hCur } },
+            { binding: 2, resource: { buffer: scratch.oOut } },
+            resBinding(3, w("post_attention_layernorm")),
+            { binding: 4, resource: { buffer: scratch.normed1 } },   // residual2 (fp16 sum)
+            { binding: 5, resource: { buffer: scratch.hiddenF32 } }, // f32 normed
           ],
         }),
         T,
-      );
-
-      // Widen normed2 → hiddenF32 (reuse, overwriting the Q/K/V source).
-      dispatch(
-        this.pipelines.castFp16ToF32,
-        device.createBindGroup({
-          layout: this.bgls.cast1to1,
-          entries: [
-            { binding: 0, resource: { buffer: u(dims4(T * D, 0, 0, 0)) } },
-            { binding: 1, resource: { buffer: scratch.normed2 } },
-            { binding: 2, resource: { buffer: scratch.hiddenF32 } },
-          ],
-        }),
-        T * D,
       );
 
       // Router: f32-in, f32-out int4 matmul.
@@ -1977,6 +2031,10 @@ function createBindGroupLayouts(device: GPUDevice): BindGroupLayouts {
       label: "bgl.rmsnorm",
       entries: [uniformEntry(0), rEntry(1), rEntry(2), rwEntry(3)],
     }),
+    addRmsNormToF32: device.createBindGroupLayout({
+      label: "bgl.addRmsNormToF32",
+      entries: [uniformEntry(0), rEntry(1), rEntry(2), rEntry(3), rwEntry(4), rwEntry(5)],
+    }),
     matmul: device.createBindGroupLayout({
       label: "bgl.matmul",
       entries: [uniformEntry(0), rEntry(1), rEntry(2), rEntry(3), rEntry(4), rEntry(5), rwEntry(6)],
@@ -2052,12 +2110,13 @@ async function createPipelines(
   };
 
   const [
-    embed, rmsNorm, matmulF32F32, matmulFp16F16, castFp16ToF32,
+    embed, rmsNorm, addRmsNormToF32, matmulF32F32, matmulFp16F16, castFp16ToF32,
     castF32ToFp16Scaled, addFp16, zero, rope, banded,
     routerTopk, swiglu, qmoeGateUp, qmoeDownScatter,
   ] = await Promise.all([
     mk("embed",              EMBED_LOOKUP_INT4_WGSL,       bgls.embed),
     mk("rmsnorm",            RMS_NORM_WGSL,                 bgls.rmsNorm),
+    mk("add_rmsnorm_to_f32", ADD_RMSNORM_FP16_TO_F32_WGSL,  bgls.addRmsNormToF32),
     mk("matmul_int4_f32_f32",MATMUL_INT4_F32_F32_WGSL,      bgls.matmul),
     mk("matmul_int4_fp16_f16",MATMUL_INT4_FP16_F16_WGSL,    bgls.matmul),
     mk("cast_fp16_to_f32",   CAST_FP16_TO_F32_WGSL,         bgls.cast1to1),
@@ -2073,7 +2132,7 @@ async function createPipelines(
   ]);
 
   return {
-    embed, rmsNorm, matmulF32F32, matmulFp16F16, castFp16ToF32,
+    embed, rmsNorm, addRmsNormToF32, matmulF32F32, matmulFp16F16, castFp16ToF32,
     castF32ToFp16Scaled, addFp16, zero, rope, banded,
     routerTopk, swiglu, qmoeGateUp, qmoeDownScatter,
   };

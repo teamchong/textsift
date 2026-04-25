@@ -1,6 +1,6 @@
 # Roadmap
 
-This is the execution plan for `@teamchong/textsift`. Stage 0 ships a working
+This is the execution plan for `textsift`. Stage 0 ships a working
 library by wrapping transformers.js behind the public API. Stages 1–3
 replace internals with progressively faster and more compact inference
 paths. The public API doesn't change between stages.

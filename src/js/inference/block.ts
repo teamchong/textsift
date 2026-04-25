@@ -41,8 +41,12 @@ export interface BlockConfig extends AttentionConfig, ExpertConfig {
  * Run the router: matmul in fp32, topk, softmax over top-k, divide by K.
  * Writes to caller-owned `routingIdxPtr` (i32 [T, K]) and
  * `routingScoresPtr` (f32 [T, K]).
+ *
+ * Under MT, the matmul (the dominant cost — `T*numExperts*D` ops, ~1 ms
+ * per layer) is partitioned across workers along T. The T*K topk +
+ * softmax + invK pass is small enough to stay single-threaded.
  */
-export function routerForward(
+export async function routerForward(
   wasm: PiiWasmExports,
   hiddenF32Ptr: number,
   routingIdxPtr: number,
@@ -52,15 +56,43 @@ export function routerForward(
   K: number,
   T: number,
   D: number,
-): void {
+  mt?: MultiThreadContext,
+): Promise<void> {
   // Logits in fp32 (upstream: `F.linear(hidden.float(), W.float(), b.float())`).
   const logitsPtr = wasm.alloc(T * numExperts * 4);
-  wasm.matmul_f32_x_int4block_out_f32(
-    hiddenF32Ptr,
-    router.int4.dataOffset, router.scales.dataOffset, router.zp.dataOffset,
-    router.bias.dataOffset, logitsPtr,
-    T, numExperts, D,
-  );
+  if (mt && T >= mt.pool.numThreads * 2) {
+    const N = mt.pool.numThreads;
+    const scripts: WorkerScript[] = [];
+    for (let w = 0; w < N; w++) {
+      const tStart = Math.floor((w * T) / N);
+      const tEnd = Math.floor(((w + 1) * T) / N);
+      const tCount = tEnd - tStart;
+      const calls: KernelCall[] = [];
+      if (tCount > 0) {
+        calls.push({
+          kernel: "matmul_f32_x_int4block_out_f32",
+          args: [
+            hiddenF32Ptr + tStart * D * 4,
+            router.int4.dataOffset, router.scales.dataOffset, router.zp.dataOffset,
+            router.bias.dataOffset,
+            logitsPtr + tStart * numExperts * 4,
+            tCount, numExperts, D,
+          ],
+        });
+      } else {
+        calls.push({ kernel: "echo", args: [0] });
+      }
+      scripts.push(calls);
+    }
+    await mt.pool.run(scripts);
+  } else {
+    wasm.matmul_f32_x_int4block_out_f32(
+      hiddenF32Ptr,
+      router.int4.dataOffset, router.scales.dataOffset, router.zp.dataOffset,
+      router.bias.dataOffset, logitsPtr,
+      T, numExperts, D,
+    );
+  }
   const topValPtr = wasm.alloc(T * K * 4);
   wasm.topk_partial_f32(logitsPtr, routingIdxPtr, topValPtr, T, numExperts, K);
   wasm.softmax_f32(topValPtr, routingScoresPtr, T, K);
@@ -146,9 +178,10 @@ export async function blockForward(
   // Router + expert dispatch (both read f32 hidden).
   const routingIdxPtr = wasm.alloc(T * K * 4);
   const routingScoresPtr = wasm.alloc(T * K * 4);
-  routerForward(
+  await routerForward(
     wasm, normed2F32Ptr, routingIdxPtr, routingScoresPtr,
     weights.router, config.numExperts, K, T, D,
+    mt,
   );
 
   const moeOutPtr = wasm.alloc(T * D * 2);

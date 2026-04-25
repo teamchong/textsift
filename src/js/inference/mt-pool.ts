@@ -67,6 +67,13 @@ _onMessage(async (e) => {
     return;
   }
   if (msg.type === "script") {
+    // Acquire fence on the signal SAB. The JS memory model says an
+    // atomic load reads the most recent atomic store from any thread,
+    // and that read includes all writes that were sequenced-before
+    // the corresponding store. Main's pre-dispatch Atomics.add on
+    // EPOCH_OFFSET releases all the input-buffer writes it did before
+    // postMessage; this load makes them visible here.
+    Atomics.load(signal, ${EPOCH_OFFSET});
     const calls = msg.calls;
     for (let i = 0; i < calls.length; i++) {
       const call = calls[i];

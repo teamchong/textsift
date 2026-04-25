@@ -1,5 +1,5 @@
 /**
- * Public types for @yourorg/pii-wasm.
+ * Public types for pii-wasm.
  *
  * The public API is intentionally narrow and hides the following
  * internal complexity:

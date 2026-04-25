@@ -1,7 +1,7 @@
 {
-  "name": "@yourorg/pii-wasm",
+  "name": "pii-wasm",
   "version": "0.0.1",
-  "description": "Browser-native PII detection and redaction — runs openai/privacy-filter locally via WebGPU or WebAssembly.",
+  "description": "PII detection and redaction that runs openai/privacy-filter locally in the browser or Node via WebGPU or WebAssembly. No backend required.",
   "type": "module",
   "main": "dist/index.js",
   "module": "dist/index.js",
@@ -9,8 +9,6 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "browser": "./dist/index.browser.js",
-      "node": "./dist/index.node.js",
       "default": "./dist/index.js"
     }
   },
@@ -59,10 +57,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yourorg/pii-wasm.git"
+    "url": "git+https://github.com/teamchong/pii-wasm.git"
   },
   "bugs": {
-    "url": "https://github.com/yourorg/pii-wasm/issues"
+    "url": "https://github.com/teamchong/pii-wasm/issues"
   },
-  "homepage": "https://github.com/yourorg/pii-wasm#readme"
+  "homepage": "https://teamchong.github.io/pii-wasm/"
 }

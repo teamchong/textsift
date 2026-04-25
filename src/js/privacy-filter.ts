@@ -174,26 +174,41 @@ export class PrivacyFilter {
       const calibration = loadCalibration(bundle.calibrationJson);
       const tokenizer = await Tokenizer.fromBundle(bundle);
 
-      // Stage-1 (Zig+WASM) and Stage-2 (WGSL) backends are requested
-      // explicitly via `backend: "wasm"` / `backend: "webgpu"`. Anything
-      // else routes to transformers.js. In browsers transformers.js
-      // wants WebGPU (q4f16 needs MatMulNBits / GatherBlockQuantized,
-      // neither of which has an ORT-Web WASM kernel); in Node,
-      // onnxruntime-node picks CPU automatically and doesn't accept
-      // a "wasm" device string.
-      const wantsStage1 = this.opts.backend === "wasm";
-      const wantsStage2 = this.opts.backend === "webgpu";
-      const hasWebGPU = typeof navigator !== "undefined"
-        && !!(navigator as { gpu?: unknown }).gpu;
+      // Backend selection: explicit `backend` wins; "auto" (or
+      // unspecified) picks the fastest path available in this
+      // environment. Browser: transformers.js on WebGPU when the
+      // adapter supports it, otherwise our WASM path. Node: our WASM
+      // path — onnxruntime-node's CPU EP has no kernel for
+      // `GatherBlockQuantized` / `MatMulNBits`, which this model
+      // requires, so tjs can't run at all in Node for it.
+      const requested = this.opts.backend ?? "auto";
+      const wantsStage1 = requested === "wasm";
+      const wantsStage2 = requested === "webgpu";
+      // Node 21+ defines `navigator` globally, so `typeof navigator` isn't
+      // the right environment check any more. `process.versions.node`
+      // is — it's only set when running on the Node runtime (absent in
+      // browsers, Bun, Deno, and workers).
+      const isNode =
+        typeof process !== "undefined" &&
+        !!(process as { versions?: { node?: string } }).versions?.node;
+      const hasWebGPU =
+        !isNode &&
+        typeof navigator !== "undefined" &&
+        !!(navigator as { gpu?: unknown }).gpu;
+      const chosen: "transformers-js" | "wasm" | "webgpu" =
+        wantsStage2 ? "webgpu"
+        : wantsStage1 ? "wasm"
+        : isNode ? "wasm"
+        : "transformers-js";
       const device: "auto" | "wasm" | "webgpu" = hasWebGPU ? "webgpu" : "auto";
       const compileBackend: "webgpu" | "wasm" =
-        wantsStage2 || (!wantsStage1 && device === "webgpu") ? "webgpu" : "wasm";
+        chosen === "webgpu" || (chosen === "transformers-js" && device === "webgpu") ? "webgpu" : "wasm";
       progress?.({ stage: "compile", backend: compileBackend });
       const backend = await selectBackend({
         quantization: this.opts.quantization ?? "int8",
         device,
         bundle,
-        backend: wantsStage2 ? "webgpu" : wantsStage1 ? "wasm" : "transformers-js",
+        backend: chosen,
         wasmModuleUrl: this.opts.wasmModuleUrl,
       });
 

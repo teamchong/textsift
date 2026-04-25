@@ -1,5 +1,5 @@
 /**
- * @yourorg/pii-wasm — browser-native PII detection and redaction.
+ * pii-wasm — PII detection and redaction, browser + Node.
  *
  * Public API surface:
  *

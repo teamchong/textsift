@@ -1,0 +1,66 @@
+---
+title: Quickstart
+description: Install, detect PII, redact text — in three code blocks.
+---
+
+## Install
+
+```sh
+npm install pii-wasm
+# or: pnpm add / bun add / yarn add
+```
+
+## Redact
+
+```ts
+import { PrivacyFilter } from "pii-wasm";
+
+const filter = await PrivacyFilter.create();
+
+const { redactedText, spans } = await filter.redact(
+  "Please email me at jane.doe@example.com about invoice 4511.",
+);
+// redactedText = "Please email me at [private_email] about invoice [account_number]."
+// spans        = [ { label: "private_email", ... }, { label: "account_number", ... } ]
+```
+
+## Detect (no redaction applied)
+
+```ts
+const { spans, containsPii } = await filter.detect(
+  "Call me at (555) 123-4567.",
+);
+// spans = [ { label: "private_phone", start: 11, end: 25, text: "(555) 123-4567", ... } ]
+// containsPii = true
+```
+
+## Batch
+
+```ts
+const results = await filter.redactBatch([
+  "First message.",
+  "Second message with PII: jane@example.com.",
+]);
+```
+
+## Pick a backend
+
+By default `PrivacyFilter.create()` uses the transformers.js backend with WebGPU (or CPU fallback in Node). To use our own faster kernels:
+
+```ts
+// Fastest: Stage-2 WGSL compute shaders, requires WebGPU + shader-f16.
+const gpu = await PrivacyFilter.create({ backend: "webgpu" });
+
+// Universal: Stage-1 Zig + WASM + SIMD128. Works everywhere.
+const wasm = await PrivacyFilter.create({ backend: "wasm" });
+```
+
+See the [Backends](/pii-wasm/backends/) page for the full compatibility table.
+
+## Dispose when done
+
+```ts
+filter.dispose();
+```
+
+Releases GPU buffers and WASM memory. Safe to call multiple times.

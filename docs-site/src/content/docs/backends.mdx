@@ -1,0 +1,68 @@
+---
+title: Backends
+description: Three execution engines behind the same public API.
+---
+
+`pii-wasm` ships three interchangeable backends. The public API (`PrivacyFilter.create`, `redact`, `detect`) is identical across all three — the backend is an implementation detail picked at construction.
+
+| Backend | Device | Compute | When to use |
+|---|---|---|---|
+| `auto` (default) | WebGPU via ORT-Web; CPU in Node | transformers.js | Drop-in, works everywhere |
+| `webgpu` | WebGPU with `shader-f16` | Hand-tuned WGSL | **Fastest.** Modern Chromium, recent Safari, Firefox with WebGPU enabled |
+| `wasm` | CPU | Zig + SIMD128 | Universal fallback. Only working CPU path for this model |
+
+## Backend decision tree
+
+```
+ ┌──────────────────────────┐
+ │ Does target have WebGPU? │
+ │   (navigator.gpu +       │
+ │    shader-f16 feature)   │
+ └────────────┬─────────────┘
+              │
+       ┌──────┴──────┐
+       │             │
+      yes            no
+       │             │
+       ▼             ▼
+ backend:"webgpu"   backend:"wasm"
+ (fastest)          (only CPU option)
+```
+
+## Compatibility
+
+| | Chromium 147 | Firefox 129 | Safari 19 | Node 22 |
+|---|:-:|:-:|:-:|:-:|
+| `auto` (tjs + WebGPU) | ✅ | ✅ with `dom.webgpu.enabled=true` | ✅ | ⚠️ CPU-only via ORT-Node |
+| `webgpu` | ✅ | ⚠️ shader-f16 preview | ⚠️ shader-f16 preview | ❌ |
+| `wasm` | ✅ | ✅ | ✅ | ✅ |
+
+Any browser that can run `model_q4f16.onnx` at all can run `backend: "auto"`. For CPU-only environments, only `backend: "wasm"` works — transformers.js fails session creation because ORT-Web's WASM bundle has no `GatherBlockQuantized` or `MatMulNBits` kernel.
+
+## Output parity
+
+All three backends produce **byte-identical spans** on the same input (cross-backend conformance test: `tests/browser/smoke.spec.ts` + `webgpu-smoke.spec.ts`). Logit magnitudes may drift by up to 0.2 RMS due to fp16 rounding differences across 8 layers, but argmax (and hence Viterbi + span decode) is bit-exact.
+
+## Switching backends at runtime
+
+You can't — a `PrivacyFilter` instance is bound to one backend for its lifetime. To switch, dispose and recreate:
+
+```ts
+const wasmFilter = await PrivacyFilter.create({ backend: "wasm" });
+await wasmFilter.redact(text);
+wasmFilter.dispose();
+
+const gpuFilter = await PrivacyFilter.create({ backend: "webgpu" });
+```
+
+Both share the same OPFS cache for the 770 MB model — switching is a ~1.1-second warmup, not a full re-download.
+
+## Memory footprint
+
+| Backend | Resident memory during inference |
+|---|---|
+| `auto` (tjs WebGPU) | ~870 MB JS heap + ~1 GB GPU |
+| `webgpu` | ~30 MB JS heap + ~800 MB GPU |
+| `wasm` | ~800 MB WASM linear memory |
+
+`webgpu` is the most memory-efficient since weights live on-device and JS holds only kernel dispatch state.

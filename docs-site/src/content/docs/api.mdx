@@ -1,0 +1,130 @@
+---
+title: API Reference
+description: Full surface of the pii-wasm public API.
+---
+
+`pii-wasm` has a narrow public surface: one class and a handful of types. Everything else (tokenization, chunking, Viterbi CRF, BIOES merging, backend selection, OPFS caching) is internal.
+
+## `PrivacyFilter.create(options?)`
+
+Static factory. Downloads the model on first call, then caches it via OPFS.
+
+```ts
+static create(options?: CreateOptions): Promise<PrivacyFilter>;
+```
+
+### `CreateOptions`
+
+| field | type | default | notes |
+|---|---|---|---|
+| `modelSource` | `string` | HuggingFace Hub URL | Point at your own mirror (R2/S3/on-prem). |
+| `backend` | `"auto" \| "wasm" \| "webgpu"` | `"auto"` | `"auto"` picks transformers.js (WebGPU when available). |
+| `quantization` | `"int4" \| "int8" \| "fp16"` | `"int8"` | All three map to `model_q4f16.onnx` today. |
+| `onProgress` | `(ev: ProgressEvent) => void` | — | Fires during download + warmup. |
+| `signal` | `AbortSignal` | — | Cancels a slow first-time load. |
+| `markers` | `MarkerStrategy` | `"[<label>]"` | Per-category replacement text. |
+| `enabledCategories` | `SpanLabel[]` | all 8 | Only redact these categories. |
+| `maxChunkTokens` | `number` | `2048` | Chunk size for long inputs. |
+
+## Instance methods
+
+### `redact(text, options?)`
+
+```ts
+redact(text: string, options?: RedactOptions): Promise<RedactResult>;
+```
+
+Returns `{ input, redactedText, spans, summary, containsPii }`. `redactedText` is the input with every detected span replaced by its marker.
+
+### `detect(text, options?)`
+
+```ts
+detect(text: string, options?: RedactOptions): Promise<DetectResult>;
+```
+
+Same inference, no output string built. Use when you want to highlight spans in a UI instead of producing redacted text.
+
+### `redactBatch(inputs, options?)`
+
+```ts
+redactBatch(inputs: readonly string[], options?: RedactOptions): Promise<RedactResult[]>;
+```
+
+Serial processing. For real parallelism, construct multiple `PrivacyFilter` instances.
+
+### `dispose()`
+
+```ts
+dispose(): void;
+```
+
+Releases GPU buffers + WASM memory. Calls after dispose throw.
+
+## Types
+
+### `SpanLabel`
+
+The 8 PII categories emitted by the model:
+
+```ts
+type SpanLabel =
+  | "account_number"   // credit cards, bank accounts, SSN-like identifiers
+  | "private_address"  // street addresses, geographic coordinates
+  | "private_email"    // email addresses
+  | "private_person"   // personal names
+  | "private_phone"    // phone numbers
+  | "private_url"      // URLs pointing to personal accounts/profiles
+  | "private_date"     // dates, birthdays
+  | "secret";          // API keys, passwords, tokens
+```
+
+### `DetectedSpan`
+
+```ts
+interface DetectedSpan {
+  label: SpanLabel;
+  start: number;   // UTF-16 char offset into the original input
+  end: number;     // exclusive
+  text: string;    // input.slice(start, end)
+  marker: string;  // replacement string
+  confidence: number;
+}
+```
+
+### `RedactResult`
+
+```ts
+interface RedactResult {
+  input: string;
+  redactedText: string;
+  spans: readonly DetectedSpan[];
+  summary: Readonly<Partial<Record<SpanLabel, number>>>;
+  containsPii: boolean;
+  warning?: string;  // present only for chunked inputs
+}
+```
+
+### `MarkerStrategy`
+
+Either a static map or a callback:
+
+```ts
+// Static per-category
+const markers = { private_person: "[NAME]", private_email: "[EMAIL]" };
+
+// Dynamic per-span (indexed)
+const markers = (span, i) => `[${span.label.toUpperCase()}_${i}]`;
+```
+
+Return `null` to leave a given span unredacted.
+
+### `ProgressEvent`
+
+```ts
+type ProgressEvent =
+  | { stage: "download"; loaded: number; total: number; url: string }
+  | { stage: "cache-hit"; total: number }
+  | { stage: "compile"; backend: "webgpu" | "wasm" }
+  | { stage: "warmup" }
+  | { stage: "ready" };
+```

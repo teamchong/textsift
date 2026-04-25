@@ -1,0 +1,83 @@
+---
+title: pii-wasm
+description: Browser-native PII detection and redaction using openai/privacy-filter.
+template: splash
+hero:
+  tagline: OpenAI's privacy-filter model, running entirely in your browser. No backend, no network calls, no text ever leaves the device.
+  actions:
+    - text: Quickstart
+      link: /pii-wasm/quickstart/
+      icon: right-arrow
+      variant: primary
+    - text: API Reference
+      link: /pii-wasm/api/
+      variant: minimal
+    - text: GitHub
+      link: https://github.com/teamchong/pii-wasm
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid } from "@astrojs/starlight/components";
+
+## Why
+
+OpenAI released [openai/privacy-filter](https://huggingface.co/openai/privacy-filter) on 2026-04-20 — a 1.5B-parameter MoE token classifier (50M active) for PII detection, Apache 2.0. It reaches **96-97% F1 on PII-Masking-300k** and runs on a laptop.
+
+The gap: the official SDK is Python. transformers.js runs it on WebGPU but has no CPU fallback. **`pii-wasm` is the only package that runs this model end-to-end in the browser with both WebGPU and CPU paths.**
+
+## Features
+
+<CardGrid>
+  <Card title="Fully client-side" icon="seti:lock">
+    No backend. No network inference calls. PII text stays on the user's device.
+  </Card>
+  <Card title="Three backends" icon="seti:config">
+    WebGPU (hand-tuned WGSL, fastest), WASM (Zig + SIMD128, universal), or transformers.js (baseline). One public API.
+  </Card>
+  <Card title="Faster than tjs" icon="rocket">
+    2.3–4× faster per forward than transformers.js; 10× faster on repeat-visit cold start.
+  </Card>
+  <Card title="OPFS cache" icon="document">
+    770 MB model downloaded once, persisted across visits. Second launch: 1.1 seconds.
+  </Card>
+  <Card title="Byte-exact decoding" icon="approve-check">
+    Viterbi CRF over BIOES, matching OpenAI's reference decoding.
+  </Card>
+  <Card title="Apache 2.0" icon="open-book">
+    Same license as the model.
+  </Card>
+</CardGrid>
+
+## 30-second example
+
+```ts
+import { PrivacyFilter } from "pii-wasm";
+
+const filter = await PrivacyFilter.create();
+const result = await filter.redact(
+  "Hi, my name is John Smith and my email is john@example.com.",
+);
+
+console.log(result.redactedText);
+// "Hi, my name is [private_person] and my email is [private_email]."
+
+console.log(result.spans);
+// [
+//   { label: "private_person", start: 15, end: 25, text: "John Smith", ... },
+//   { label: "private_email",  start: 43, end: 59, text: "john@example.com", ... },
+// ]
+```
+
+## How it compares
+
+| | tjs (WebGPU) | **pii-wasm (WebGPU)** | pii-wasm (WASM) |
+|---|---:|---:|---:|
+| Forward — short | 29 ms | **7 ms** | 66 ms |
+| Forward — medium | 39 ms | **12 ms** | 158 ms |
+| Forward — long | 57 ms | **25 ms** | 342 ms |
+| Second-visit warmup | 11.2 s | **1.1 s** | 1.8 s |
+
+*M-series MacBook, Chromium 147, median of 5 runs after 2 warmups.*
+
+For **CPU-only environments** (corporate Chrome without WebGPU, Firefox with `dom.webgpu.enabled=false`, server-side Node), pii-wasm is the only working path — transformers.js fails session creation on this model's WASM device due to missing ORT-Web kernels (`GatherBlockQuantized`, `MatMulNBits`).

@@ -1,0 +1,44 @@
+---
+title: Caveats
+description: What pii-wasm does well, and what it doesn't.
+---
+
+## From OpenAI's own model card
+
+> Like all models, Privacy Filter can make mistakes. It may miss uncommon identifiers or ambiguous references, and it can over- or under-redact information when context is limited, especially in shorter text. In high-sensitivity areas such as legal, medical, and financial workflows, human review and domain-specific evaluation and fine-tuning remain important.
+
+`pii-wasm` is a production-grade inference engine for a model that itself is an aid, not an anonymization guarantee. Treat it as such.
+
+## Known model-level gaps
+
+- **No dedicated SSN or passport-number label.** They may be caught by `account_number` (credit cards + bank account numbers) or `secret`, but there's no guarantee. Reported in multiple launch reviews (Decrypt, VentureBeat).
+- **English-first.** The model was trained primarily on English; performance drops on non-English text, non-Latin scripts, and unusual naming patterns. Japanese reaches ~88% F1; other languages are untested.
+- **Short-text edge cases.** Over/under-redaction spikes when there isn't enough context — a bare "Alice" by itself may not be tagged as a name; in longer sentences it will be.
+- **No runtime label policy.** You can't add new categories without fine-tuning. The 8 labels are fixed.
+
+## Implementation-level caveats
+
+- **Browser storage quota.** The 770 MB model is persisted via OPFS. Users with tight storage (Safari's 1 GB origin quota at 77% full, mobile browsers, private-mode tabs) may hit eviction. We fall back to plain fetch if OPFS write fails — no re-download loop, but warmup reverts to ~13 seconds on subsequent visits.
+- **WebGPU availability.** `backend: "webgpu"` requires `shader-f16`. Chromium 147 ships it; Firefox + Safari are still behind a pref. Use `backend: "wasm"` as the universal fallback.
+- **fp16 accumulation drift.** GPU and WASM forward logits RMS-disagree by ~0.18 due to different rounding paths across 8 layers. Argmax is preserved (span output is byte-exact across backends); only the softmax probabilities differ by a few percent in magnitude.
+- **No streaming.** `forward` processes one chunk synchronously; for inputs > `maxChunkTokens` the chunking is invisible to the caller. You get all spans at once, not as they're decoded.
+
+## Not-a-replacement for
+
+- **Compliance review.** Redaction != anonymization. Miranda Bogen (Center for Democracy and Technology) in Bloomberg: *"Foundation models can create privacy violations far beyond what PII filtering can detect."*
+- **Regex-level guarantees.** For known patterns (credit-card Luhn checks, US SSN structure validation), a regex library like `redact-pii` is faster and more deterministic. Run both for belt-and-braces.
+- **Multi-language deployments.** If your users write in Chinese, Arabic, or Hindi, consider Microsoft Presidio or a cloud DLP with native multilingual training.
+
+## When to use `pii-wasm`
+
+- Client-side redaction in browser UIs (form fields, comment boxes, chat prompts before hitting a cloud LLM).
+- Browser-extension "warn before paste" prompts.
+- Offline / air-gapped environments where sending text to a server isn't acceptable.
+- Node pipelines where you want the same model locally without a Python stack.
+
+## Upstream references
+
+- [openai/privacy-filter on HuggingFace](https://huggingface.co/openai/privacy-filter)
+- [Model card PDF](https://cdn.openai.com/pdf/c66281ed-b638-456a-8ce1-97e9f5264a90/OpenAI-Privacy-Filter-Model-Card.pdf)
+- [OpenAI announcement](https://openai.com/index/introducing-openai-privacy-filter/)
+- [HuggingFace transformers docs](https://github.com/huggingface/transformers/blob/main/docs/source/en/model_doc/openai_privacy_filter.md)

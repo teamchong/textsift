@@ -192,7 +192,9 @@ ${INT4_ACCESS_WGSL}
 // 4-wide T tiles. Each thread owns one N column and four T rows; the
 // int4 weight decode for that (n, k_block) is reused across the four
 // T accumulators, and the X reads are amortized across the workgroup
-// via on-chip x_tile.
+// via on-chip x_tile. TR=8 was tried and produced a wash (register
+// pressure on Apple Silicon GPRs cancelled the W-decode amortization
+// gain).
 @compute @workgroup_size(64, 1, 1)
 fn main(
     @builtin(workgroup_id) wg_id: vec3<u32>,
@@ -1022,6 +1024,14 @@ struct Dims {
 @group(0) @binding(8) var<storage, read_write> acc: array<atomic<u32>>;
 
 const BLOCK: u32 = 32u;
+const D_MAX: u32 = 640u;  // dff for openai/privacy-filter
+const WG: u32 = 64u;
+
+// Workgroup-shared input tile. All 64 threads in a workgroup share the
+// same (token, k_pick) so they read the same glu row — load it once
+// cooperatively and reuse from on-chip memory rather than reissuing
+// 64 redundant global loads per K block.
+var<workgroup> glu_tile: array<f32, D_MAX>;
 
 ${INT4_ACCESS_WGSL}
 
@@ -1036,16 +1046,21 @@ fn atomic_add_f32(slot: u32, val: f32) {
     }
 }
 
+// 2D dispatch: workgroup_id.x is the (token, k_pick) pair, .y is the
+// N-tile index (0..N/64). Each thread writes one N column for that
+// (tk, n_tile) tile via atomic scatter-add.
 @compute @workgroup_size(64, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let total = dims.T * dims.K * dims.N;
-    let idx = gid.x;
-    if (idx >= total) { return; }
+fn main(
+    @builtin(workgroup_id) wg_id: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let tid = lid.x;
+    let tk = wg_id.x;
+    if (tk >= dims.T * dims.K) { return; }
+    let n_base = wg_id.y * WG;
+    let n = n_base + tid;
 
-    let n = idx % dims.N;
-    let tk = idx / dims.N;
-    let t  = tk / dims.K;
-
+    let t = tk / dims.K;
     let e = u32(routing_idx[tk]);
     let w = routing_scores[tk];
 
@@ -1054,12 +1069,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n_blocks = D / BLOCK;
     let zp_per_row = (n_blocks + 1u) >> 1u;
 
+    // Cooperatively load the glu row (D = dff = 640 elements) once.
+    // 64 threads, 10 elements each.
+    for (var i: u32 = 0u; i < 10u; i = i + 1u) {
+        let k_idx = i * WG + tid;
+        if (k_idx < D) {
+            glu_tile[k_idx] = glu[tk * D + k_idx];
+        }
+    }
+    workgroupBarrier();
+
+    if (n >= N) { return; }
+
     let expert_nibble_base = e * N * D + n * D;
     let expert_scale_base  = e * N * n_blocks + n * n_blocks;
     let expert_zp_base     = e * N * zp_per_row + n * zp_per_row;
     let expert_bias_base   = e * N + n;
-
-    let glu_row = tk * D;
 
     var acc_local: f32 = 0.0;
     for (var b: u32 = 0u; b < n_blocks; b = b + 1u) {
@@ -1069,7 +1094,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let zp_f: f32 = f32(zp_nib);
 
         let word_base = (expert_nibble_base + b * BLOCK) >> 3u;
-        let xb = glu_row + b * BLOCK;
+        let xb = b * BLOCK;
 
         var block_sum: f32 = 0.0;
         for (var wi: u32 = 0u; wi < 4u; wi = wi + 1u) {
@@ -1083,14 +1108,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let q5 = f32((word >> 20u) & 0xFu) - zp_f;
             let q6 = f32((word >> 24u) & 0xFu) - zp_f;
             let q7 = f32((word >> 28u) & 0xFu) - zp_f;
-            block_sum = fma(q0, glu[xb + kb + 0u], block_sum);
-            block_sum = fma(q1, glu[xb + kb + 1u], block_sum);
-            block_sum = fma(q2, glu[xb + kb + 2u], block_sum);
-            block_sum = fma(q3, glu[xb + kb + 3u], block_sum);
-            block_sum = fma(q4, glu[xb + kb + 4u], block_sum);
-            block_sum = fma(q5, glu[xb + kb + 5u], block_sum);
-            block_sum = fma(q6, glu[xb + kb + 6u], block_sum);
-            block_sum = fma(q7, glu[xb + kb + 7u], block_sum);
+            block_sum = fma(q0, glu_tile[xb + kb + 0u], block_sum);
+            block_sum = fma(q1, glu_tile[xb + kb + 1u], block_sum);
+            block_sum = fma(q2, glu_tile[xb + kb + 2u], block_sum);
+            block_sum = fma(q3, glu_tile[xb + kb + 3u], block_sum);
+            block_sum = fma(q4, glu_tile[xb + kb + 4u], block_sum);
+            block_sum = fma(q5, glu_tile[xb + kb + 5u], block_sum);
+            block_sum = fma(q6, glu_tile[xb + kb + 6u], block_sum);
+            block_sum = fma(q7, glu_tile[xb + kb + 7u], block_sum);
         }
         acc_local = fma(block_sum, scale, acc_local);
     }
@@ -1480,7 +1505,7 @@ export class WebGpuBackend implements InferenceBackend {
           ],
         });
         const xGroups = Math.ceil(N / 64);
-        const yGroups = Math.ceil(T / 4);
+        const yGroups = Math.ceil(T / 4);  // matches TR=4 in MATMUL_INT4_FP16_F16_WGSL
         dispatchGroups2D(this.pipelines!.matmulFp16F16, bg, xGroups, yGroups);
       };
       runMatmulFp16F16(`layers.${L}.attn.q_proj`, scratch.normed1, scratch.qBuf, Hq * hd, D);
@@ -1662,13 +1687,16 @@ export class WebGpuBackend implements InferenceBackend {
         T * Kpick * dff,
       );
 
-      // QMoE down_proj + atomic scatter-add into acc.
+      // QMoE down_proj + atomic scatter-add into acc. Tiled like
+      // qmoe_gate_up: workgroup_id.x = (token, k_pick), .y = N-tile,
+      // with cooperative glu-tile load shared across all 64 threads
+      // in the workgroup.
       {
         const wq = this.weights.get(`layers.${L}.experts.down.int4`)!;
         const ws = this.weights.get(`layers.${L}.experts.down.scales`)!;
         const wz = this.weights.get(`layers.${L}.experts.down.zp`)!;
         const wb = this.weights.get(`layers.${L}.experts.down.bias`)!;
-        dispatch(
+        dispatchGroups2D(
           this.pipelines.qmoeDownScatter,
           device.createBindGroup({
             layout: this.bgls.qmoeDown,
@@ -1684,7 +1712,8 @@ export class WebGpuBackend implements InferenceBackend {
               { binding: 8, resource: { buffer: scratch.acc } },
             ],
           }),
-          T * Kpick * D,
+          T * Kpick,
+          Math.ceil(D / 64),
         );
       }
 

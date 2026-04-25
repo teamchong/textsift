@@ -1,0 +1,98 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>pii-wasm — probe transformers.js CPU paths</title>
+  </head>
+  <body>
+    <pre id="out">starting</pre>
+    <script type="module">
+      // Probe: does transformers.js actually have a working CPU path for
+      // openai/privacy-filter on any (device, dtype) combination? Try
+      // each and report success/failure with timing.
+      // Load transformers.js from the CDN so the probe exercises the
+      // same package the app resolves via bun. Pinned to the version in
+      // package.json so it doesn't drift silently.
+      import {
+        AutoModelForTokenClassification,
+        Tensor,
+      } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0/+esm";
+
+      const $out = document.getElementById("out");
+      const log = (m) => { $out.textContent += "\n" + m; };
+
+      const MODEL_ID = "openai/privacy-filter";
+
+      // The question: does transformers.js offer *any* CPU-only path
+      // for this model? ORT-Web accepts device ∈ {"wasm", "webgpu"} —
+      // "wasm" is the CPU path. Try every dtype the hub ships.
+      const combos = [
+        { device: "wasm",   dtype: "q4f16" },
+        { device: "wasm",   dtype: "q4"    },
+        { device: "wasm",   dtype: "q8"    },
+        { device: "wasm",   dtype: "fp32"  },
+        { device: "cpu",    dtype: "q4f16" }, // confirm tjs rejects "cpu" entirely
+      ];
+
+      async function probe(opts) {
+        const label = `device=${opts.device} dtype=${opts.dtype}`;
+        const tCreate0 = performance.now();
+        let model;
+        try {
+          model = await AutoModelForTokenClassification.from_pretrained(
+            MODEL_ID,
+            { dtype: opts.dtype, device: opts.device },
+          );
+        } catch (e) {
+          log(`${label}: CREATE FAILED — ${e.message ?? e}`);
+          return { label, opts, ok: false, stage: "create", error: String(e) };
+        }
+        const createMs = performance.now() - tCreate0;
+
+        const T = 32;
+        const ids = new BigInt64Array(T);
+        const mask = new BigInt64Array(T);
+        for (let i = 0; i < T; i++) {
+          ids[i] = BigInt((i * 37 + 11) % 50000);
+          mask[i] = 1n;
+        }
+        const input_ids = new Tensor("int64", ids, [1, T]);
+        const attention_mask = new Tensor("int64", mask, [1, T]);
+
+        try {
+          for (let i = 0; i < 2; i++) {
+            await model({ input_ids, attention_mask });
+          }
+          const samples = [];
+          for (let i = 0; i < 5; i++) {
+            const t0 = performance.now();
+            await model({ input_ids, attention_mask });
+            samples.push(performance.now() - t0);
+          }
+          samples.sort((a, b) => a - b);
+          const medianMs = samples[Math.floor(samples.length / 2)];
+          log(`${label}: create=${createMs.toFixed(0)}ms forward_median=${medianMs.toFixed(1)}ms`);
+          await model.dispose?.();
+          return { label, opts, ok: true, createMs, medianMs };
+        } catch (e) {
+          log(`${label}: FORWARD FAILED — ${e.message ?? e}`);
+          await model.dispose?.();
+          return { label, opts, ok: false, stage: "forward", error: String(e) };
+        }
+      }
+
+      try {
+        const results = [];
+        for (const c of combos) {
+          results.push(await probe(c));
+        }
+        window.__result = { ok: true, results };
+        log("done");
+      } catch (e) {
+        window.__result = { ok: false, error: String(e), stack: e.stack };
+        log("ERROR: " + e);
+        throw e;
+      }
+    </script>
+  </body>
+</html>

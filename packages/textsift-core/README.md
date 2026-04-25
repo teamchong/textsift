@@ -1,5 +1,7 @@
 # textsift-core
 
+> **Personal learning project.** Built to teach myself WebGPU compute shaders, Zig→WASM with SIMD, and a from-scratch o200k-style BPE tokenizer. Tests pass and the code works, but there's no SLA or production-support commitment behind this — use accordingly.
+
 PII detection + redaction for browser, Node, and edge runtimes. 76 KB gzipped, no runtime dependencies.
 
 The lean half of the [textsift](https://www.npmjs.com/package/textsift) split. Custom WebGPU + WASM backends, native o200k-style BPE tokenizer.

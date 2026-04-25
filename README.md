@@ -1,5 +1,7 @@
 # textsift
 
+> **Personal learning project.** I built this to teach myself WebGPU compute shaders, Zig→WASM with SIMD intrinsics, and the o200k-style BPE tokenizer pipeline. The code works and the tests pass, but treat it as such — there's no SLA, no roadmap commitment, no team behind it. PRs and bug reports welcome; "production support" is not.
+
 PII detection and redaction that runs [openai/privacy-filter](https://huggingface.co/openai/privacy-filter) on the user's device. WebGPU when available; Zig + SIMD128 WASM otherwise. Apache 2.0.
 
 [**Docs**](https://teamchong.github.io/textsift/) · [**Quickstart**](https://teamchong.github.io/textsift/quickstart/) · [**Playground**](https://teamchong.github.io/textsift/playground/) · [**API**](https://teamchong.github.io/textsift/api/)

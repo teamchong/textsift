@@ -1,5 +1,7 @@
 # textsift
 
+> **Personal learning project.** Treat as such — no SLA, no roadmap commitment. See the [main README](https://github.com/teamchong/textsift) for context.
+
 Wraps [`textsift-core`](https://www.npmjs.com/package/textsift-core) and adds a transformers.js fallback backend for runtimes that can't run WebGPU or SIMD-capable WASM. 226 KB gzipped (vs 76 KB for the lean `textsift-core`).
 
 ```sh

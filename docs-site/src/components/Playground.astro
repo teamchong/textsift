@@ -85,6 +85,11 @@ John (cell: 617.555.0123, work: jsmith@acme.io)</textarea>
     <button id="ts-redact" type="button">Redact</button>
     <span id="ts-status" class="ts-status">idle</span>
   </div>
+  <div id="ts-download-warning" class="ts-download-warning" hidden>
+    <strong>⚠ First click will download ~770 MB</strong> of model weights from
+    HuggingFace and cache them on this device (OPFS). Subsequent visits load
+    from the local cache.
+  </div>
 
   <div class="ts-row">
     <label><strong>3. Result</strong></label>
@@ -308,6 +313,17 @@ John (cell: 617.555.0123, work: jsmith@acme.io)</textarea>
   .ts-storage-info th, .ts-storage-info td { text-align: left; padding: 0.15rem 0.5rem; }
   .ts-storage-info th { color: var(--sl-color-gray-3, #888); font-weight: 600; font-size: 0.8rem; }
   .ts-storage-info .ts-total { font-weight: 600; }
+
+  .ts-download-warning {
+    border: 1px solid #d4a23a;
+    background: rgba(255, 220, 150, 0.18);
+    color: var(--sl-color-text, #222);
+    border-radius: 4px;
+    padding: 0.5rem 0.7rem;
+    font-size: 0.88rem;
+    line-height: 1.5;
+  }
+  .ts-download-warning strong { color: #b8761a; }
 </style>
 
 <script>
@@ -341,6 +357,7 @@ John (cell: 617.555.0123, work: jsmith@acme.io)</textarea>
   const $wipe = document.getElementById("ts-wipe");
   const $storageStatus = document.getElementById("ts-storage-status");
   const $storageInfo = document.getElementById("ts-storage-info");
+  const $downloadWarning = document.getElementById("ts-download-warning");
 
   let filterPromise = null;
   let currentFilter = null;
@@ -431,11 +448,34 @@ John (cell: 617.555.0123, work: jsmith@acme.io)</textarea>
     return html;
   }
 
+  // Returns true if the user accepts the download (or no warning is needed).
+  // Shows a confirm() once when nothing is cached so a click on Detect/Redact
+  // doesn't silently start a ~770 MB fetch.
+  async function confirmDownloadIfNeeded() {
+    if (filterPromise) return true; // model already loaded this session
+    let info;
+    try { info = await getCachedModelInfo(); }
+    catch { return true; } // can't check — let it proceed
+    if (info.supported && info.entries.length > 0) return true;
+    const msg = info.supported
+      ? "First run will download ~770 MB of model weights from HuggingFace and " +
+        "cache them on this device (OPFS). Continue?"
+      : "OPFS is not available in this browser, so the ~770 MB model weights " +
+        "will be re-downloaded on every visit. Continue?";
+    return window.confirm(msg);
+  }
+
   async function getFilter(createOpts) {
     if (filterPromise) return filterPromise;
     setStatus("loading model (first run downloads ~770 MB; cached after)…");
     filterPromise = PrivacyFilter.create(createOpts)
-      .then((f) => { currentFilter = f; setStatus("model ready"); return f; })
+      .then((f) => {
+        currentFilter = f;
+        setStatus("model ready");
+        // Cache is now populated — hide the warning banner.
+        refreshStorage();
+        return f;
+      })
       .catch((err) => { filterPromise = null; setStatus("load failed: " + err.message); throw err; });
     return filterPromise;
   }
@@ -459,6 +499,12 @@ John (cell: 617.555.0123, work: jsmith@acme.io)</textarea>
     try { cfg = readConfig(); }
     catch (err) { $configHint.textContent = err.message; return; }
     $configHint.textContent = "";
+    // Reload always re-creates the filter; warn if cache is empty so
+    // the user knows a fresh fetch is about to happen.
+    if (!(await confirmDownloadIfNeeded())) {
+      setStatus("cancelled — model not loaded");
+      return;
+    }
     setStatus("reloading…");
     await disposeFilter();
     await getFilter(cfg.createOpts);
@@ -468,6 +514,10 @@ John (cell: 617.555.0123, work: jsmith@acme.io)</textarea>
     let cfg;
     try { cfg = readConfig(); }
     catch (err) { setStatus(err.message); return; }
+    if (!(await confirmDownloadIfNeeded())) {
+      setStatus("cancelled — model not downloaded");
+      return;
+    }
     const text = $input.value;
     const filter = await getFilter(cfg.createOpts);
     setStatus("detecting…");
@@ -482,6 +532,10 @@ John (cell: 617.555.0123, work: jsmith@acme.io)</textarea>
     let cfg;
     try { cfg = readConfig(); }
     catch (err) { setStatus(err.message); return; }
+    if (!(await confirmDownloadIfNeeded())) {
+      setStatus("cancelled — model not downloaded");
+      return;
+    }
     const text = $input.value;
     const filter = await getFilter(cfg.createOpts);
     setStatus("redacting…");
@@ -505,6 +559,8 @@ John (cell: 617.555.0123, work: jsmith@acme.io)</textarea>
     setStorageStatus("checking…");
     try {
       const info = await getCachedModelInfo();
+      const cacheEmpty = !info.supported || info.entries.length === 0;
+      $downloadWarning.hidden = !cacheEmpty;
       if (!info.supported) {
         $storageInfo.innerHTML = "<em>OPFS not available in this browser. Weights re-download every visit.</em>";
         setStorageStatus("");

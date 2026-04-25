@@ -1,0 +1,104 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>textsift-core — redact(stream)</title>
+  </head>
+  <body>
+    <pre id="out">starting</pre>
+    <script type="module">
+      // Verify the streaming redact() overload produces the same final
+      // output as a single batch redact() call on the reassembled
+      // input. textStream's concatenation must equal redactedText
+      // from the batch path.
+
+      import { PrivacyFilter } from "/packages/textsift-core/dist/index.js";
+
+      const $out = document.getElementById("out");
+      const log = (m) => { $out.textContent += "\n" + m; };
+
+      const TEXT =
+        "Hi support, my name is John Smith and my email is john@example.com. " +
+        "Please call me at (617) 555-0199 or write to 456 Oak Avenue, Boston, MA 02134. " +
+        "My account number is 9876543210 and the SSN is 123-45-6789. " +
+        "For more, visit https://support.example.com/tickets/TKT-48211.";
+
+      function makeChunks(text, chunkSize) {
+        const out = [];
+        for (let i = 0; i < text.length; i += chunkSize) {
+          out.push(text.slice(i, i + chunkSize));
+        }
+        return out;
+      }
+
+      try {
+        log("create filter (backend=wasm)");
+        const filter = await PrivacyFilter.create({ backend: "wasm" });
+
+        log("\n[1] batch redact — pass a string");
+        const t0 = performance.now();
+        const batchResult = await filter.redact(TEXT);
+        const tBatch = performance.now() - t0;
+        log(`  ${batchResult.spans.length} spans applied in ${tBatch.toFixed(0)}ms`);
+        log(`  redactedText[..120] = ${JSON.stringify(batchResult.redactedText.slice(0, 120))}`);
+
+        log("\n[2] streaming redact — pass an AsyncIterable<string>");
+        const chunks = makeChunks(TEXT, 24);
+        async function* chunkStream() {
+          for (const c of chunks) yield c;
+        }
+        const t1 = performance.now();
+        const handle = filter.redact(chunkStream());
+
+        const textPieces = [];
+        const streamSpans = [];
+        // Drive both surfaces in parallel.
+        const textTask = (async () => {
+          for await (const piece of handle.textStream) {
+            textPieces.push(piece);
+            log(`    text chunk: ${JSON.stringify(piece.slice(0, 50))}${piece.length > 50 ? "…" : ""}`);
+          }
+        })();
+        const spanTask = (async () => {
+          for await (const span of handle.spanStream) {
+            streamSpans.push(span);
+            log(`    span: [${span.label}] ${JSON.stringify(span.text)} (${span.start}..${span.end})`);
+          }
+        })();
+        await Promise.all([textTask, spanTask]);
+        const finalResult = await handle.result;
+        const tStream = performance.now() - t1;
+
+        const streamedText = textPieces.join("");
+        log(`\n  streamed ${textPieces.length} text chunks → ${streamedText.length} chars`);
+        log(`  streamedText[..120] = ${JSON.stringify(streamedText.slice(0, 120))}`);
+        log(`  result.spans=${finalResult.spans.length}  spanStream=${streamSpans.length}`);
+
+        const textSame = streamedText === batchResult.redactedText;
+        const spanCountSame = streamSpans.length === finalResult.spans.length;
+
+        filter.dispose();
+
+        window.__result = {
+          ok: textSame && spanCountSame,
+          textSame,
+          spanCountSame,
+          batchTextLen: batchResult.redactedText.length,
+          streamTextLen: streamedText.length,
+          batchSpanCount: batchResult.spans.length,
+          streamSpanCount: streamSpans.length,
+          finalResultSpanCount: finalResult.spans.length,
+          tBatchMs: tBatch,
+          tStreamMs: tStream,
+          batchExcerpt: batchResult.redactedText.slice(0, 200),
+          streamExcerpt: streamedText.slice(0, 200),
+        };
+        log(`\ndone: textSame=${textSame} spanCountSame=${spanCountSame}`);
+      } catch (e) {
+        window.__result = { ok: false, error: String(e), stack: e.stack };
+        log("ERROR: " + e);
+        throw e;
+      }
+    </script>
+  </body>
+</html>

@@ -36,8 +36,11 @@ import { bioesToSpans } from "./inference/spans.js";
 import { applyRedaction } from "./inference/redact.js";
 import {
   streamDetect,
+  streamRedact,
   type DetectStreamHandle,
   type DetectStreamOptions,
+  type RedactStreamHandle,
+  type RedactStreamOptions,
 } from "./inference/stream.js";
 
 /** Internal ready state. */
@@ -114,10 +117,54 @@ export class PrivacyFilter {
   }
 
   /**
-   * Redact PII in `text` and return both the redacted string and the
-   * span metadata. Safe to call concurrently (calls are queued).
+   * Redact PII in `input`. Two call shapes, picked by the type of
+   * `input`:
+   *
+   *   // (1) Batch — pass a string, await the result.
+   *   const result = await filter.redact("Hi John, my email is x@y.com");
+   *   result.redactedText;
+   *
+   *   // (2) Streaming — pass an AsyncIterable<string>. Returns sync.
+   *   //     Three surfaces on the handle: textStream (yields safe-to
+   *   //     -emit redacted text fragments), spanStream (yields stable
+   *   //     spans), result (resolves to the full RedactResult).
+   *   const handle = filter.redact(llmStream);
+   *   for await (const piece of handle.textStream) downstream.write(piece);
+   *
+   * Cost: batch is one detection + one redaction pass. Streaming is
+   * O(N) over the input stream — same trailing-window logic as
+   * detect(stream), with text held back inside the safety margin
+   * until the trailing edge advances past it.
    */
-  async redact(text: string, callOpts: RedactOptions = {}): Promise<RedactResult> {
+  redact(text: string, opts?: RedactOptions): Promise<RedactResult>;
+  redact(input: AsyncIterable<string>, opts?: RedactStreamOptions): RedactStreamHandle;
+  redact(
+    input: string | AsyncIterable<string>,
+    opts: RedactOptions | RedactStreamOptions = {},
+  ): Promise<RedactResult> | RedactStreamHandle {
+    if (typeof input === "string") {
+      return this.redactOne(input, opts as RedactOptions);
+    }
+    const merged: RedactStreamOptions = {
+      enabledCategories:
+        (opts as RedactStreamOptions).enabledCategories ?? this.opts.enabledCategories,
+      markers: (opts as RedactStreamOptions).markers ?? this.opts.markers,
+      windowTokens: (opts as RedactStreamOptions).windowTokens,
+      safetyMarginTokens: (opts as RedactStreamOptions).safetyMarginTokens,
+      signal: (opts as RedactStreamOptions).signal,
+    };
+    return streamRedact(
+      this.ensureReady().then((r) => ({
+        backend: r.backend,
+        tokenizer: r.tokenizer,
+        viterbi: r.viterbi,
+      })),
+      input,
+      merged,
+    );
+  }
+
+  private async redactOne(text: string, callOpts: RedactOptions): Promise<RedactResult> {
     const ready = await this.ensureReady();
     return this.enqueue(async () => {
       const spans = await this.runDetection(ready, text, callOpts);

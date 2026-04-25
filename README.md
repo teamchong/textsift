@@ -47,7 +47,7 @@ Detect-only:
 const { spans, containsPii } = await filter.detect(text);
 ```
 
-Streaming detect (proxy use case) — same `detect()`, just pass an async source:
+Streaming detect / redact (proxy use case) — same `detect()` / `redact()`, just pass an async source:
 
 ```ts
 async function* llmStream() {
@@ -56,15 +56,20 @@ async function* llmStream() {
   }
 }
 
-const handle = filter.detect(llmStream());
-
-// Iterate spans as they become detectable...
-for await (const span of handle.spanStream) {
+// Detect — iterate spans as they become detectable
+const det = filter.detect(llmStream());
+for await (const span of det.spanStream) {
   if (span.label === "secret" && span.confidence > 0.9) abort();
 }
+const detFinal = await det.result;
 
-// ...and/or await the final result.
-const result = await handle.result;
+// Redact — pipe redacted text downstream as it becomes safe to emit.
+// textStream lags the input by up to safetyMarginTokens of chars.
+const red = filter.redact(llmStream());
+for await (const piece of red.textStream) {
+  await downstreamWriter.write(piece);
+}
+const redFinal = await red.result;
 ```
 
 Batch inputs, custom markers, per-category enabling — see the [API reference](https://teamchong.github.io/textsift/api/).

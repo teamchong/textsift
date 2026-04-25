@@ -40,11 +40,13 @@ const result = await filter.redact(
 
 ```ts
 PrivacyFilter.create(opts?): Promise<PrivacyFilter>
-filter.redact(text, opts?): Promise<RedactResult>
 
-// detect() overloads on input type:
-filter.detect(text: string, opts?): Promise<DetectResult>          // batch
+// Both detect() and redact() overload on input type:
+filter.detect(text: string, opts?): Promise<DetectResult>
 filter.detect(input: AsyncIterable<string>, opts?): DetectStreamHandle  // streaming, O(N)
+
+filter.redact(text: string, opts?): Promise<RedactResult>
+filter.redact(input: AsyncIterable<string>, opts?): RedactStreamHandle  // streaming, O(N)
 
 filter.redactBatch(inputs, opts?): Promise<RedactResult[]>
 filter.dispose(): void

@@ -28,10 +28,17 @@
 import type { InferenceBackend } from "../backends/abstract.js";
 import type { Tokenizer } from "../model/tokenizer.js";
 import type { ViterbiDecoder } from "./viterbi.js";
-import type { DetectResult, DetectedSpan, SpanLabel } from "../types.js";
+import type {
+  DetectResult,
+  DetectedSpan,
+  MarkerStrategy,
+  RedactResult,
+  SpanLabel,
+} from "../types.js";
 import { ALL_SPAN_LABELS, PrivacyFilterError } from "../types.js";
 import { bioesToSpans } from "./spans.js";
 import { chunkInput, type Chunk } from "./chunking.js";
+import { applyRedaction } from "./redact.js";
 
 /**
  * Options for streaming detection. Defaults are tuned for the
@@ -56,6 +63,11 @@ export interface DetectStreamOptions {
   signal?: AbortSignal;
   /** Same as the batch-mode `enabledCategories` option. */
   enabledCategories?: readonly SpanLabel[];
+}
+
+/** Options for streaming redaction. Same as detect plus a marker strategy. */
+export interface RedactStreamOptions extends DetectStreamOptions {
+  markers?: MarkerStrategy;
 }
 
 /**
@@ -85,6 +97,37 @@ export interface DetectStreamHandle {
    * once the input stream has ended and all spans have been emitted.
    */
   readonly result: Promise<DetectResult>;
+}
+
+/**
+ * Handle returned by `redact(asyncIterableInput)`. Three surfaces:
+ *
+ *   const handle = filter.redact(llmStream);
+ *
+ *   // (A) stream redacted text downstream as it becomes safe to emit
+ *   for await (const piece of handle.textStream) {
+ *     await downstreamWriter.write(piece);
+ *   }
+ *
+ *   // (B) iterate detected spans as they arrive (for logging / metrics)
+ *   for await (const span of handle.spanStream) { ... }
+ *
+ *   // (C) await the final RedactResult (full text, all spans, summary)
+ *   const result = await handle.result;
+ *
+ * `textStream` only yields output text whose redaction status is final
+ * — text within the safety margin is held back until the trailing edge
+ * advances past it (or the input stream ends and `finish` flushes
+ * everything). This means `textStream` lags the input stream by up to
+ * `safetyMarginTokens` worth of characters.
+ */
+export interface RedactStreamHandle {
+  /** Yields redacted text fragments as they become safe to emit. */
+  readonly textStream: AsyncIterable<string>;
+  /** Yields stable spans (same as detect's spanStream). */
+  readonly spanStream: AsyncIterable<DetectedSpan>;
+  /** Resolves to the full `RedactResult` once the stream is done. */
+  readonly result: Promise<RedactResult>;
 }
 
 const DEFAULT_WINDOW_TOKENS = 1024;
@@ -264,6 +307,322 @@ export function streamDetect(
   };
 
   return { spanStream, result };
+}
+
+/**
+ * Streaming redaction. Same trailing-window inference loop as
+ * `streamDetect`, plus an output channel that emits redacted text in
+ * order as the trailing edge advances past it.
+ *
+ * Concretely:
+ *   - `inputBuffer` accumulates as chunks arrive.
+ *   - `emitCursor` tracks how many chars of `inputBuffer` have been
+ *     pushed to `textStream` (in their final, possibly-redacted form).
+ *   - On every chunk, after detection runs, advance `emitCursor` to
+ *     the new safety edge, emitting the slice [oldCursor, newEdge)
+ *     with all stable spans in that range applied.
+ *   - At `finish`, flush [emitCursor, end) with all remaining spans.
+ *
+ * Spans fall into one of three states each chunk:
+ *   - **Stable** (end ≤ safety edge): apply at emit time, never
+ *     re-considered.
+ *   - **Pending** (start ≤ safety edge < end): straddles the edge —
+ *     hold the emit cursor at `start` until the span is stable.
+ *   - **Future** (start > safety edge): not yet emitted; will be
+ *     re-detected on the next chunk.
+ */
+export function streamRedact(
+  internalsReady: Promise<StreamInternals>,
+  input: AsyncIterable<string>,
+  opts: RedactStreamOptions = {},
+): RedactStreamHandle {
+  const resolved = resolveStreamOptions(opts);
+  const enabledFilter = buildEnabledFilter(resolved.enabledCategories);
+  const enabledSet = new Set<SpanLabel>(
+    resolved.enabledCategories ?? ALL_SPAN_LABELS,
+  );
+  const markerStrategy = opts.markers;
+
+  const allSpans: DetectedSpan[] = [];
+  let inputBuffer = "";
+  let emitCursor = 0; // chars of inputBuffer emitted (final form) into textStream
+  let outputAccum = "";
+
+  // Two queues: one for spans, one for redacted-text fragments. Same
+  // multi-consumer pattern as detect's queue.
+  const spanQueue: DetectedSpan[] = [];
+  let spanQueueClosed = false;
+  let spanQueueError: unknown = undefined;
+  const spanWaiters: Array<(v: IteratorResult<DetectedSpan>) => void> = [];
+
+  const textQueue: string[] = [];
+  let textQueueClosed = false;
+  let textQueueError: unknown = undefined;
+  const textWaiters: Array<(v: IteratorResult<string>) => void> = [];
+
+  function pushSpan(value: DetectedSpan): void {
+    const w = spanWaiters.shift();
+    if (w) w({ value, done: false });
+    else spanQueue.push(value);
+  }
+  function closeSpanQueue(err?: unknown): void {
+    spanQueueClosed = true;
+    spanQueueError = err;
+    while (spanWaiters.length > 0) {
+      spanWaiters.shift()!({ value: undefined as unknown as DetectedSpan, done: true });
+    }
+  }
+  function pushText(value: string): void {
+    if (value.length === 0) return;
+    const w = textWaiters.shift();
+    if (w) w({ value, done: false });
+    else textQueue.push(value);
+  }
+  function closeTextQueue(err?: unknown): void {
+    textQueueClosed = true;
+    textQueueError = err;
+    while (textWaiters.length > 0) {
+      textWaiters.shift()!({ value: undefined as unknown as string, done: true });
+    }
+  }
+
+  let resolveResult!: (value: RedactResult) => void;
+  let rejectResult!: (reason: unknown) => void;
+  const result: Promise<RedactResult> = new Promise((res, rej) => {
+    resolveResult = res;
+    rejectResult = rej;
+  });
+
+  // Spans we've already emitted-as-stable (so we don't double-count).
+  const stableSpanKeys = new Set<string>();
+  // Spans currently considered stable in chronological order — used
+  // to apply redactions to the emitted text slice.
+  const stableSpans: DetectedSpan[] = [];
+
+  function spanKey(s: DetectedSpan): string {
+    return `${s.label}:${s.start}:${s.end}`;
+  }
+
+  /**
+   * Emit redacted text up to `targetCursor` chars into `inputBuffer`.
+   * Walks the stable-span list, applying redactions for any span whose
+   * end ≤ targetCursor and start ≥ emitCursor. If a stable span starts
+   * before the new emit cursor target but doesn't end until after it,
+   * we cap targetCursor at span.start so we don't split a redactable
+   * region across two emits.
+   */
+  function flushTo(targetCursor: number): void {
+    if (targetCursor <= emitCursor) return;
+    // Cap at the start of any stable-but-not-yet-fully-included span
+    // that begins before targetCursor — we can't emit past its start
+    // without committing to its (already-decided) marker.
+    let cap = targetCursor;
+    for (const span of stableSpans) {
+      if (span.end > cap && span.start < cap && span.start >= emitCursor) {
+        cap = span.start;
+      }
+    }
+    if (cap <= emitCursor) return;
+
+    const slice = inputBuffer.slice(emitCursor, cap);
+    // Spans entirely inside [emitCursor, cap) get applied to this slice.
+    const sliceSpans = stableSpans
+      .filter((s) => s.start >= emitCursor && s.end <= cap)
+      .map((s) => ({
+        ...s,
+        start: s.start - emitCursor,
+        end: s.end - emitCursor,
+      }));
+    const { redactedText, applied } = applyRedaction(
+      slice,
+      sliceSpans,
+      enabledSet,
+      markerStrategy,
+    );
+    pushText(redactedText);
+    outputAccum += redactedText;
+    // Re-translate `applied` markers back onto absolute coordinates
+    // for the final result. We don't push them anywhere here — the
+    // span emission to `spanStream` happened separately when each
+    // became stable.
+    void applied;
+    emitCursor = cap;
+  }
+
+  (async () => {
+    try {
+      const internals = await internalsReady;
+      const { backend, tokenizer, viterbi } = internals;
+      const safetyMarginChars = resolved.safetyMarginTokens * 4;
+      const emitted = new Set<string>();
+
+      function shouldEmit(span: DetectedSpan): boolean {
+        if (enabledFilter && !enabledFilter(span)) return false;
+        const key = spanKey(span);
+        if (emitted.has(key)) return false;
+        emitted.add(key);
+        return true;
+      }
+
+      async function runWindow(safetyEdgeChar: number): Promise<void> {
+        if (inputBuffer.length === 0) return;
+        resolved.signal?.throwIfAborted();
+
+        const enc = tokenizer.encode(inputBuffer);
+        const totalTokens = enc.tokenIds.length;
+        if (totalTokens === 0) return;
+
+        const winStart = Math.max(0, totalTokens - resolved.windowTokens);
+        const winLen = totalTokens - winStart;
+        const windowIds = enc.tokenIds.subarray(winStart, totalTokens);
+        const windowMask = enc.attentionMask.subarray(winStart, totalTokens);
+
+        const logits = await backend.forward(windowIds, windowMask);
+        const tags = viterbi.decode(logits, winLen);
+
+        const winFirstCharOffset = enc.tokenToCharOffset[winStart] ?? 0;
+        const localTokenToChar: number[] = new Array(winLen + 1);
+        for (let i = 0; i <= winLen; i++) {
+          const abs = enc.tokenToCharOffset[winStart + i] ?? inputBuffer.length;
+          localTokenToChar[i] = abs - winFirstCharOffset;
+        }
+        const chunk: Chunk = {
+          tokenIds: windowIds,
+          attentionMask: windowMask,
+          tokenToCharOffset: localTokenToChar,
+          text: inputBuffer.slice(winFirstCharOffset),
+          charOffset: winFirstCharOffset,
+          emitRange: [0, winLen] as const,
+        };
+
+        const spans = bioesToSpans(tags, chunk, tokenizer);
+        for (const span of spans) {
+          if (span.end > safetyEdgeChar) continue;
+          if (!shouldEmit(span)) continue;
+          allSpans.push(span);
+          if (!stableSpanKeys.has(spanKey(span))) {
+            stableSpanKeys.add(spanKey(span));
+            stableSpans.push(span);
+          }
+          pushSpan(span);
+        }
+      }
+
+      for await (const chunk of input) {
+        if (chunk.length === 0) continue;
+        inputBuffer += chunk;
+        const safetyEdgeChar = Math.max(0, inputBuffer.length - safetyMarginChars);
+        await runWindow(safetyEdgeChar);
+        // After the inference pass, advance the emit cursor up to
+        // safetyEdgeChar — that's the boundary at which all spans
+        // ending before it have been finalised.
+        flushTo(safetyEdgeChar);
+      }
+
+      // Stream ended — final pass over remaining buffer with no
+      // safety margin, then emit everything.
+      if (inputBuffer.length > 0) {
+        const chunks = chunkInput(inputBuffer, internals.tokenizer, {
+          maxChunkTokens: Math.max(resolved.windowTokens, 2048),
+        });
+        for (const c of chunks) {
+          resolved.signal?.throwIfAborted();
+          const logits = await internals.backend.forward(c.tokenIds, c.attentionMask);
+          const tags = internals.viterbi.decode(logits, c.tokenIds.length);
+          const spans = bioesToSpans(tags, c, internals.tokenizer);
+          for (const span of spans) {
+            if (!shouldEmit(span)) continue;
+            allSpans.push(span);
+            if (!stableSpanKeys.has(spanKey(span))) {
+              stableSpanKeys.add(spanKey(span));
+              stableSpans.push(span);
+            }
+            pushSpan(span);
+          }
+        }
+      }
+      // Flush remainder.
+      flushTo(inputBuffer.length);
+
+      const summary = buildSummary(allSpans);
+      const finalApplied: DetectedSpan[] = stableSpans
+        .filter((s) => enabledSet.has(s.label))
+        .map((s, i) => ({
+          ...s,
+          marker: resolveMarkerForResult(s, i, markerStrategy),
+        }));
+      resolveResult({
+        input: inputBuffer,
+        redactedText: outputAccum,
+        spans: finalApplied,
+        summary,
+        containsPii: finalApplied.length > 0,
+      });
+      closeSpanQueue();
+      closeTextQueue();
+    } catch (err) {
+      rejectResult(err);
+      closeSpanQueue(err);
+      closeTextQueue(err);
+    }
+  })();
+
+  const spanStream: AsyncIterable<DetectedSpan> = {
+    [Symbol.asyncIterator]() {
+      return {
+        next(): Promise<IteratorResult<DetectedSpan>> {
+          if (spanQueue.length > 0) {
+            return Promise.resolve({ value: spanQueue.shift()!, done: false });
+          }
+          if (spanQueueClosed) {
+            if (spanQueueError !== undefined) return Promise.reject(spanQueueError);
+            return Promise.resolve({
+              value: undefined as unknown as DetectedSpan,
+              done: true,
+            });
+          }
+          return new Promise((resolve) => spanWaiters.push(resolve));
+        },
+      };
+    },
+  };
+
+  const textStream: AsyncIterable<string> = {
+    [Symbol.asyncIterator]() {
+      return {
+        next(): Promise<IteratorResult<string>> {
+          if (textQueue.length > 0) {
+            return Promise.resolve({ value: textQueue.shift()!, done: false });
+          }
+          if (textQueueClosed) {
+            if (textQueueError !== undefined) return Promise.reject(textQueueError);
+            return Promise.resolve({
+              value: undefined as unknown as string,
+              done: true,
+            });
+          }
+          return new Promise((resolve) => textWaiters.push(resolve));
+        },
+      };
+    },
+  };
+
+  return { textStream, spanStream, result };
+}
+
+function resolveMarkerForResult(
+  span: DetectedSpan,
+  index: number,
+  strategy: MarkerStrategy | undefined,
+): string {
+  if (strategy === undefined) return `[${span.label}]`;
+  if (typeof strategy === "function") {
+    return strategy(span, index) ?? span.text;
+  }
+  const override = strategy[span.label];
+  if (override === null) return span.text;
+  if (override === undefined) return `[${span.label}]`;
+  return override;
 }
 
 function buildEnabledFilter(

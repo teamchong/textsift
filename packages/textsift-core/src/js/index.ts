@@ -16,7 +16,12 @@
  */
 
 export { PrivacyFilter, type BackendResolver } from "./privacy-filter.js";
-export type { DetectStreamHandle, DetectStreamOptions } from "./inference/stream.js";
+export type {
+  DetectStreamHandle,
+  DetectStreamOptions,
+  RedactStreamHandle,
+  RedactStreamOptions,
+} from "./inference/stream.js";
 
 // Advanced: direct backend access for tests + power users who want to
 // skip the tokenizer / chunking pipeline. Most consumers should use

@@ -106,4 +106,6 @@ export type {
   BackendResolver,
   DetectStreamHandle,
   DetectStreamOptions,
+  RedactStreamHandle,
+  RedactStreamOptions,
 } from "textsift-core";

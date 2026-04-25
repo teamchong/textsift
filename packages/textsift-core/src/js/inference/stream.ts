@@ -33,12 +33,14 @@ import type {
   DetectedSpan,
   MarkerStrategy,
   RedactResult,
+  Rule,
   SpanLabel,
 } from "../types.js";
 import { ALL_SPAN_LABELS, PrivacyFilterError } from "../types.js";
 import { bioesToSpans } from "./spans.js";
 import { chunkInput, type Chunk } from "./chunking.js";
 import { applyRedaction } from "./redact.js";
+import { runRules, mergeRuleSpans } from "./rules.js";
 
 /**
  * Options for streaming detection. Defaults are tuned for the
@@ -63,6 +65,12 @@ export interface DetectStreamOptions {
   signal?: AbortSignal;
   /** Same as the batch-mode `enabledCategories` option. */
   enabledCategories?: readonly SpanLabel[];
+  /**
+   * Custom rules merged with the model's spans. See `Rule` in
+   * `types.ts`. Rules run on every window pass; results dedup by
+   * `(label, start, end)` like model spans.
+   */
+  rules?: readonly Rule[];
 }
 
 /** Options for streaming redaction. Same as detect plus a marker strategy. */
@@ -154,6 +162,7 @@ export function streamDetect(
 ): DetectStreamHandle {
   const resolved = resolveStreamOptions(opts);
   const enabledFilter = buildEnabledFilter(resolved.enabledCategories);
+  const rules = resolved.rules;
   const allSpans: DetectedSpan[] = [];
   let inputBuffer = "";
 
@@ -235,8 +244,24 @@ export function streamDetect(
           emitRange: [0, winLen] as const,
         };
 
-        const spans = bioesToSpans(tags, chunk, tokenizer);
-        for (const span of spans) {
+        const modelSpans = bioesToSpans(tags, chunk, tokenizer);
+        // Custom rules (if any) run on the same character range the
+        // model just covered, then merge with rule-priority on
+        // overlap. Rules are deterministic over text — no harm in
+        // re-running them every window; the dedup `emitted` set
+        // suppresses duplicate yields.
+        const merged =
+          rules && rules.length > 0
+            ? mergeRuleSpans(
+                modelSpans,
+                runRules(inputBuffer, rules).filter(
+                  (s) =>
+                    s.start >= chunk.charOffset &&
+                    s.end <= chunk.charOffset + chunk.text.length,
+                ),
+              )
+            : modelSpans;
+        for (const span of merged) {
           if (span.end > safetyEdgeChar) continue;
           if (shouldEmit(span)) {
             allSpans.push(span);
@@ -258,12 +283,22 @@ export function streamDetect(
         const chunks = chunkInput(inputBuffer, internals.tokenizer, {
           maxChunkTokens: Math.max(resolved.windowTokens, 2048),
         });
+        const finalRuleSpans = rules && rules.length > 0
+          ? runRules(inputBuffer, rules)
+          : [];
         for (const c of chunks) {
           resolved.signal?.throwIfAborted();
           const logits = await internals.backend.forward(c.tokenIds, c.attentionMask);
           const tags = internals.viterbi.decode(logits, c.tokenIds.length);
-          const spans = bioesToSpans(tags, c, internals.tokenizer);
-          for (const span of spans) {
+          const modelSpans = bioesToSpans(tags, c, internals.tokenizer);
+          const ruleSpansHere = finalRuleSpans.filter(
+            (s) => s.start >= c.charOffset && s.end <= c.charOffset + c.text.length,
+          );
+          const merged =
+            ruleSpansHere.length > 0
+              ? mergeRuleSpans(modelSpans, ruleSpansHere)
+              : modelSpans;
+          for (const span of merged) {
             if (shouldEmit(span)) {
               allSpans.push(span);
               pushQueue(span);
@@ -342,6 +377,7 @@ export function streamRedact(
     resolved.enabledCategories ?? ALL_SPAN_LABELS,
   );
   const markerStrategy = opts.markers;
+  const rules = resolved.rules;
 
   const allSpans: DetectedSpan[] = [];
   let inputBuffer = "";
@@ -495,8 +531,19 @@ export function streamRedact(
           emitRange: [0, winLen] as const,
         };
 
-        const spans = bioesToSpans(tags, chunk, tokenizer);
-        for (const span of spans) {
+        const modelSpans = bioesToSpans(tags, chunk, tokenizer);
+        const merged =
+          rules && rules.length > 0
+            ? mergeRuleSpans(
+                modelSpans,
+                runRules(inputBuffer, rules).filter(
+                  (s) =>
+                    s.start >= chunk.charOffset &&
+                    s.end <= chunk.charOffset + chunk.text.length,
+                ),
+              )
+            : modelSpans;
+        for (const span of merged) {
           if (span.end > safetyEdgeChar) continue;
           if (!shouldEmit(span)) continue;
           allSpans.push(span);
@@ -525,12 +572,21 @@ export function streamRedact(
         const chunks = chunkInput(inputBuffer, internals.tokenizer, {
           maxChunkTokens: Math.max(resolved.windowTokens, 2048),
         });
+        const finalRuleSpans =
+          rules && rules.length > 0 ? runRules(inputBuffer, rules) : [];
         for (const c of chunks) {
           resolved.signal?.throwIfAborted();
           const logits = await internals.backend.forward(c.tokenIds, c.attentionMask);
           const tags = internals.viterbi.decode(logits, c.tokenIds.length);
-          const spans = bioesToSpans(tags, c, internals.tokenizer);
-          for (const span of spans) {
+          const modelSpans = bioesToSpans(tags, c, internals.tokenizer);
+          const ruleSpansHere = finalRuleSpans.filter(
+            (s) => s.start >= c.charOffset && s.end <= c.charOffset + c.text.length,
+          );
+          const merged =
+            ruleSpansHere.length > 0
+              ? mergeRuleSpans(modelSpans, ruleSpansHere)
+              : modelSpans;
+          for (const span of merged) {
             if (!shouldEmit(span)) continue;
             allSpans.push(span);
             if (!stableSpanKeys.has(spanKey(span))) {
@@ -546,7 +602,7 @@ export function streamRedact(
 
       const summary = buildSummary(allSpans);
       const finalApplied: DetectedSpan[] = stableSpans
-        .filter((s) => enabledSet.has(s.label))
+        .filter((s) => s.source === "rule" || enabledSet.has(s.label as SpanLabel))
         .map((s, i) => ({
           ...s,
           marker: resolveMarkerForResult(s, i, markerStrategy),
@@ -615,13 +671,15 @@ function resolveMarkerForResult(
   index: number,
   strategy: MarkerStrategy | undefined,
 ): string {
-  if (strategy === undefined) return `[${span.label}]`;
+  const defaultMarker =
+    span.source === "rule" ? span.marker : `[${span.label}]`;
+  if (strategy === undefined) return defaultMarker;
   if (typeof strategy === "function") {
     return strategy(span, index) ?? span.text;
   }
-  const override = strategy[span.label];
+  const override = (strategy as Record<string, string | null | undefined>)[span.label];
   if (override === null) return span.text;
-  if (override === undefined) return `[${span.label}]`;
+  if (override === undefined) return defaultMarker;
   return override;
 }
 
@@ -629,18 +687,22 @@ function buildEnabledFilter(
   enabled: readonly SpanLabel[] | undefined,
 ): ((span: DetectedSpan) => boolean) | undefined {
   if (!enabled || enabled.length === ALL_SPAN_LABELS.length) return undefined;
-  const set = new Set<SpanLabel>(enabled);
-  return (span) => set.has(span.label);
+  const set = new Set<string>(enabled);
+  // Rule-sourced spans are always allowed through — the caller wrote
+  // the rule explicitly, so it doesn't make sense for an
+  // `enabledCategories` filter (which is about model categories) to
+  // suppress them.
+  return (span) => span.source === "rule" || set.has(span.label);
 }
 
 function buildSummary(
   spans: readonly DetectedSpan[],
 ): Partial<Record<SpanLabel, number>> {
-  const out: Partial<Record<SpanLabel, number>> = {};
+  const out: Record<string, number> = {};
   for (const span of spans) {
     out[span.label] = (out[span.label] ?? 0) + 1;
   }
-  return out;
+  return out as Partial<Record<SpanLabel, number>>;
 }
 
 /**
@@ -653,6 +715,7 @@ export function resolveStreamOptions(opts: DetectStreamOptions = {}): {
   safetyMarginTokens: number;
   signal?: AbortSignal;
   enabledCategories?: readonly SpanLabel[];
+  rules?: readonly Rule[];
 } {
   const windowTokens = opts.windowTokens ?? DEFAULT_WINDOW_TOKENS;
   const safetyMarginTokens = opts.safetyMarginTokens ?? DEFAULT_SAFETY_MARGIN_TOKENS;
@@ -679,5 +742,6 @@ export function resolveStreamOptions(opts: DetectStreamOptions = {}): {
     safetyMarginTokens,
     signal: opts.signal,
     enabledCategories: opts.enabledCategories,
+    rules: opts.rules,
   };
 }

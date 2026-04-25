@@ -34,6 +34,7 @@ import { loadCalibration } from "./model/calibration.js";
 import { chunkInput, mergeChunkResults, type Chunk } from "./inference/chunking.js";
 import { bioesToSpans } from "./inference/spans.js";
 import { applyRedaction } from "./inference/redact.js";
+import { runRules, mergeRuleSpans } from "./inference/rules.js";
 import {
   streamDetect,
   streamRedact,
@@ -149,6 +150,7 @@ export class PrivacyFilter {
       enabledCategories:
         (opts as RedactStreamOptions).enabledCategories ?? this.opts.enabledCategories,
       markers: (opts as RedactStreamOptions).markers ?? this.opts.markers,
+      rules: (opts as RedactStreamOptions).rules ?? this.opts.rules,
       windowTokens: (opts as RedactStreamOptions).windowTokens,
       safetyMarginTokens: (opts as RedactStreamOptions).safetyMarginTokens,
       signal: (opts as RedactStreamOptions).signal,
@@ -216,6 +218,7 @@ export class PrivacyFilter {
     const merged: DetectStreamOptions = {
       enabledCategories:
         (opts as DetectStreamOptions).enabledCategories ?? this.opts.enabledCategories,
+      rules: (opts as DetectStreamOptions).rules ?? this.opts.rules,
       windowTokens: (opts as DetectStreamOptions).windowTokens,
       safetyMarginTokens: (opts as DetectStreamOptions).safetyMarginTokens,
       signal: (opts as DetectStreamOptions).signal,
@@ -393,7 +396,11 @@ export class PrivacyFilter {
       perChunkSpans.push(spans);
     }
 
-    return mergeChunkResults(perChunkSpans, chunks);
+    const modelSpans = mergeChunkResults(perChunkSpans, chunks);
+    const rules = opts.rules ?? this.opts.rules;
+    if (!rules || rules.length === 0) return modelSpans;
+    const ruleSpans = runRules(text, rules);
+    return mergeRuleSpans(modelSpans, ruleSpans);
   }
 
   private enqueue<T>(fn: () => Promise<T>): Promise<T> {
@@ -406,11 +413,11 @@ export class PrivacyFilter {
 function buildSummary(
   spans: readonly DetectedSpan[],
 ): Partial<Record<SpanLabel, number>> {
-  const out: Partial<Record<SpanLabel, number>> = {};
+  const out: Record<string, number> = {};
   for (const span of spans) {
     out[span.label] = (out[span.label] ?? 0) + 1;
   }
-  return out;
+  return out as Partial<Record<SpanLabel, number>>;
 }
 
 const DEFAULT_MODEL_SOURCE =

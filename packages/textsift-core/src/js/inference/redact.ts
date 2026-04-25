@@ -39,16 +39,28 @@ export function applyRedaction(
 ): ApplyRedactionResult {
   const sorted = [...spans].sort((a, b) => a.start - b.start);
 
+  // A span is "enabled for redaction" when:
+  //   - It's a rule span (custom rules apply unconditionally; the
+  //     caller authored them, so the model's enabledCategories filter
+  //     doesn't constrain them), OR
+  //   - It's a model span whose label is in enabledSet.
+  const isEnabled = (span: DetectedSpan): boolean =>
+    span.source === "rule" ||
+    enabledSet.has(span.label as SpanLabel);
+
   // First pass: resolve markers. Build a decorated array in original
   // order so we can index-count "enabled" spans consistently for
   // function-form markers.
   const decorated: DetectedSpan[] = [];
   let enabledIndex = 0;
   for (const span of sorted) {
-    if (!enabledSet.has(span.label)) {
+    if (!isEnabled(span)) {
       decorated.push({ ...span, marker: span.text });
       continue;
     }
+    // Rule spans carry their own preferred marker on the span object
+    // (set by `runRules`). Caller-supplied marker strategy still wins
+    // when it explicitly maps the rule's label to something non-null.
     const resolved = resolveMarker(span, enabledIndex, strategy);
     enabledIndex++;
     decorated.push({ ...span, marker: resolved ?? span.text });
@@ -58,7 +70,7 @@ export function applyRedaction(
   let redacted = input;
   for (let i = decorated.length - 1; i >= 0; i--) {
     const span = decorated[i]!;
-    if (!enabledSet.has(span.label)) continue;
+    if (!isEnabled(span)) continue;
     if (span.marker === span.text) continue; // strategy returned null or unchanged
     redacted = redacted.slice(0, span.start) + span.marker + redacted.slice(span.end);
   }
@@ -71,14 +83,18 @@ function resolveMarker(
   enabledIndex: number,
   strategy: MarkerStrategy | undefined,
 ): string | null {
+  // Rule spans carry their explicit marker on the span itself (set by
+  // `runRules` from `Rule.marker`). Use it as the default when the
+  // caller hasn't passed a strategy.
+  const ruleMarker = span.source === "rule" ? span.marker : `[${span.label}]`;
   if (strategy === undefined) {
-    return `[${span.label}]`;
+    return ruleMarker;
   }
   if (typeof strategy === "function") {
     return strategy(span, enabledIndex);
   }
-  const override = strategy[span.label];
+  const override = (strategy as Record<string, string | null | undefined>)[span.label];
   if (override === null) return null;
-  if (override === undefined) return `[${span.label}]`;
+  if (override === undefined) return ruleMarker;
   return override;
 }

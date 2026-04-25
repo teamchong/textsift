@@ -43,10 +43,42 @@ export const ALL_SPAN_LABELS: readonly SpanLabel[] = [
   "secret",
 ] as const;
 
-/** A single detected PII span with character-level offsets into the input text. */
+/**
+ * Span label is either one of the 8 model categories or a string the
+ * caller has defined via a custom rule. The latter is opaque to
+ * textsift — proxy code reads it and decides what to do.
+ */
+export type Label = SpanLabel | string;
+
+/**
+ * Severity tag attached to a custom rule. textsift doesn't act on
+ * severity itself (it's not a guard, only a detector); proxy code
+ * reads `severity` and decides whether to block, redact, log, or warn.
+ * Borrowed from the codesift / linter-style severity vocabulary.
+ */
+export type RuleSeverity = "block" | "warn" | "track";
+
+/** A single detected span with character-level offsets into the input text. */
 export interface DetectedSpan {
-  /** Which PII category this span belongs to. */
-  label: SpanLabel;
+  /**
+   * Which category this span belongs to. For model spans this is one
+   * of the 8 `SpanLabel` values; for custom-rule spans this is the
+   * label the rule defined (any string).
+   */
+  label: Label;
+  /**
+   * Where the span came from. `"model"` when produced by
+   * openai/privacy-filter; `"rule"` when produced by a custom rule.
+   * Proxy code can use `source === "rule"` to apply rule-specific
+   * policy (block / warn / track) per `severity`.
+   */
+  source: "model" | "rule";
+  /**
+   * Severity, populated only when `source === "rule"`. Carries the
+   * rule's declared severity through the pipeline so callers don't
+   * need to look it up by id.
+   */
+  severity?: RuleSeverity;
   /** Start offset in the original input text (UTF-16 code units). */
   start: number;
   /** End offset (exclusive) in the original input text. */
@@ -55,9 +87,56 @@ export interface DetectedSpan {
   text: string;
   /** The marker string used in the redacted output for this span. */
   marker: string;
-  /** Model's confidence for this span (0..1). */
+  /** Model's confidence for this span (0..1); `1.0` for rule spans (deterministic). */
   confidence: number;
 }
+
+/**
+ * Custom detection rule. Rules run alongside the model's detection
+ * pass; matches are merged into the same `DetectedSpan[]` output with
+ * `source: "rule"` and the rule's `label`/`severity`.
+ *
+ * Two match shapes — pick whichever fits:
+ *
+ *   { label, pattern: RegExp }                 — every regex match becomes a span
+ *   { label, match: (text) => Array<...> }    — arbitrary code returns spans
+ *
+ * Use cases beyond PII:
+ *   - "block on `eval()` in code"
+ *   - "warn on lazy-LLM phrases (TODO markers, hedging language)"
+ *   - "track API keys / JWTs the model wasn't trained on"
+ *   - "block prompts that contain prior conversation IDs"
+ *
+ * Rules don't replace the model — they augment it. Both run; results
+ * are merged with overlap dedup (see `mergeRuleSpans`).
+ */
+export type Rule =
+  | {
+      /** Span label produced when this rule matches. Any string. */
+      label: string;
+      /** Severity for the proxy's block/warn/track decision. Default: "warn". */
+      severity?: RuleSeverity;
+      /** Replacement marker for `redact()`. Default: `[label]`. */
+      marker?: string;
+      /**
+       * Regex matched against the full input text. Must be global
+       * (`/g`) so `matchAll()` walks every match. Capture groups are
+       * not used — the whole match is the span.
+       */
+      pattern: RegExp;
+    }
+  | {
+      label: string;
+      severity?: RuleSeverity;
+      marker?: string;
+      /**
+       * Function that returns `{ start, end }` ranges for every
+       * match in `text`. Useful when matching needs context outside
+       * a single regex (e.g. proximity rules, "git checkout without
+       * a fingerprint reference nearby").
+       */
+      match: (text: string) => Array<{ start: number; end: number }>;
+    };
 
 /** A successful redaction, returned from `redact()`. */
 export interface RedactResult {
@@ -156,6 +235,16 @@ export interface CreateOptions {
    * keeps per-chunk latency bounded).
    */
   maxChunkTokens?: number;
+
+  /**
+   * Custom detection rules. Run alongside model detection; matches
+   * merge into the same `DetectedSpan[]` with `source: "rule"`. See
+   * the `Rule` type for the two supported shapes (regex vs function).
+   *
+   * Rules apply on every `detect()` / `redact()` call unless
+   * overridden per-call via `RedactOptions.rules`.
+   */
+  rules?: readonly Rule[];
 }
 
 /** Per-call options passed to `redact()` / `detect()`. */
@@ -164,6 +253,12 @@ export interface RedactOptions {
   markers?: MarkerStrategy;
   /** Override the session's enabled-categories list for this call only. */
   enabledCategories?: readonly SpanLabel[];
+  /**
+   * Override or extend the session's custom-rule list for this call
+   * only. If set, replaces the session-level rules entirely (no
+   * merging). To extend, splice them at the call site.
+   */
+  rules?: readonly Rule[];
   /** AbortSignal for cancelling a long inference. */
   signal?: AbortSignal;
 }

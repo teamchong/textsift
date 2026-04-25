@@ -58,8 +58,11 @@ export type {
   DetectResult,
   DetectedSpan,
   SpanLabel,
+  Label,
   ProgressEvent,
   MarkerStrategy,
+  Rule,
+  RuleSeverity,
 } from "./types.js";
 
 export { ALL_SPAN_LABELS, PrivacyFilterError } from "./types.js";

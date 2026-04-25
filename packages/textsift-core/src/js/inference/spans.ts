@@ -127,6 +127,7 @@ export function bioesToSpans(
 
     spans.push({
       label,
+      source: "model",
       start: chunk.charOffset + startOffset,
       end: chunk.charOffset + endOffset,
       text: chunk.text.slice(startOffset, endOffset),

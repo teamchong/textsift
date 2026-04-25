@@ -1,0 +1,147 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>textsift-core — custom rules</title>
+  </head>
+  <body>
+    <pre id="out">starting</pre>
+    <script type="module">
+      // Exercises the custom rule engine: a regex rule (credit-card-ish
+      // digit grouping) + a function rule (JIRA-style ticket reference)
+      // in both batch and streaming paths. Verifies:
+      //   - rule spans land with source="rule" and the declared severity
+      //   - rule spans get redacted regardless of enabledCategories
+      //   - rule spans use the rule's marker by default
+      //   - streaming output equals batch output
+
+      import { PrivacyFilter } from "/packages/textsift-core/dist/index.js";
+
+      const $out = document.getElementById("out");
+      const log = (m) => { $out.textContent += "\n" + m; };
+
+      const TEXT =
+        "Card 4111-1111-1111-1111 charged today. " +
+        "Linked to ticket PROJ-4821 in our tracker. " +
+        "Backup card: 5500 0000 0000 0004 expires soon.";
+
+      const rules = [
+        {
+          label: "CREDIT_CARD",
+          severity: "block",
+          marker: "[CARD]",
+          // 4 groups of 4 digits, separated by space or hyphen.
+          pattern: /\b(?:\d{4}[\s-]){3}\d{4}\b/g,
+        },
+        {
+          label: "JIRA_TICKET",
+          severity: "warn",
+          marker: "[TICKET]",
+          match: (text) => {
+            const out = [];
+            const re = /\b[A-Z]{2,}-\d+\b/g;
+            for (const m of text.matchAll(re)) {
+              out.push({ start: m.index, end: m.index + m[0].length });
+            }
+            return out;
+          },
+        },
+      ];
+
+      function makeChunks(text, chunkSize) {
+        const out = [];
+        for (let i = 0; i < text.length; i += chunkSize) {
+          out.push(text.slice(i, i + chunkSize));
+        }
+        return out;
+      }
+
+      try {
+        log("create filter (backend=wasm)");
+        const filter = await PrivacyFilter.create({ backend: "wasm", rules });
+
+        log("\n[1] batch detect — rules merged with model spans");
+        const detect = await filter.detect(TEXT);
+        const ruleSpans = detect.spans.filter((s) => s.source === "rule");
+        const cardSpans = ruleSpans.filter((s) => s.label === "CREDIT_CARD");
+        const ticketSpans = ruleSpans.filter((s) => s.label === "JIRA_TICKET");
+        log(`  total spans=${detect.spans.length}, rule=${ruleSpans.length}`);
+        for (const s of ruleSpans) {
+          log(`    [${s.label}] (${s.severity}) ${JSON.stringify(s.text)} @ ${s.start}..${s.end}`);
+        }
+
+        log("\n[2] batch redact — rule markers applied");
+        const batch = await filter.redact(TEXT);
+        log(`  redactedText = ${JSON.stringify(batch.redactedText)}`);
+        const cardRedacted = batch.redactedText.includes("[CARD]");
+        const ticketRedacted = batch.redactedText.includes("[TICKET]");
+        const cardLeaked = batch.redactedText.includes("4111-1111-1111-1111");
+
+        log("\n[3] streaming redact — same input via async iterable");
+        const chunks = makeChunks(TEXT, 18);
+        async function* streamIn() {
+          for (const c of chunks) yield c;
+        }
+        const handle = filter.redact(streamIn());
+        const pieces = [];
+        const streamRuleSpans = [];
+        const textTask = (async () => {
+          for await (const p of handle.textStream) pieces.push(p);
+        })();
+        const spanTask = (async () => {
+          for await (const s of handle.spanStream) {
+            if (s.source === "rule") streamRuleSpans.push(s);
+          }
+        })();
+        await Promise.all([textTask, spanTask]);
+        const finalResult = await handle.result;
+        const streamedText = pieces.join("");
+        log(`  streamed ${pieces.length} text chunks → ${streamedText.length} chars`);
+        log(`  streamedText = ${JSON.stringify(streamedText)}`);
+        log(`  stream rule spans = ${streamRuleSpans.length}`);
+
+        const textsAgree = streamedText === batch.redactedText;
+        const ruleCountsAgree = streamRuleSpans.length === ruleSpans.length;
+
+        filter.dispose();
+
+        const ok =
+          cardSpans.length === 2 &&
+          ticketSpans.length === 1 &&
+          cardSpans.every((s) => s.severity === "block") &&
+          ticketSpans[0].severity === "warn" &&
+          cardRedacted &&
+          ticketRedacted &&
+          !cardLeaked &&
+          textsAgree &&
+          ruleCountsAgree;
+
+        window.__result = {
+          ok,
+          cardSpanCount: cardSpans.length,
+          ticketSpanCount: ticketSpans.length,
+          cardSeverity: cardSpans.map((s) => s.severity),
+          ticketSeverity: ticketSpans.map((s) => s.severity),
+          cardRedacted,
+          ticketRedacted,
+          cardLeaked,
+          textsAgree,
+          ruleCountsAgree,
+          batchTextLen: batch.redactedText.length,
+          streamTextLen: streamedText.length,
+          batchExcerpt: batch.redactedText,
+          streamExcerpt: streamedText,
+          streamRuleSpanCount: streamRuleSpans.length,
+          finalResultRuleSpanCount: finalResult.spans.filter(
+            (s) => s.source === "rule",
+          ).length,
+        };
+        log(`\ndone: ok=${ok}`);
+      } catch (e) {
+        window.__result = { ok: false, error: String(e), stack: e.stack };
+        log("ERROR: " + e);
+        throw e;
+      }
+    </script>
+  </body>
+</html>

@@ -36,14 +36,25 @@ test("e2e perf bench vs transformers.js default", async ({ page }) => {
   console.log(
     `WebGPU: ${result.hasWebGPU}  ` +
       `tjs warmup=${result.tjsWarmupMs.toFixed(0)}ms  ` +
-      `wasm warmup=${result.wasmWarmupMs.toFixed(0)}ms`,
+      `wasm warmup=${result.wasmWarmupMs.toFixed(0)}ms  ` +
+      `gpu warmup=${result.gpuWarmupMs.toFixed(0)}ms`,
   );
   console.log(
-    `  ${"text".padEnd(40)} ${"tjs (ms)".padStart(10)} ${"wasm (ms)".padStart(10)} ${"speedup".padStart(10)}`,
+    `  ${"text".padEnd(40)} ` +
+      `${"tjs (ms)".padStart(10)} ` +
+      `${"wasm (ms)".padStart(10)} ` +
+      `${"gpu (ms)".padStart(10)} ` +
+      `${"wasm/tjs".padStart(10)} ` +
+      `${"gpu/tjs".padStart(10)}`,
   );
   for (const r of result.rows) {
     console.log(
-      `  ${r.text.slice(0, 40).padEnd(40)} ${r.tjsMs.toFixed(1).padStart(10)} ${r.wasmMs.toFixed(1).padStart(10)} ${r.speedup.toFixed(2).padStart(9)}x`,
+      `  ${r.text.slice(0, 40).padEnd(40)} ` +
+        `${r.tjsMs.toFixed(1).padStart(10)} ` +
+        `${r.wasmMs.toFixed(1).padStart(10)} ` +
+        `${r.gpuMs.toFixed(1).padStart(10)} ` +
+        `${(r.wasmMs / r.tjsMs).toFixed(2).padStart(9)}x ` +
+        `${(r.gpuMs  / r.tjsMs).toFixed(2).padStart(9)}x`,
     );
   }
 

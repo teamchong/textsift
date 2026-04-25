@@ -72,26 +72,38 @@
         const wasmWarmup = performance.now() - t1;
         log(`wasm ready in ${wasmWarmup.toFixed(0)}ms`);
 
+        log("webgpu backend: create + warmup");
+        const t2 = performance.now();
+        const gpu = await PrivacyFilter.create({
+          backend: "webgpu",
+        });
+        const gpuWarmup = performance.now() - t2;
+        log(`webgpu ready in ${gpuWarmup.toFixed(0)}ms`);
+
         const rows = [];
         for (const text of SEEDS) {
           log(`\ntext: "${text.slice(0, 60)}${text.length > 60 ? "…" : ""}"`);
           const tjsMs = await measure("transformers.js", tjs, text);
           const wasmMs = await measure("wasm (Stage 1)", wasm, text);
+          const gpuMs = await measure("webgpu (Stage 2)", gpu, text);
           rows.push({
             text: text.slice(0, 80),
-            tjsMs, wasmMs,
-            speedup: tjsMs / wasmMs,
+            tjsMs, wasmMs, gpuMs,
+            wasmSpeedup: tjsMs / wasmMs,
+            gpuSpeedup: tjsMs / gpuMs,
           });
         }
 
         tjs.dispose();
         wasm.dispose();
+        gpu.dispose();
 
         window.__result = {
           ok: true,
           hasWebGPU,
           tjsWarmupMs: tjsWarmup,
           wasmWarmupMs: wasmWarmup,
+          gpuWarmupMs: gpuWarmup,
           rows,
         };
         log("\ndone");

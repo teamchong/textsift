@@ -7,7 +7,7 @@ All numbers measured on an M-series MacBook, Chromium 147 with `--enable-unsafe-
 
 ## Per-forward latency
 
-| Input length | tjs (WebGPU) | **pii-wasm (WebGPU)** | speedup | pii-wasm (WASM) |
+| Input length | tjs (WebGPU) | **textsift (WebGPU)** | speedup | textsift (WASM) |
 |---|---:|---:|---:|---:|
 | Short (~12 tokens) | 29 ms | **7 ms** | **4.1×** | 66 ms |
 | Medium (~25 tokens) | 39 ms | **12 ms** | **3.2×** | 158 ms |
@@ -20,12 +20,12 @@ Linear scaling with T — dispatch overhead is negligible at this model size, th
 | | First visit (HF CDN download) | Second visit (cache warm) |
 |---|---:|---:|
 | tjs | 13.3 s | 11.2 s |
-| pii-wasm (WASM) | 14.1 s | 1.8 s |
-| **pii-wasm (WebGPU)** | 14.1 s ¹ | **1.1 s** |
+| textsift (WASM) | 14.1 s | 1.8 s |
+| **textsift (WebGPU)** | 14.1 s ¹ | **1.1 s** |
 
 ¹ First visit is download-bound (~770 MB from HuggingFace CDN). All backends take similar time on the initial download; the difference is on repeat visits.
 
-**Second-visit cold start — pii-wasm webgpu is 10× faster than transformers.js.** The win comes from OPFS-backed caching: Cache API can't hold the 770 MB `.onnx_data` blob (quota rejects it), so we persist via OPFS where Chromium allocates ~60% of free disk per origin and Safari gives 1 GB.
+**Second-visit cold start — textsift webgpu is 10× faster than transformers.js.** The win comes from OPFS-backed caching: Cache API can't hold the 770 MB `.onnx_data` blob (quota rejects it), so we persist via OPFS where Chromium allocates ~60% of free disk per origin and Safari gives 1 GB.
 
 ## Warmup breakdown (cache hit)
 
@@ -42,7 +42,7 @@ From `tests/browser/webgpu-coldstart.spec.ts`, second warmup:
 
 ## Accuracy
 
-On the model's own benchmark (PII-Masking-300k), `openai/privacy-filter` reports **F1 96%** (state-of-the-art). All three pii-wasm backends produce byte-identical span output (`tests/browser/smoke.spec.ts`, `webgpu-smoke.spec.ts`), so the downstream accuracy is the model's.
+On the model's own benchmark (PII-Masking-300k), `openai/privacy-filter` reports **F1 96%** (state-of-the-art). All three textsift backends produce byte-identical span output (`tests/browser/smoke.spec.ts`, `webgpu-smoke.spec.ts`), so the downstream accuracy is the model's.
 
 Our forward-parity test (`tests/browser/webgpu-forward.spec.ts`) confirms argmax agrees on 32/32 tokens of deterministic input, with a logit RMS drift of 0.18 vs the WASM reference — the model's fp16 rounding noise compounding across 8 layers. Argmax (and thus Viterbi + span output) is preserved.
 

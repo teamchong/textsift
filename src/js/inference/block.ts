@@ -14,7 +14,7 @@
  * between forward passes.
  */
 
-import type { Int4BlockWeight, PiiWasmExports, WeightTensorInfo } from "../backends/wasm.js";
+import type { Int4BlockWeight, TextsiftExports, WeightTensorInfo } from "../backends/wasm.js";
 import { attentionForward, type AttentionWeights, type AttentionConfig, type AttentionTables } from "./attention.js";
 import { expertDispatch, type ExpertWeights, type ExpertConfig, type MultiThreadContext } from "./expert.js";
 import type { KernelCall, WorkerScript } from "./mt-pool.js";
@@ -47,7 +47,7 @@ export interface BlockConfig extends AttentionConfig, ExpertConfig {
  * softmax + invK pass is small enough to stay single-threaded.
  */
 export async function routerForward(
-  wasm: PiiWasmExports,
+  wasm: TextsiftExports,
   hiddenF32Ptr: number,
   routingIdxPtr: number,
   routingScoresPtr: number,
@@ -106,7 +106,7 @@ export async function routerForward(
  * Sole production entry point called by `modelForward`.
  */
 export async function blockForward(
-  wasm: PiiWasmExports,
+  wasm: TextsiftExports,
   inputPtr: number,
   outputPtr: number,
   weights: BlockWeights,

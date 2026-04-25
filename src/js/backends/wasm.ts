@@ -2,7 +2,7 @@
  * Stage 1 backend: custom Zig+WASM inference engine.
  *
  * This file is the JS side of the bridge; the Zig side lives at
- * `src/zig/wasm_exports.zig` and compiles to `dist/pii.wasm` via
+ * `src/zig/wasm_exports.zig` and compiles to `dist/textsift.wasm` via
  * `npm run build:zig`.
  *
  * Loads weights directly from the upstream ONNX graph shipped on HF Hub
@@ -23,10 +23,10 @@ import type { WorkerScratch } from "../inference/mt-expert.js";
 import type { BlockWeights } from "../inference/block.js";
 import { parseOnnxGraph, resolveTensorBytes } from "../model/onnx-reader.js";
 import { fetchBytesCached } from "../model/opfs-fetch.js";
-import { PII_WASM_BYTES, PII_WASM_MT_BYTES } from "./pii-wasm-inline.js";
+import { TEXTSIFT_BYTES, TEXTSIFT_MT_BYTES } from "./textsift-inline.js";
 
 /** Exports declared in `src/zig/wasm_exports.zig`. Keep in sync. */
-export interface PiiWasmExports {
+export interface TextsiftExports {
   readonly memory: WebAssembly.Memory;
   /** Idempotent. Explicit call is optional; `alloc`/`reset`/`heap_mark_now` lazy-init. */
   heap_init(): number;
@@ -135,29 +135,29 @@ export function sharedMemorySupported(): boolean {
 }
 
 /**
- * Load `pii.wasm` and return its typed exports plus a readiness check.
+ * Load `textsift.wasm` and return its typed exports plus a readiness check.
  * If `url` is `null` or undefined, uses the inlined bytes baked into
- * the bundle (`PII_WASM_BYTES`) — this is the default and avoids the
+ * the bundle (`TEXTSIFT_BYTES`) — this is the default and avoids the
  * extra HTTP request for a ~3 KB file.
  */
-export async function loadPiiWasm(url?: string | URL | null): Promise<PiiWasmExports> {
+export async function loadTextsift(url?: string | URL | null): Promise<TextsiftExports> {
   let instance: WebAssembly.Instance;
   if (url == null) {
-    const result = await WebAssembly.instantiate(PII_WASM_BYTES as BufferSource, {});
+    const result = await WebAssembly.instantiate(TEXTSIFT_BYTES as BufferSource, {});
     instance = result.instance;
   } else {
     const response = await fetch(url);
     if (!response.ok) {
       throw new Error(
-        `loadPiiWasm: fetch ${url} → ${response.status} ${response.statusText}`,
+        `loadTextsift: fetch ${url} → ${response.status} ${response.statusText}`,
       );
     }
     const result = await WebAssembly.instantiateStreaming(response, {});
     instance = result.instance;
   }
-  const exports = instance.exports as unknown as PiiWasmExports;
+  const exports = instance.exports as unknown as TextsiftExports;
 
-  const required: readonly (keyof PiiWasmExports)[] = [
+  const required: readonly (keyof TextsiftExports)[] = [
     "memory",
     "alloc",
     "heap_mark_now",
@@ -192,7 +192,7 @@ export async function loadPiiWasm(url?: string | URL | null): Promise<PiiWasmExp
   ];
   for (const name of required) {
     if (!(name in exports)) {
-      throw new Error(`loadPiiWasm: missing export "${String(name)}"`);
+      throw new Error(`loadTextsift: missing export "${String(name)}"`);
     }
   }
 
@@ -200,24 +200,24 @@ export async function loadPiiWasm(url?: string | URL | null): Promise<PiiWasmExp
 }
 
 /**
- * Load `pii-mt.wasm` — same kernels as `pii.wasm` but built with the
+ * Load `textsift-mt.wasm` — same kernels as `textsift.wasm` but built with the
  * WASM atomics + bulk_memory features and an imported shared memory.
  * The returned exports use `memory.buffer` as a SharedArrayBuffer, which
  * means the same `WebAssembly.Memory` can be passed to Worker threads
  * and they all see the same address space. Single-threaded callers can
- * use this build identically to `loadPiiWasm` — atomics are opt-in per
+ * use this build identically to `loadTextsift` — atomics are opt-in per
  * kernel call, not required for correctness.
  *
  * Throws if SAB isn't available in this environment (no
  * cross-origin-isolated context in browsers, etc.). Caller should
  * feature-check via `sharedMemorySupported()` first.
  */
-export async function loadPiiWasmShared(
+export async function loadTextsiftShared(
   sharedMemory?: WebAssembly.Memory,
-): Promise<PiiWasmExports> {
+): Promise<TextsiftExports> {
   if (!sharedMemorySupported()) {
     throw new Error(
-      "loadPiiWasmShared: SharedArrayBuffer is not available in this environment " +
+      "loadTextsiftShared: SharedArrayBuffer is not available in this environment " +
         "(in browsers, the page must be served with " +
         "Cross-Origin-Opener-Policy: same-origin and " +
         "Cross-Origin-Embedder-Policy: require-corp)",
@@ -233,19 +233,19 @@ export async function loadPiiWasmShared(
     shared: true,
   });
   if (!(memory.buffer instanceof SharedArrayBuffer)) {
-    throw new Error("loadPiiWasmShared: provided memory is not SAB-backed");
+    throw new Error("loadTextsiftShared: provided memory is not SAB-backed");
   }
   const result = await WebAssembly.instantiate(
-    PII_WASM_MT_BYTES as BufferSource,
+    TEXTSIFT_MT_BYTES as BufferSource,
     { env: { memory } },
   );
   // The mt-WASM imports memory rather than exporting it; expose the
   // imported memory via the same `exports.memory` shape so callers
-  // can use the returned object identically to `loadPiiWasm`.
+  // can use the returned object identically to `loadTextsift`.
   const exports = {
     ...(result.instance.exports as object),
     memory,
-  } as unknown as PiiWasmExports;
+  } as unknown as TextsiftExports;
   return exports;
 }
 
@@ -305,7 +305,7 @@ function f32BufferToFp16(src: Uint8Array): Uint8Array {
 // ---------- ONNX → WASM memory ----------
 
 function pinBytes(
-  wasm: PiiWasmExports,
+  wasm: TextsiftExports,
   name: string,
   dtype: WeightDType,
   shape: readonly number[],
@@ -326,7 +326,7 @@ function pinBytes(
  * a name → info map keyed by our canonical (dotted) names.
  */
 export async function loadOnnxWeights(
-  wasm: PiiWasmExports,
+  wasm: TextsiftExports,
   modelSource: string,
 ): Promise<Map<string, WeightTensorInfo>> {
   const base = modelSource.endsWith("/") ? modelSource : `${modelSource}/`;
@@ -484,7 +484,7 @@ const PF_CONFIG: Omit<ModelConfig, "vocabSize" | "numExperts" | "numExpertsInBlo
 
 export interface WasmBackendOptions extends BackendConstructionOptions {
   /**
-   * Override the URL the backend fetches `pii.wasm` from. Defaults to
+   * Override the URL the backend fetches `textsift.wasm` from. Defaults to
    * the bytes inlined into the JS bundle, which is the right choice for
    * every deployment so far. Only set this if you want to host an
    * alternative .wasm build separately.
@@ -582,7 +582,7 @@ const MAX_M_PER_WORKER = MAX_T;
 
 export class WasmBackend implements InferenceBackend {
   readonly name = "wasm" as const;
-  private wasm: PiiWasmExports | null = null;
+  private wasm: TextsiftExports | null = null;
   private weightMap: Map<string, WeightTensorInfo> | null = null;
   private modelWeights: ModelWeights | null = null;
   private numExpertsInBlob = 0;
@@ -623,9 +623,9 @@ export class WasmBackend implements InferenceBackend {
         maximum: 32768, // 2 GB hard cap (WASM32 limit)
         shared: true,
       });
-      this.wasm = await loadPiiWasmShared(memory);
+      this.wasm = await loadTextsiftShared(memory);
     } else {
-      this.wasm = await loadPiiWasm(this.opts.wasmModuleUrl);
+      this.wasm = await loadTextsift(this.opts.wasmModuleUrl);
     }
 
     const echoed = this.wasm.echo(42);

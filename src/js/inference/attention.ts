@@ -14,7 +14,7 @@
  * allocator. Caller is expected to `reset()` afterwards to drop it.
  */
 
-import type { Int4BlockWeight, PiiWasmExports, WeightTensorInfo } from "../backends/wasm.js";
+import type { Int4BlockWeight, TextsiftExports, WeightTensorInfo } from "../backends/wasm.js";
 import type { KernelCall, WorkerScript } from "./mt-pool.js";
 import type { MultiThreadContext } from "./expert.js";
 
@@ -43,7 +43,7 @@ export interface AttentionTables {
 }
 
 export async function attentionForward(
-  wasm: PiiWasmExports,
+  wasm: TextsiftExports,
   /**
    * f32 [T, D]; the caller has already widened hidden via the fused
    * `rms_norm_fp16_to_f32` so the Q/K/V int4 matmuls can run directly

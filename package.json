@@ -1,5 +1,5 @@
 {
-  "name": "pii-wasm",
+  "name": "textsift",
   "version": "0.0.1",
   "description": "PII detection and redaction that runs openai/privacy-filter locally in the browser or Node via WebGPU or WebAssembly. No backend required.",
   "type": "module",
@@ -37,11 +37,11 @@
   "scripts": {
     "build": "npm run build:zig && npm run build:opt && node scripts/inline-wasm.mjs && bun build src/js/index.ts --outdir dist --target browser --format esm --sourcemap=external && bun x tsc --emitDeclarationOnly",
     "build:zig": "npm run build:zig-st && npm run build:zig-mt",
-    "build:zig-st": "mise exec -- zig build-exe -target wasm32-freestanding -mcpu=generic+simd128+relaxed_simd -O ReleaseFast -fstrip -flto src/zig/wasm_exports.zig -cflags -O3 -mrelaxed-simd -flto -- src/c/fma.c --name pii -fno-entry -rdynamic && mv pii.wasm dist/",
-    "build:zig-mt": "mise exec -- zig build-exe -target wasm32-freestanding -mcpu=generic+simd128+relaxed_simd+atomics+bulk_memory -O ReleaseFast -fstrip -flto src/zig/wasm_exports.zig -cflags -O3 -mrelaxed-simd -flto -- src/c/fma.c --shared-memory --import-memory --initial-memory=4194304 --max-memory=2147483648 --export=__stack_pointer --name pii-mt -fno-entry -rdynamic && mv pii-mt.wasm dist/",
+    "build:zig-st": "mise exec -- zig build-exe -target wasm32-freestanding -mcpu=generic+simd128+relaxed_simd -O ReleaseFast -fstrip -flto src/zig/wasm_exports.zig -cflags -O3 -mrelaxed-simd -flto -- src/c/fma.c --name textsift -fno-entry -rdynamic && mv textsift.wasm dist/",
+    "build:zig-mt": "mise exec -- zig build-exe -target wasm32-freestanding -mcpu=generic+simd128+relaxed_simd+atomics+bulk_memory -O ReleaseFast -fstrip -flto src/zig/wasm_exports.zig -cflags -O3 -mrelaxed-simd -flto -- src/c/fma.c --shared-memory --import-memory --initial-memory=4194304 --max-memory=2147483648 --export=__stack_pointer --name textsift-mt -fno-entry -rdynamic && mv textsift-mt.wasm dist/",
     "build:opt": "npm run build:opt-st && npm run build:opt-mt",
-    "build:opt-st": "wasm-opt -O3 --strip-producers --strip-target-features dist/pii.wasm -o dist/pii.wasm --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals --enable-relaxed-simd --inlining-optimizing --always-inline-max-function-size 256 --flexible-inline-max-function-size 512 --inline-functions-with-loops",
-    "build:opt-mt": "wasm-opt -O3 --strip-producers --strip-target-features dist/pii-mt.wasm -o dist/pii-mt.wasm --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals --enable-relaxed-simd --enable-threads --inlining-optimizing --always-inline-max-function-size 256 --flexible-inline-max-function-size 512 --inline-functions-with-loops",
+    "build:opt-st": "wasm-opt -O3 --strip-producers --strip-target-features dist/textsift.wasm -o dist/textsift.wasm --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals --enable-relaxed-simd --inlining-optimizing --always-inline-max-function-size 256 --flexible-inline-max-function-size 512 --inline-functions-with-loops",
+    "build:opt-mt": "wasm-opt -O3 --strip-producers --strip-target-features dist/textsift-mt.wasm -o dist/textsift-mt.wasm --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals --enable-relaxed-simd --enable-threads --inlining-optimizing --always-inline-max-function-size 256 --flexible-inline-max-function-size 512 --inline-functions-with-loops",
     "typecheck": "bun x tsc --noEmit",
     "test": "bun x playwright test",
     "test:zig": "mise exec -- zig test src/zig/math.zig",
@@ -61,10 +61,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/teamchong/pii-wasm.git"
+    "url": "git+https://github.com/teamchong/textsift.git"
   },
   "bugs": {
-    "url": "https://github.com/teamchong/pii-wasm/issues"
+    "url": "https://github.com/teamchong/textsift/issues"
   },
-  "homepage": "https://teamchong.github.io/pii-wasm/"
+  "homepage": "https://teamchong.github.io/textsift/"
 }

@@ -26,7 +26,7 @@
  * `expertSlicePointers` below.
  */
 
-import type { PiiWasmExports, WeightTensorInfo } from "../backends/wasm.js";
+import type { TextsiftExports, WeightTensorInfo } from "../backends/wasm.js";
 import type { MtPool } from "./mt-pool.js";
 import {
   expertDispatchParallel,
@@ -102,7 +102,7 @@ export interface MultiThreadContext {
 }
 
 export async function expertDispatch(
-  wasm: PiiWasmExports,
+  wasm: TextsiftExports,
   /** f32 [T, D]; the caller has already widened hidden from fp16. */
   hiddenF32Ptr: number,
   outputPtr: number,

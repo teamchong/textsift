@@ -1,7 +1,7 @@
 /**
  * Model loader — Stage 0 (minimal).
  *
- * Fetches the two small JSON artifacts pii-wasm owns (parsing + decoding):
+ * Fetches the two small JSON artifacts textsift owns (parsing + decoding):
  *   - `config.json` — architecture, `id2label`, context length.
  *   - `viterbi_calibration.json` — the 6 CRF transition biases.
  *
@@ -15,7 +15,7 @@
 
 import { PrivacyFilterError, type ProgressEvent } from "../types.js";
 
-/** Narrow view of the `config.json` fields pii-wasm reads. */
+/** Narrow view of the `config.json` fields textsift reads. */
 export interface ModelConfig {
   readonly model_type: string;
   readonly architectures: readonly string[];

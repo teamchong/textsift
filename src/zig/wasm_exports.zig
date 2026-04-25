@@ -1,4 +1,4 @@
-// WASM32 exports for the pii-wasm Stage 1 inference engine.
+// WASM32 exports for the textsift Stage 1 inference engine.
 //
 // This module is the sole compilation unit. We target
 // `wasm32-freestanding` with `simd128` + `relaxed_simd` CPU features —

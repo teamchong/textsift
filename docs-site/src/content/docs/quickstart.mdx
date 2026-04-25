@@ -6,14 +6,14 @@ description: Install, detect PII, redact text — in three code blocks.
 ## Install
 
 ```sh
-npm install pii-wasm
+npm install textsift
 # or: pnpm add / bun add / yarn add
 ```
 
 ## Redact
 
 ```ts
-import { PrivacyFilter } from "pii-wasm";
+import { PrivacyFilter } from "textsift";
 
 const filter = await PrivacyFilter.create();
 
@@ -55,7 +55,7 @@ const gpu = await PrivacyFilter.create({ backend: "webgpu" });
 const wasm = await PrivacyFilter.create({ backend: "wasm" });
 ```
 
-See the [Backends](/pii-wasm/backends/) page for the full compatibility table.
+See the [Backends](/textsift/backends/) page for the full compatibility table.
 
 ## Dispose when done
 

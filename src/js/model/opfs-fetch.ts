@@ -18,7 +18,7 @@
  * second-visit fast path.
  */
 
-const OPFS_DIR = "pii-wasm-v1";
+const OPFS_DIR = "textsift-v1";
 
 function opfsKey(url: string): string {
   // FNV-1a on the URL + the trailing basename → human-readable + unique.

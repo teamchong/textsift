@@ -12,7 +12,7 @@
  * forward pass.
  */
 
-import type { Int4BlockWeight, PiiWasmExports, WeightTensorInfo } from "../backends/wasm.js";
+import type { Int4BlockWeight, TextsiftExports, WeightTensorInfo } from "../backends/wasm.js";
 import { blockForward, type BlockWeights, type BlockConfig } from "./block.js";
 import type { MultiThreadContext } from "./expert.js";
 import { buildRopeTables, type YarnRopeConfig } from "./rope.js";
@@ -48,7 +48,7 @@ export interface ModelConfig extends BlockConfig {
  * by the caller. All other scratch is bump-alloc'd.
  */
 export async function modelForward(
-  wasm: PiiWasmExports,
+  wasm: TextsiftExports,
   inputIdsPtr: number,
   logitsPtr: number,
   weights: ModelWeights,

@@ -3,15 +3,15 @@ import starlight from "@astrojs/starlight";
 
 export default defineConfig({
   site: "https://teamchong.github.io",
-  base: "/pii-wasm",
+  base: "/textsift",
   integrations: [
     starlight({
-      title: "pii-wasm",
+      title: "textsift",
       social: [
         {
           icon: "github",
           label: "GitHub",
-          href: "https://github.com/teamchong/pii-wasm",
+          href: "https://github.com/teamchong/textsift",
         },
       ],
       sidebar: [

@@ -1,19 +1,19 @@
 ---
-title: pii-wasm
+title: textsift
 description: Browser-native PII detection and redaction using openai/privacy-filter.
 template: splash
 hero:
   tagline: OpenAI's privacy-filter model, running entirely in your browser. No backend, no network calls, no text ever leaves the device.
   actions:
     - text: Quickstart
-      link: /pii-wasm/quickstart/
+      link: /textsift/quickstart/
       icon: right-arrow
       variant: primary
     - text: API Reference
-      link: /pii-wasm/api/
+      link: /textsift/api/
       variant: minimal
     - text: GitHub
-      link: https://github.com/teamchong/pii-wasm
+      link: https://github.com/teamchong/textsift
       icon: external
       variant: minimal
 ---
@@ -24,7 +24,7 @@ import { Card, CardGrid } from "@astrojs/starlight/components";
 
 OpenAI released [openai/privacy-filter](https://huggingface.co/openai/privacy-filter) on 2026-04-20 — a 1.5B-parameter MoE token classifier (50M active) for PII detection, Apache 2.0. It reaches **96-97% F1 on PII-Masking-300k** and runs on a laptop.
 
-The gap: the official SDK is Python. transformers.js runs it on WebGPU but has no CPU fallback. **`pii-wasm` is the only package that runs this model end-to-end in the browser with both WebGPU and CPU paths.**
+The gap: the official SDK is Python. transformers.js runs it on WebGPU but has no CPU fallback. **`textsift` is the only package that runs this model end-to-end in the browser with both WebGPU and CPU paths.**
 
 ## Features
 
@@ -52,7 +52,7 @@ The gap: the official SDK is Python. transformers.js runs it on WebGPU but has n
 ## 30-second example
 
 ```ts
-import { PrivacyFilter } from "pii-wasm";
+import { PrivacyFilter } from "textsift";
 
 const filter = await PrivacyFilter.create();
 const result = await filter.redact(
@@ -71,7 +71,7 @@ console.log(result.spans);
 
 ## How it compares
 
-| | tjs (WebGPU) | **pii-wasm (WebGPU)** | pii-wasm (WASM) |
+| | tjs (WebGPU) | **textsift (WebGPU)** | textsift (WASM) |
 |---|---:|---:|---:|
 | Forward — short | 29 ms | **7 ms** | 66 ms |
 | Forward — medium | 39 ms | **12 ms** | 158 ms |
@@ -80,4 +80,4 @@ console.log(result.spans);
 
 *M-series MacBook, Chromium 147, median of 5 runs after 2 warmups.*
 
-For **CPU-only environments** (corporate Chrome without WebGPU, Firefox with `dom.webgpu.enabled=false`, server-side Node), pii-wasm is the only working path — transformers.js fails session creation on this model's WASM device due to missing ORT-Web kernels (`GatherBlockQuantized`, `MatMulNBits`).
+For **CPU-only environments** (corporate Chrome without WebGPU, Firefox with `dom.webgpu.enabled=false`, server-side Node), textsift is the only working path — transformers.js fails session creation on this model's WASM device due to missing ORT-Web kernels (`GatherBlockQuantized`, `MatMulNBits`).

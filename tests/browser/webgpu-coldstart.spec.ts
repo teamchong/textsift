@@ -10,7 +10,7 @@ test("webgpu cold-start timing breakdown", async ({ page }) => {
   test.setTimeout(5 * 60_000);
   page.on("console", (msg) => {
     const text = msg.text();
-    if (text.includes("[pii-wasm]")) console.log(text);
+    if (text.includes("[textsift]")) console.log(text);
   });
 
   await page.goto("/tests/browser/webgpu-coldstart.html");

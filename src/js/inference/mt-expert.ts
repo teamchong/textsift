@@ -12,7 +12,7 @@
  * the caller. Each worker only touches its assigned slot.
  */
 
-import type { PiiWasmExports, WeightTensorInfo } from "../backends/wasm.js";
+import type { TextsiftExports, WeightTensorInfo } from "../backends/wasm.js";
 import type { ExpertWeights, ExpertConfig } from "./expert.js";
 import type { MtPool, KernelCall, WorkerScript } from "./mt-pool.js";
 
@@ -62,7 +62,7 @@ function expertBiasPointer(tensor: WeightTensorInfo, expertIdx: number): number 
  */
 export async function expertDispatchParallel(
   pool: MtPool,
-  wasm: PiiWasmExports,
+  wasm: TextsiftExports,
   hiddenF32Ptr: number,
   outputPtr: number,
   routingIndicesPtr: number,

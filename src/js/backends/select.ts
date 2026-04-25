@@ -17,7 +17,7 @@ export interface SelectOptions {
   bundle: LoadedModelBundle;
   /** Explicit backend selection. Defaults to the transformers.js path. */
   backend?: "auto" | "transformers-js" | "wasm" | "webgpu";
-  /** Override for the `pii.wasm` module URL. Defaults to the bytes inlined into the JS bundle. */
+  /** Override for the `textsift.wasm` module URL. Defaults to the bytes inlined into the JS bundle. */
   wasmModuleUrl?: string | URL;
 }
 

@@ -1,4 +1,4 @@
-# pii-wasm
+# textsift
 
 **PII detection and redaction for the browser and Node, powered by `openai/privacy-filter`.**
 
@@ -6,18 +6,18 @@ Runs entirely on the user's device — WebGPU on capable browsers, WebAssembly +
 
 > The only npm package that runs `openai/privacy-filter` client-side with both GPU and CPU paths.
 
-[**Docs**](https://teamchong.github.io/pii-wasm/) · [**Quickstart**](https://teamchong.github.io/pii-wasm/quickstart/) · [**API**](https://teamchong.github.io/pii-wasm/api/) · [**Benchmarks**](https://teamchong.github.io/pii-wasm/benchmarks/)
+[**Docs**](https://teamchong.github.io/textsift/) · [**Quickstart**](https://teamchong.github.io/textsift/quickstart/) · [**API**](https://teamchong.github.io/textsift/api/) · [**Benchmarks**](https://teamchong.github.io/textsift/benchmarks/)
 
 ## Install
 
 ```sh
-npm install pii-wasm
+npm install textsift
 ```
 
 ## Use
 
 ```ts
-import { PrivacyFilter } from "pii-wasm";
+import { PrivacyFilter } from "textsift";
 
 const filter = await PrivacyFilter.create();
 
@@ -39,19 +39,19 @@ Detection without applying redactions:
 const { spans, containsPii } = await filter.detect(text);
 ```
 
-Batch inputs, custom markers, per-category enabling — see the [API reference](https://teamchong.github.io/pii-wasm/api/).
+Batch inputs, custom markers, per-category enabling — see the [API reference](https://teamchong.github.io/textsift/api/).
 
 ## Why
 
 OpenAI released [`openai/privacy-filter`](https://huggingface.co/openai/privacy-filter) on 2026-04-20 — a 1.5B-parameter MoE (50M active) bidirectional token classifier for PII detection. Apache 2.0. State-of-the-art on PII-Masking-300k (96% F1).
 
-The official SDK is Python. `transformers.js` runs it on WebGPU but fails on CPU — ORT-Web's WASM bundle is missing `GatherBlockQuantized` and `MatMulNBits` kernels. **pii-wasm is the only package that runs this model end-to-end in the browser on both GPU and CPU**, with a single public API.
+The official SDK is Python. `transformers.js` runs it on WebGPU but fails on CPU — ORT-Web's WASM bundle is missing `GatherBlockQuantized` and `MatMulNBits` kernels. **textsift is the only package that runs this model end-to-end in the browser on both GPU and CPU**, with a single public API.
 
 ## Performance
 
-M-series MacBook / Chromium 147, median of 5 runs after 2 warmups. Full table in [/benchmarks](https://teamchong.github.io/pii-wasm/benchmarks/):
+M-series MacBook / Chromium 147, median of 5 runs after 2 warmups. Full table in [/benchmarks](https://teamchong.github.io/textsift/benchmarks/):
 
-| | tjs (WebGPU) | **pii-wasm (WebGPU)** | speedup |
+| | tjs (WebGPU) | **textsift (WebGPU)** | speedup |
 |---|---:|---:|---:|
 | Short input | 29 ms | **7 ms** | **4.1×** |
 | Medium input | 39 ms | **12 ms** | **3.2×** |
@@ -76,7 +76,7 @@ const wasm = await PrivacyFilter.create({ backend: "wasm" });    // universal
 const auto = await PrivacyFilter.create({ backend: "auto" });    // tjs baseline
 ```
 
-All three produce byte-identical spans on the same input. See [/backends](https://teamchong.github.io/pii-wasm/backends/).
+All three produce byte-identical spans on the same input. See [/backends](https://teamchong.github.io/textsift/backends/).
 
 ## Architecture
 
@@ -103,13 +103,13 @@ All three produce byte-identical spans on the same input. See [/backends](https:
       ↑ cached in OPFS ↑
 ```
 
-Full architecture details in [/architecture](https://teamchong.github.io/pii-wasm/architecture/).
+Full architecture details in [/architecture](https://teamchong.github.io/textsift/architecture/).
 
 ## Caveats
 
 `openai/privacy-filter` is a detection aid, **not an anonymization guarantee**. No dedicated SSN / passport label. English-first (Japanese ~88% F1, other languages untested). Short text under-contextualizes.
 
-See the [caveats page](https://teamchong.github.io/pii-wasm/caveats/) and OpenAI's [model card](https://cdn.openai.com/pdf/c66281ed-b638-456a-8ce1-97e9f5264a90/OpenAI-Privacy-Filter-Model-Card.pdf) before treating redacted output as compliance-safe.
+See the [caveats page](https://teamchong.github.io/textsift/caveats/) and OpenAI's [model card](https://cdn.openai.com/pdf/c66281ed-b638-456a-8ce1-97e9f5264a90/OpenAI-Privacy-Filter-Model-Card.pdf) before treating redacted output as compliance-safe.
 
 ## Development
 

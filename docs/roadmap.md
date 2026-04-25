@@ -1,6 +1,6 @@
 # Roadmap
 
-This is the execution plan for `@yourorg/pii-wasm`. Stage 0 ships a working
+This is the execution plan for `@teamchong/textsift`. Stage 0 ships a working
 library by wrapping transformers.js behind the public API. Stages 1–3
 replace internals with progressively faster and more compact inference
 paths. The public API doesn't change between stages.
@@ -41,7 +41,7 @@ inputs through the same output pipeline as upstream.
       labelled fixture are model behaviour, not a wiring defect.
 - [x] Demo page (`demo/index.html`) — browser-tested via CDP.
 
-**Ship gate (met).** Parity confirmed transitively: pii-wasm ↔
+**Ship gate (met).** Parity confirmed transitively: textsift ↔
 transformers.js pipeline is byte-exact on the same logits; the
 pipeline shares the model with `opf` CLI so decoding agreement is
 mechanical. Chrome benchmark captured in `docs/benchmarks.md`
@@ -80,9 +80,9 @@ Target: 1.5–2× faster than Stage 0 Chrome warm-inference
 - [x] `src/zig/wasm_exports.zig` — bump allocator (`heap_init` /
       `alloc` / `reset` / `heap_used`), plumbing smoke-test helpers
       (`echo`, `sum_i32`).
-- [x] Built via `npm run build:zig` → `dist/pii.wasm`
+- [x] Built via `npm run build:zig` → `dist/textsift.wasm`
       (`wasm32-freestanding`, `simd128` + `relaxed_simd`).
-- [x] JS bridge `src/js/backends/wasm.ts` with `loadPiiWasm()`
+- [x] JS bridge `src/js/backends/wasm.ts` with `loadTextsift()`
       loader + `WasmBackend` class (`forward()` throws until
       kernels land).
 - [x] End-to-end round-trip verified: echo ABI, JS→WASM memory
@@ -213,7 +213,7 @@ baselines and blocks on regression. Zig unit tests for pure helpers
       `bench.spec.ts`, `public-api.html` + spec) running under
       Chromium with `--enable-unsafe-webgpu --use-angle=metal` so
       the transformers.js WebGPU path is real, not swiftshader.
-- [x] Inline `dist/pii.wasm` as a Uint8Array via
+- [x] Inline `dist/textsift.wasm` as a Uint8Array via
       `scripts/inline-wasm.mjs` — the JS bundle ships the .wasm bytes
       so there's no separate HTTP round-trip and no URL-resolution
       quirk when the library is re-bundled.
@@ -260,7 +260,7 @@ Replace the custom `pii-weights.bin` path with direct reading of
       exports (`weights_load` et al.) + `readU32LE`/`readU64LE`
       helpers removed. Composition fixture specs pruned from
       `tests/fixtures/manifest.json` (per-kernel fixtures stay).
-      `WeightDType.I4_BLOCK32_SYM` removed. dist/pii.wasm: 25 KB.
+      `WeightDType.I4_BLOCK32_SYM` removed. dist/textsift.wasm: 25 KB.
 
 **OPFS note.** With Stage 3 NO-GO (2026-04-23), the weight size
 Stage 1 carries equals what Stage 0 already ships: ~772 MB

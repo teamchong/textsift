@@ -1,5 +1,5 @@
 /**
- * Public types for pii-wasm.
+ * Public types for textsift.
  *
  * The public API is intentionally narrow and hides the following
  * internal complexity:
@@ -107,8 +107,8 @@ export interface CreateOptions {
   backend?: "auto" | "wasm" | "webgpu";
 
   /**
-   * Override the URL of the `pii.wasm` module. Defaults to a sibling of
-   * the bundled JS (`./pii.wasm`). Required when hosting the .wasm at
+   * Override the URL of the `textsift.wasm` module. Defaults to a sibling of
+   * the bundled JS (`./textsift.wasm`). Required when hosting the .wasm at
    * a different path than the bundled entry point.
    */
   wasmModuleUrl?: string;

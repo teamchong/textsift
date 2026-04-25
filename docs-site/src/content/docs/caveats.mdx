@@ -1,13 +1,13 @@
 ---
 title: Caveats
-description: What pii-wasm does well, and what it doesn't.
+description: What textsift does well, and what it doesn't.
 ---
 
 ## From OpenAI's own model card
 
 > Like all models, Privacy Filter can make mistakes. It may miss uncommon identifiers or ambiguous references, and it can over- or under-redact information when context is limited, especially in shorter text. In high-sensitivity areas such as legal, medical, and financial workflows, human review and domain-specific evaluation and fine-tuning remain important.
 
-`pii-wasm` is a production-grade inference engine for a model that itself is an aid, not an anonymization guarantee. Treat it as such.
+`textsift` is a production-grade inference engine for a model that itself is an aid, not an anonymization guarantee. Treat it as such.
 
 ## Known model-level gaps
 
@@ -29,7 +29,7 @@ description: What pii-wasm does well, and what it doesn't.
 - **Regex-level guarantees.** For known patterns (credit-card Luhn checks, US SSN structure validation), a regex library like `redact-pii` is faster and more deterministic. Run both for belt-and-braces.
 - **Multi-language deployments.** If your users write in Chinese, Arabic, or Hindi, consider Microsoft Presidio or a cloud DLP with native multilingual training.
 
-## When to use `pii-wasm`
+## When to use `textsift`
 
 - Client-side redaction in browser UIs (form fields, comment boxes, chat prompts before hitting a cloud LLM).
 - Browser-extension "warn before paste" prompts.

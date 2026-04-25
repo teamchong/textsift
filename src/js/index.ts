@@ -1,5 +1,5 @@
 /**
- * pii-wasm — PII detection and redaction, browser + Node.
+ * textsift — PII detection and redaction, browser + Node.
  *
  * Public API surface:
  *
@@ -22,8 +22,8 @@ export { PrivacyFilter } from "./privacy-filter.js";
 export {
   WasmBackend,
   sharedMemorySupported,
-  loadPiiWasm,
-  loadPiiWasmShared,
+  loadTextsift,
+  loadTextsiftShared,
 } from "./backends/wasm.js";
 export { WebGpuBackend } from "./backends/webgpu.js";
 export { ModelLoader } from "./model/loader.js";

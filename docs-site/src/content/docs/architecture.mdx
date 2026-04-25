@@ -1,6 +1,6 @@
 ---
 title: Architecture
-description: How pii-wasm turns text into redacted output, from tokenizer to spans.
+description: How textsift turns text into redacted output, from tokenizer to spans.
 ---
 
 ## Pipeline
@@ -79,7 +79,7 @@ Thin wrapper around `AutoModelForTokenClassification`. We bypass `pipeline('toke
 
 ### Zig + WASM (Stage 1)
 
-Hand-written kernels in `src/zig/wasm_exports.zig`, compiled with `-target wasm32-freestanding -mcpu=generic+simd128+relaxed_simd -O ReleaseFast`. `dist/pii.wasm` is ~25 KB, inlined into the JS bundle.
+Hand-written kernels in `src/zig/wasm_exports.zig`, compiled with `-target wasm32-freestanding -mcpu=generic+simd128+relaxed_simd -O ReleaseFast`. `dist/textsift.wasm` is ~25 KB, inlined into the JS bundle.
 
 Kernels: embed lookup, RMSNorm, int4 matmul (three X×Out type variants), RoPE, banded attention with sinks, swiGLU with clamp, QMoE dispatch, scatter-add, cast, softmax, topK.
 

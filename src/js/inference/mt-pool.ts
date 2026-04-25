@@ -23,12 +23,12 @@
  * the package ships as one bundle with no separate worker file.
  */
 
-import { PII_WASM_MT_BYTES } from "../backends/pii-wasm-inline.js";
-import type { PiiWasmExports } from "../backends/wasm.js";
+import { TEXTSIFT_MT_BYTES } from "../backends/textsift-inline.js";
+import type { TextsiftExports } from "../backends/wasm.js";
 
 /** One WASM kernel call: function name + args (all numbers). */
 export interface KernelCall {
-  kernel: keyof PiiWasmExports;
+  kernel: keyof TextsiftExports;
   args: number[];
 }
 
@@ -41,7 +41,7 @@ export type WorkerScript = readonly KernelCall[];
  * Add a new kernel here when you want to call it from inside a
  * worker script.
  */
-const DISPATCHABLE_KERNELS: readonly (keyof PiiWasmExports)[] = [
+const DISPATCHABLE_KERNELS: readonly (keyof TextsiftExports)[] = [
   "echo",
   "matmul_fp16_x_int4block",
   "matmul_fp16_x_int4block_out_f32",
@@ -392,7 +392,7 @@ export class MtPool {
             workerIdx: i,
             kernelNames: DISPATCHABLE_KERNELS,
             stackTop: this.stackTops[i] ?? null,
-            wasmBytes: PII_WASM_MT_BYTES,
+            wasmBytes: TEXTSIFT_MT_BYTES,
           });
         }),
       );

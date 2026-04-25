@@ -18,7 +18,7 @@ export default defineConfig({
     // Cross-Origin-Embedder-Policy: require-corp so SharedArrayBuffer
     // is available — required for the multi-threaded WASM backend.
     command: "python3 scripts/serve-coi.py 8123",
-    url: "http://localhost:8123/dist/pii.wasm",
+    url: "http://localhost:8123/dist/textsift.wasm",
     reuseExistingServer: !process.env.CI,
     cwd: ".",
     timeout: 15_000,

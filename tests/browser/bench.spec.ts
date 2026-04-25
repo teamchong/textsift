@@ -1,9 +1,13 @@
 /**
- * Browser perf bench: transformers.js (forced via resolver) vs our
- * Zig+WASM and WebGPU backends. Pre-warms caches so the timed cold-
- * start measurement excludes the 770 MB model download — the bench
- * measures backend init + first inference, not CDN throughput.
- * Steady-state medians are reported across several input lengths.
+ * Browser perf bench: steady-state per-forward latency for
+ * transformers.js (forced via resolver) vs our Zig+WASM and WebGPU
+ * backends. Median of 5 samples after 2 warmup iterations.
+ *
+ * This bench does NOT report cold-start numbers. Cold start is
+ * dominated by model download + storage choice, neither of which
+ * tells you anything about engine speed (and isolating engine cost
+ * from storage requires Service-Worker plumbing we deliberately
+ * skip — see benchmarks.mdx for the rationale).
  */
 
 import { test, expect } from "@playwright/test";
@@ -30,12 +34,8 @@ test("e2e perf bench vs transformers.js default", async ({ page }) => {
     throw new Error(`bench failed: ${result.error}\n${result.stack ?? ""}`);
   }
 
-  console.log("\n--- browser perf bench ---");
-  console.log(
-    `WebGPU: ${result.hasWebGPU}\n` +
-      `  cold start (caches populated, no network):  ` +
-      `tjs=${result.tjsWarmupMs.toFixed(0)}ms  wasm=${result.wasmWarmupMs.toFixed(0)}ms  gpu=${result.gpuWarmupMs.toFixed(0)}ms`,
-  );
+  console.log("\n--- browser perf bench (steady-state per-forward) ---");
+  console.log(`WebGPU: ${result.hasWebGPU}`);
   console.log(
     `  ${"text".padEnd(40)} ` +
       `${"tjs (ms)".padStart(10)} ` +

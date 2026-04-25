@@ -80,15 +80,13 @@
         const hasWebGPU = !!navigator.gpu;
         log(`WebGPU available: ${hasWebGPU}`);
 
-        // Pre-warm caches: download the model into Cache API (for tjs)
-        // and OPFS (for our backends) once, BEFORE any timed measurement.
-        // The 770 MB fetch dominates first-load and is irrelevant to
-        // anything textsift controls — it's a CDN test, not a backend
-        // benchmark. After this prelude every "cold start" measured
-        // below is honest: backend init + first inference, no network.
-        log("--- prelude: populate caches (untimed) ---");
-        const tPrelude0 = performance.now();
-        const tjsPrelude = await createTjs({
+        // We don't report a cold-start comparison — it's not isolable
+        // from storage choice without intercepting ORT-Web's worker
+        // fetch (which needs a Service Worker). See benchmarks.mdx.
+        // The bench's job is steady-state inference: warmup each
+        // backend, then report median per-forward latency.
+        log("--- warmup (untimed) ---");
+        const tjs = await createTjs({
           onProgress: (ev) => {
             if (ev.stage === "download") {
               const pct = ev.total ? Math.round((ev.loaded / ev.total) * 100) : 0;
@@ -96,39 +94,9 @@
             }
           },
         });
-        tjsPrelude.dispose();
-        const wasmPrelude = await PrivacyFilter.create({
-          backend: "wasm",
-          onProgress: (ev) => {
-            if (ev.stage === "download") {
-              const pct = ev.total ? Math.round((ev.loaded / ev.total) * 100) : 0;
-              log(`  wasm download ${ev.url.split("/").pop()}: ${pct}%`);
-            }
-          },
-        });
-        wasmPrelude.dispose();
-        log(`prelude done in ${(performance.now() - tPrelude0).toFixed(0)}ms (download cost — excluded from results below)`);
-
-        // ── COLD START (caches populated; no network) ──────────
-        // What we actually want: time from PrivacyFilter.create() to
-        // the model being ready to do inference, with model bytes
-        // already on disk.
-        log("\n--- cold start (no network) ---");
-
-        const t0 = performance.now();
-        const tjs = await createTjs();
-        const tjsWarmup = performance.now() - t0;
-        log(`transformers.js: ${tjsWarmup.toFixed(0)}ms`);
-
-        const t1 = performance.now();
         const wasm = await PrivacyFilter.create({ backend: "wasm" });
-        const wasmWarmup = performance.now() - t1;
-        log(`wasm:            ${wasmWarmup.toFixed(0)}ms`);
-
-        const t2 = performance.now();
         const gpu = await PrivacyFilter.create({ backend: "webgpu" });
-        const gpuWarmup = performance.now() - t2;
-        log(`webgpu:          ${gpuWarmup.toFixed(0)}ms`);
+        log("warmup done");
 
         const rows = [];
         for (const text of SEEDS) {
@@ -151,9 +119,6 @@
         window.__result = {
           ok: true,
           hasWebGPU,
-          tjsWarmupMs: tjsWarmup,
-          wasmWarmupMs: wasmWarmup,
-          gpuWarmupMs: gpuWarmup,
           rows,
         };
         log("\ndone");

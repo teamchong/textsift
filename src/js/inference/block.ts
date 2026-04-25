@@ -97,7 +97,7 @@ export async function blockForward(
   wasm.rms_norm(inputPtr, weights.inputLayernorm.dataOffset, normed1Ptr, T, D, config.rmsNormEps);
 
   const attnOutPtr = wasm.alloc(T * D * 2);
-  attentionForward(wasm, normed1Ptr, attnOutPtr, weights.attn, config, tables, T, maskPtr);
+  await attentionForward(wasm, normed1Ptr, attnOutPtr, weights.attn, config, tables, T, maskPtr, mt);
 
   const h1Ptr = wasm.alloc(T * D * 2);
   wasm.add_fp16(residualPtr, attnOutPtr, h1Ptr, T * D);

@@ -247,54 +247,38 @@ fn main(
             for (var w: u32 = 0u; w < 4u; w = w + 1u) {
                 let word = w_int4[word_base + w];
                 let kb = w * 8u;
-                let q0 = f32( word        & 0xFu) - zp_f;
-                let q1 = f32((word >>  4u) & 0xFu) - zp_f;
-                let q2 = f32((word >>  8u) & 0xFu) - zp_f;
-                let q3 = f32((word >> 12u) & 0xFu) - zp_f;
-                let q4 = f32((word >> 16u) & 0xFu) - zp_f;
-                let q5 = f32((word >> 20u) & 0xFu) - zp_f;
-                let q6 = f32((word >> 24u) & 0xFu) - zp_f;
-                let q7 = f32((word >> 28u) & 0xFu) - zp_f;
+                let q_lo = vec4<f32>(
+                    f32( word        & 0xFu) - zp_f,
+                    f32((word >>  4u) & 0xFu) - zp_f,
+                    f32((word >>  8u) & 0xFu) - zp_f,
+                    f32((word >> 12u) & 0xFu) - zp_f,
+                );
+                let q_hi = vec4<f32>(
+                    f32((word >> 16u) & 0xFu) - zp_f,
+                    f32((word >> 20u) & 0xFu) - zp_f,
+                    f32((word >> 24u) & 0xFu) - zp_f,
+                    f32((word >> 28u) & 0xFu) - zp_f,
+                );
 
                 let xb0 = 0u * BLOCK + kb;
-                blk0 = fma(q0, x_tile[xb0 + 0u], blk0);
-                blk0 = fma(q1, x_tile[xb0 + 1u], blk0);
-                blk0 = fma(q2, x_tile[xb0 + 2u], blk0);
-                blk0 = fma(q3, x_tile[xb0 + 3u], blk0);
-                blk0 = fma(q4, x_tile[xb0 + 4u], blk0);
-                blk0 = fma(q5, x_tile[xb0 + 5u], blk0);
-                blk0 = fma(q6, x_tile[xb0 + 6u], blk0);
-                blk0 = fma(q7, x_tile[xb0 + 7u], blk0);
+                let x0_lo = vec4<f32>(x_tile[xb0 + 0u], x_tile[xb0 + 1u], x_tile[xb0 + 2u], x_tile[xb0 + 3u]);
+                let x0_hi = vec4<f32>(x_tile[xb0 + 4u], x_tile[xb0 + 5u], x_tile[xb0 + 6u], x_tile[xb0 + 7u]);
+                blk0 = blk0 + dot(q_lo, x0_lo) + dot(q_hi, x0_hi);
 
                 let xb1 = 1u * BLOCK + kb;
-                blk1 = fma(q0, x_tile[xb1 + 0u], blk1);
-                blk1 = fma(q1, x_tile[xb1 + 1u], blk1);
-                blk1 = fma(q2, x_tile[xb1 + 2u], blk1);
-                blk1 = fma(q3, x_tile[xb1 + 3u], blk1);
-                blk1 = fma(q4, x_tile[xb1 + 4u], blk1);
-                blk1 = fma(q5, x_tile[xb1 + 5u], blk1);
-                blk1 = fma(q6, x_tile[xb1 + 6u], blk1);
-                blk1 = fma(q7, x_tile[xb1 + 7u], blk1);
+                let x1_lo = vec4<f32>(x_tile[xb1 + 0u], x_tile[xb1 + 1u], x_tile[xb1 + 2u], x_tile[xb1 + 3u]);
+                let x1_hi = vec4<f32>(x_tile[xb1 + 4u], x_tile[xb1 + 5u], x_tile[xb1 + 6u], x_tile[xb1 + 7u]);
+                blk1 = blk1 + dot(q_lo, x1_lo) + dot(q_hi, x1_hi);
 
                 let xb2 = 2u * BLOCK + kb;
-                blk2 = fma(q0, x_tile[xb2 + 0u], blk2);
-                blk2 = fma(q1, x_tile[xb2 + 1u], blk2);
-                blk2 = fma(q2, x_tile[xb2 + 2u], blk2);
-                blk2 = fma(q3, x_tile[xb2 + 3u], blk2);
-                blk2 = fma(q4, x_tile[xb2 + 4u], blk2);
-                blk2 = fma(q5, x_tile[xb2 + 5u], blk2);
-                blk2 = fma(q6, x_tile[xb2 + 6u], blk2);
-                blk2 = fma(q7, x_tile[xb2 + 7u], blk2);
+                let x2_lo = vec4<f32>(x_tile[xb2 + 0u], x_tile[xb2 + 1u], x_tile[xb2 + 2u], x_tile[xb2 + 3u]);
+                let x2_hi = vec4<f32>(x_tile[xb2 + 4u], x_tile[xb2 + 5u], x_tile[xb2 + 6u], x_tile[xb2 + 7u]);
+                blk2 = blk2 + dot(q_lo, x2_lo) + dot(q_hi, x2_hi);
 
                 let xb3 = 3u * BLOCK + kb;
-                blk3 = fma(q0, x_tile[xb3 + 0u], blk3);
-                blk3 = fma(q1, x_tile[xb3 + 1u], blk3);
-                blk3 = fma(q2, x_tile[xb3 + 2u], blk3);
-                blk3 = fma(q3, x_tile[xb3 + 3u], blk3);
-                blk3 = fma(q4, x_tile[xb3 + 4u], blk3);
-                blk3 = fma(q5, x_tile[xb3 + 5u], blk3);
-                blk3 = fma(q6, x_tile[xb3 + 6u], blk3);
-                blk3 = fma(q7, x_tile[xb3 + 7u], blk3);
+                let x3_lo = vec4<f32>(x_tile[xb3 + 0u], x_tile[xb3 + 1u], x_tile[xb3 + 2u], x_tile[xb3 + 3u]);
+                let x3_hi = vec4<f32>(x_tile[xb3 + 4u], x_tile[xb3 + 5u], x_tile[xb3 + 6u], x_tile[xb3 + 7u]);
+                blk3 = blk3 + dot(q_lo, x3_lo) + dot(q_hi, x3_hi);
             }
             acc0 = fma(blk0, scale, acc0);
             acc1 = fma(blk1, scale, acc1);

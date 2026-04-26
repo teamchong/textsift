@@ -44,6 +44,11 @@ export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) c.napi
     register(env, exports, "metalReleaseBuffer", napiMetalReleaseBuffer) catch return null;
     register(env, exports, "metalReadBuffer", napiMetalReadBuffer) catch return null;
     register(env, exports, "metalDispatchOneShot", napiMetalDispatchOneShot) catch return null;
+    register(env, exports, "metalBeginEncoder", napiMetalBeginEncoder) catch return null;
+    register(env, exports, "metalEnqueueDispatch", napiMetalEnqueueDispatch) catch return null;
+    register(env, exports, "metalSubmitAndReadback", napiMetalSubmitAndReadback) catch return null;
+    register(env, exports, "metalWriteBuffer", napiMetalWriteBuffer) catch return null;
+    register(env, exports, "metalCreateEmptyBuffer", napiMetalCreateEmptyBuffer) catch return null;
     return exports;
 }
 
@@ -1342,6 +1347,160 @@ fn napiMetalDispatchOneShot(env: c.napi_env, info: c.napi_callback_info) callcon
     var u: c.napi_value = undefined;
     _ = c.napi_get_undefined(env, &u);
     return u;
+}
+
+fn napiMetalBeginEncoder(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argc: usize = 1; var argv: [1]c.napi_value = undefined;
+    _ = c.napi_get_cb_info(env, info, &argc, &argv, null, null);
+    if (argc < 1) return napiThrow(env, "metalBeginEncoder(handle) requires 1 arg");
+    var raw: u64 = 0; var lossless: bool = false;
+    if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok or raw == 0) {
+        return napiThrow(env, "argument 0 must be backend BigInt");
+    }
+    const b: *metal.Backend = @ptrFromInt(@as(usize, @intCast(raw)));
+    const e = metal.beginEncoder(b) catch return napiThrow(env, "metal: beginEncoder failed");
+    var bn: c.napi_value = undefined;
+    if (c.napi_create_bigint_uint64(env, @intCast(@intFromPtr(e)), &bn) != c.napi_ok) {
+        return napiThrow(env, "napi: failed to create encoder handle");
+    }
+    return bn;
+}
+
+fn napiMetalEnqueueDispatch(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argc: usize = 5; var argv: [5]c.napi_value = undefined;
+    _ = c.napi_get_cb_info(env, info, &argc, &argv, null, null);
+    if (argc < 5) return napiThrow(env, "metalEnqueueDispatch(enc, name, bindings, grid, threadgroup) requires 5 args");
+
+    var raw: u64 = 0; var lossless: bool = false;
+    if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok or raw == 0) {
+        return napiThrow(env, "argument 0 must be encoder BigInt");
+    }
+    const e: *metal.Encoder = @ptrFromInt(@as(usize, @intCast(raw)));
+
+    const name_buf = napiGetString(env, argv[1], "argument 1 must be string (name)") orelse return null;
+    defer std.heap.c_allocator.free(name_buf);
+
+    const n = napiArrayLen(env, argv[2]) orelse return napiThrow(env, "argument 2 must be array (bindings)");
+    if (n > 16) return napiThrow(env, "too many bindings");
+    var bindings: [16]metal.Binding = undefined;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const item = napiArrayGet(env, argv[2], i) orelse return napiThrow(env, "bindings[i]");
+        const idx_v = napiNamedProperty(env, item, "index") orelse return napiThrow(env, "bindings[i].index");
+        const idx = napiGetU32(env, idx_v, "bindings[i].index") orelse return null;
+        var bytes_v: c.napi_value = undefined;
+        if (c.napi_get_named_property(env, item, "bytes", &bytes_v) == c.napi_ok) {
+            var t: c.napi_valuetype = undefined;
+            if (c.napi_typeof(env, bytes_v, &t) == c.napi_ok and t != c.napi_undefined and t != c.napi_null) {
+                const bytes = napiGetUint8Array(env, bytes_v, "bindings[i].bytes") orelse return null;
+                bindings[i] = .{ .bytes = .{ .index = idx, .bytes = bytes } };
+                continue;
+            }
+        }
+        const ptr_v = napiNamedProperty(env, item, "bufPtr") orelse return napiThrow(env, "bindings[i] needs bytes or bufPtr");
+        var bufRaw: u64 = 0;
+        if (c.napi_get_value_bigint_uint64(env, ptr_v, &bufRaw, &lossless) != c.napi_ok or bufRaw == 0) {
+            return napiThrow(env, "bindings[i].bufPtr must be non-null BigInt");
+        }
+        const buf: metal.cb.TsMetalBuffer = @ptrFromInt(@as(usize, @intCast(bufRaw)));
+        var off: u32 = 0;
+        var off_v: c.napi_value = undefined;
+        if (c.napi_get_named_property(env, item, "offset", &off_v) == c.napi_ok) {
+            var t: c.napi_valuetype = undefined;
+            if (c.napi_typeof(env, off_v, &t) == c.napi_ok and t == c.napi_number) {
+                off = napiGetU32(env, off_v, "bindings[i].offset") orelse return null;
+            }
+        }
+        bindings[i] = .{ .buffer = .{ .index = idx, .buf = buf, .offset = off } };
+    }
+
+    const grid_arr = argv[3]; const tg_arr = argv[4];
+    const gx = napiGetU32(env, napiArrayGet(env, grid_arr, 0) orelse return napiThrow(env, "grid[0]"), "grid[0]") orelse return null;
+    const gy = napiGetU32(env, napiArrayGet(env, grid_arr, 1) orelse return napiThrow(env, "grid[1]"), "grid[1]") orelse return null;
+    const gz = napiGetU32(env, napiArrayGet(env, grid_arr, 2) orelse return napiThrow(env, "grid[2]"), "grid[2]") orelse return null;
+    const tx = napiGetU32(env, napiArrayGet(env, tg_arr, 0) orelse return napiThrow(env, "tg[0]"), "tg[0]") orelse return null;
+    const ty = napiGetU32(env, napiArrayGet(env, tg_arr, 1) orelse return napiThrow(env, "tg[1]"), "tg[1]") orelse return null;
+    const tz = napiGetU32(env, napiArrayGet(env, tg_arr, 2) orelse return napiThrow(env, "tg[2]"), "tg[2]") orelse return null;
+
+    metal.enqueueOnEncoder(e, name_buf, bindings[0..n], .{ gx, gy, gz }, .{ tx, ty, tz }) catch |err| {
+        return switch (err) {
+            metal.MetalError.UnknownKernel => napiThrow(env, "metal: unknown kernel name"),
+            metal.MetalError.PipelineCreateFailed => napiThrow(env, "metal: pipeline creation failed"),
+            else => napiThrow(env, "metal: enqueueDispatch failed"),
+        };
+    };
+    var u: c.napi_value = undefined;
+    _ = c.napi_get_undefined(env, &u);
+    return u;
+}
+
+fn napiMetalSubmitAndReadback(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argc: usize = 4; var argv: [4]c.napi_value = undefined;
+    _ = c.napi_get_cb_info(env, info, &argc, &argv, null, null);
+    if (argc < 4) return napiThrow(env, "metalSubmitAndReadback(enc, outBufPtr, offset, byteLen) requires 4 args");
+
+    var raw: u64 = 0; var lossless: bool = false;
+    if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok or raw == 0) {
+        return napiThrow(env, "argument 0 must be encoder BigInt");
+    }
+    const e: *metal.Encoder = @ptrFromInt(@as(usize, @intCast(raw)));
+
+    var bufRaw: u64 = 0;
+    if (c.napi_get_value_bigint_uint64(env, argv[1], &bufRaw, &lossless) != c.napi_ok or bufRaw == 0) {
+        return napiThrow(env, "argument 1 must be buffer BigInt");
+    }
+    const buf: metal.cb.TsMetalBuffer = @ptrFromInt(@as(usize, @intCast(bufRaw)));
+    const offset = napiGetU32(env, argv[2], "argument 2 must be u32 (offset)") orelse return null;
+    const byte_len = napiGetU32(env, argv[3], "argument 3 must be u32 (byteLen)") orelse return null;
+
+    var ab: c.napi_value = undefined;
+    var data_ptr: ?*anyopaque = null;
+    if (c.napi_create_arraybuffer(env, byte_len, &data_ptr, &ab) != c.napi_ok) {
+        return napiThrow(env, "napi: alloc out ArrayBuffer failed");
+    }
+    var typed: c.napi_value = undefined;
+    if (c.napi_create_typedarray(env, c.napi_uint8_array, byte_len, ab, 0, &typed) != c.napi_ok) {
+        return napiThrow(env, "napi: alloc Uint8Array failed");
+    }
+    const out = @as([*]u8, @ptrCast(data_ptr.?))[0..byte_len];
+    metal.submitAndReadback(e, buf, offset, out) catch return napiThrow(env, "metal: submitAndReadback failed");
+    return typed;
+}
+
+fn napiMetalWriteBuffer(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argc: usize = 3; var argv: [3]c.napi_value = undefined;
+    _ = c.napi_get_cb_info(env, info, &argc, &argv, null, null);
+    if (argc < 3) return napiThrow(env, "metalWriteBuffer(bufPtr, offset, bytes) requires 3 args");
+    var raw: u64 = 0; var lossless: bool = false;
+    if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok or raw == 0) {
+        return napiThrow(env, "argument 0 must be buffer BigInt");
+    }
+    const buf: metal.cb.TsMetalBuffer = @ptrFromInt(@as(usize, @intCast(raw)));
+    const offset = napiGetU32(env, argv[1], "argument 1 must be u32 (offset)") orelse return null;
+    const bytes = napiGetUint8Array(env, argv[2], "argument 2 must be Uint8Array") orelse return null;
+    metal.writeBuffer(buf, offset, bytes);
+    var u: c.napi_value = undefined;
+    _ = c.napi_get_undefined(env, &u);
+    return u;
+}
+
+fn napiMetalCreateEmptyBuffer(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argc: usize = 2; var argv: [2]c.napi_value = undefined;
+    _ = c.napi_get_cb_info(env, info, &argc, &argv, null, null);
+    if (argc < 2) return napiThrow(env, "metalCreateEmptyBuffer(handle, byteLen) requires 2 args");
+    var raw: u64 = 0; var lossless: bool = false;
+    if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok or raw == 0) {
+        return napiThrow(env, "argument 0 must be backend BigInt");
+    }
+    const b: *metal.Backend = @ptrFromInt(@as(usize, @intCast(raw)));
+    const len = napiGetU32(env, argv[1], "argument 1 must be u32 (byteLen)") orelse return null;
+    const buf = metal.createEmptyBuffer(b, len) catch return napiThrow(env, "metal: createEmptyBuffer failed");
+    var bn: c.napi_value = undefined;
+    if (c.napi_create_bigint_uint64(env, @intCast(@intFromPtr(buf)), &bn) != c.napi_ok) {
+        metal.releaseBuffer(buf);
+        return napiThrow(env, "napi: failed to create buffer handle");
+    }
+    return bn;
 }
 
 fn napiBenchDispatch(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {

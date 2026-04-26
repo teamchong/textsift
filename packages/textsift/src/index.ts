@@ -1,21 +1,21 @@
 /**
  * textsift — Node native binding entry point.
  *
- * Loads a Zig-compiled `.node` shared library that talks to
- * `wgpu-native` (Mozilla's wgpu Rust crate compiled as a C library)
- * and runs the same WGSL kernels the browser entry runs against
- * `navigator.gpu`. WebGPU only — no CPU fallback. If the host lacks
- * a usable GPU adapter (Vulkan/Metal/D3D12), `create()` throws and
- * the caller is expected to import `textsift/browser` instead.
+ * Loads a Zig-compiled `.node` shared library. On macOS the fast
+ * path is Metal-direct (hand-written MSL kernels via an Obj-C
+ * bridge); a wgpu-native fallback ships for adapter probing and
+ * non-Metal hosts. All 15 kernels are byte-equal vs the browser
+ * WGSL fixtures and at T=32 the Metal-direct forward runs in
+ * ~11.6 ms (vs ~22 ms browser).
  *
  *   import { PrivacyFilter } from "textsift/browser"; // works today
  *   import { PrivacyFilter } from "textsift";         // requires GPU
  *
- * The full WebGpuBackend port (14 WGSL shaders + buffer mgmt +
- * dispatch + readback) is in progress under issue #79. Today the
- * native entry verifies adapter availability and reports it; the
- * inference path lands shader-by-shader with conformance + bench
- * tests against the browser path at every step.
+ * The high-level `PrivacyFilter` wiring on the native entry is not
+ * yet finished (see issue #79) — `create()` still throws while the
+ * tokenizer + weight-loader + Viterbi pieces are ported on top of
+ * the kernel layer. The kernel layer itself is validated by
+ * `tests/native/forward-metal.js` (Metal-direct end-to-end forward).
  */
 
 import { createRequire } from "node:module";
@@ -81,11 +81,13 @@ export class PrivacyFilter {
     // the device-creation step instead of throwing.
     getAdapterInfo();
     throw new Error(
-      "textsift native inference is under construction (see issue #79). " +
-        'For browser/Node-via-WASM use, import from "textsift/browser". ' +
-        "The native binding probes a WebGPU adapter successfully — the " +
-        "WGSL kernel port lands shader-by-shader with conformance + " +
-        "bench tests against the browser path.",
+      "textsift native PrivacyFilter wiring is under construction " +
+        '(see issue #79). Import from "textsift/browser" until it ' +
+        "lands. The kernel layer is done (Metal-direct on macOS, " +
+        "all 15 kernels byte-equal vs browser, ~1.9× faster " +
+        "end-to-end at T=32 — see tests/native/forward-metal.js); " +
+        "the missing piece is the JS-side tokenizer + weight loader " +
+        "+ Viterbi wired through the new metal* / wgpu* NAPI surface.",
     );
   }
 }

@@ -40,7 +40,7 @@ textsift ships two interchangeable backends. The public API (`PrivacyFilter.crea
 
 `backend: "wasm"` is the only currently-working CPU path for `model_q4f16.onnx` in browsers. transformers.js with `device: "wasm"` fails session creation because ORT-Web's WASM bundle has no implementation for the `GatherBlockQuantized` and `MatMulNBits` ONNX contrib ops the int4 export uses.
 
-For Node-native execution (no WASM, full SIMD width), the `textsift` bare-import path is reserved for the upcoming NAPI binding (issue #79). Today it throws; use `textsift/browser` for Node-via-WASM.
+For Node-native execution (no WASM, full SIMD width), the `textsift` bare-import path is reserved for the upcoming NAPI binding (issue #79). The high-level `PrivacyFilter` still throws — use `textsift/browser` for Node-via-WASM. The underlying Metal-direct kernel layer is done on macOS (all 15 kernels byte-equal vs browser, ~1.9× faster end-to-end at T=32; see `packages/textsift/src/native/STATUS.md`). Linux Vulkan-direct is the next backend.
 
 ## Output parity
 

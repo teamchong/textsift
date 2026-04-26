@@ -14,7 +14,9 @@ Two entry points so browsers never bundle native code:
 // Browser / Node-via-WASM (today)
 import { PrivacyFilter } from "textsift/browser";
 
-// Node native NAPI binding (issue #79 — throws today)
+// Node native NAPI binding (issue #79 — PrivacyFilter throws today;
+// kernels done, Metal-direct on macOS is ~1.9× faster than browser
+// at T=32).
 import { PrivacyFilter } from "textsift";
 ```
 

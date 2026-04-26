@@ -147,8 +147,8 @@ pub const Binding = union(enum) {
 
 /// One-shot dispatch: encode a single kernel + commit + wait. Used
 /// for conformance tests where we want each kernel measured in
-/// isolation. For real forward, use `enqueueOnCommandBuffer` + a
-/// shared command buffer that batches everything.
+/// isolation. For real forward, use `beginEncoder` / `enqueueOnEncoder`
+/// / `submitAndReadback` to batch all kernels under one command buffer.
 pub fn dispatchOneShot(
     b: *Backend,
     name: []const u8,
@@ -171,4 +171,60 @@ pub fn dispatchOneShot(
     cb.ts_metal_encoder_end(enc);
     cb.ts_metal_command_buffer_commit(cmd);
     cb.ts_metal_command_buffer_wait(cmd);
+}
+
+/// Encoder-batched dispatch handle. One Metal command buffer + one
+/// shared compute encoder accumulate every kernel call until submit.
+/// Equivalent to the wgpu-native `beginEncoder` API but Metal-direct.
+pub const Encoder = struct {
+    backend: *Backend,
+    cmd: cb.TsMetalCommandBuffer,
+    enc: cb.TsMetalEncoder,
+};
+
+pub fn beginEncoder(b: *Backend) MetalError!*Encoder {
+    const cmd = cb.ts_metal_queue_command_buffer(b.queue) orelse return MetalError.EncoderCreateFailed;
+    errdefer cb.ts_metal_command_buffer_release(cmd);
+    const enc = cb.ts_metal_command_buffer_compute_encoder(cmd) orelse return MetalError.EncoderCreateFailed;
+    const e = std.heap.c_allocator.create(Encoder) catch return MetalError.OutOfMemory;
+    e.* = .{ .backend = b, .cmd = cmd, .enc = enc };
+    return e;
+}
+
+pub fn enqueueOnEncoder(
+    e: *Encoder,
+    name: []const u8,
+    bindings: []const Binding,
+    grid: [3]u32,
+    threadgroup: [3]u32,
+) MetalError!void {
+    const p = try getOrCompilePipeline(e.backend, name);
+    cb.ts_metal_encoder_set_pipeline(e.enc, p);
+    for (bindings) |bnd| {
+        switch (bnd) {
+            .bytes => |bb| cb.ts_metal_encoder_set_bytes(e.enc, bb.bytes.ptr, bb.bytes.len, bb.index),
+            .buffer => |bb| cb.ts_metal_encoder_set_buffer(e.enc, bb.buf, bb.offset, bb.index),
+        }
+    }
+    cb.ts_metal_encoder_dispatch(
+        e.enc,
+        grid[0], grid[1], grid[2],
+        threadgroup[0], threadgroup[1], threadgroup[2],
+    );
+}
+
+/// End the encoder, commit, wait, and read back `len` bytes from
+/// `out_buf` starting at `offset`. Releases the encoder handle.
+pub fn submitAndReadback(
+    e: *Encoder,
+    out_buf: cb.TsMetalBuffer,
+    offset: usize,
+    out: []u8,
+) MetalError!void {
+    cb.ts_metal_encoder_end(e.enc);
+    cb.ts_metal_command_buffer_commit(e.cmd);
+    cb.ts_metal_command_buffer_wait(e.cmd);
+    cb.ts_metal_buffer_read(out_buf, offset, out.ptr, out.len);
+    cb.ts_metal_command_buffer_release(e.cmd);
+    std.heap.c_allocator.destroy(e);
 }

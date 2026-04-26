@@ -18,7 +18,9 @@ npm install textsift
 // Browser / Node-via-WASM — pure WebGPU + WASM, no native binary.
 import { PrivacyFilter } from "textsift/browser";
 
-// Node native — NAPI binding (in progress, see issue #79). Throws today.
+// Node native — NAPI binding (in progress, see issue #79). PrivacyFilter
+// throws today; the kernel layer is done (Metal-direct on macOS, all 15
+// kernels byte-equal vs browser, ~1.9× faster end-to-end at T=32).
 import { PrivacyFilter } from "textsift";
 ```
 

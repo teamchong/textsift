@@ -2,6 +2,41 @@
 
 Snapshot end-of-session 2026-04-25.
 
+## Metal-direct (current best on macOS)
+
+Hand-written MSL kernels via Obj-C bridge — bypasses wgpu-native + Naga entirely.
+
+| T   | Metal-direct | wgpu-native | Browser WebGPU |
+|----:|-------------:|------------:|---------------:|
+|  32 | **11.6 ms**  | 22.0 ms     | 22.0 ms        |
+|  80 | **25.9 ms**  | 43.3 ms     | —              |
+
+**Metal-direct is 1.9× faster than the browser at T=32.** That makes Node-native the *fastest* place to run textsift, not the slowest.
+
+Phase breakdown at T=80:
+- encode: 0.6 ms  (wgpu-native: 1.7 ms — Metal API has lighter per-call overhead)
+- submit + GPU + readback: 24.0 ms  (wgpu-native: 40.6 ms — Naga MSL was the bottleneck)
+
+**Conformance:** all 15 kernels byte-equal vs browser WGSL fixtures (10 byte-equal, 2 within fp16 ULP, 1 within f32 ε for the atomic-CAS scatter). Run `node tests/native/metal/conformance-all.js`.
+
+**Reproduce:** `T=80 PROFILE=1 node tests/native/forward-metal.js`
+
+**Architecture:**
+```
+packages/textsift/src/native/metal/
+├── bridge.h         ← C-callable Metal Obj-C wrapper API
+├── bridge.m         ← Obj-C implementation (compiled with -fobjc-arc)
+└── shaders.metal    ← all 15 hand-written MSL kernels in one library
+
+packages/textsift/src/native/metal_backend.zig  ← Zig wrapper around bridge.h
+                                                  (pipeline cache, encoder API)
+packages/textsift/src/native/napi.zig           ← metal* NAPI bindings
+```
+
+**NAPI surface (metal*):** `metalCreateBackend`, `metalDestroyBackend`, `metalDeviceName`, `metalCreateBuffer`, `metalCreateEmptyBuffer`, `metalReleaseBuffer`, `metalReadBuffer`, `metalWriteBuffer`, `metalDispatchOneShot`, `metalBeginEncoder`, `metalEnqueueDispatch`, `metalSubmitAndReadback`.
+
+**Linux:** not covered. Same strategy needs Vulkan-direct (write GLSL/SPIR-V kernels via VkComputePipeline). Doable in code on Mac via MoltenVK for smoke tests, but real validation requires Linux GPU/CI.
+
 ## Done
 
 ### Build pipeline

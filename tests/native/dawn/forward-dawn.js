@@ -7,24 +7,16 @@
 //
 // ⚠️  KNOWN ISSUE (as of session 2026-04-26):
 // Heavy 130-dispatch-per-pass forwards reproducibly hang inside
-// `await readBuf.mapAsync(...)`. Smoke tests (1–5 dispatches in
-// tests/native/dawn/smoke-*.js) work fine. Tiny forwards (T=4 with
+// `await readBuf.mapAsync(...)` on macOS. Smoke tests (1–5 dispatches
+// in tests/native/dawn/smoke-*.js) work fine. Tiny forwards (T=4 with
 // MAX_LAYERS=1) work. Full forwards (T≥4 with MAX_LAYERS≥4) hang.
 //
-// Things that DID NOT fix the hang on macOS:
-//  - `await new Promise(r => setImmediate(r))` between forwards
-//  - `await new Promise(r => setTimeout(r, 0))` between forwards
-//  - Polling `mapAsync` resolution via setImmediate/setTimeout
-//  - `await dev.queue.onSubmittedWorkDone()` before mapAsync
-//  - `createComputePipelineAsync` instead of sync createComputePipeline
-//  - Bind group + uniform buffer caching across forwards
-//  - Splitting per-layer into separate submits
-//  - Cooldown delays between Node processes
-//
-// Hypothesis: this is either a Mac-specific bug in dawn.node's Metal
-// path or a deadlock in the setImmediate-based event pump under heavy
-// command-buffer load. Linux/Windows behavior unknown — the Linux
-// agent should run this same file on real Linux GPU and report.
+// This is a real bug — either Mac-specific in dawn.node's Metal
+// backend, or a deadlock in Dawn's event pump under heavy command
+// buffers. The fix belongs in the binding/library, NOT in user code.
+// The Linux agent should reproduce this on real Linux GPU; if it
+// works there, ship Dawn for Linux/Windows. If it hangs there too,
+// file an upstream issue at dawn-gpu/node-webgpu.
 //
 // Apples-to-apples vs forward-metal.js: same RNG-seeded synthetic
 // weights, same dispatch shapes, same shader source.
@@ -108,9 +100,6 @@ export class DawnForward {
       this.pipelines[name] = await this.device.createComputePipelineAsync({
         label: name, layout: "auto", compute: { module: m, entryPoint: "main" },
       });
-      // Yield between pipeline compiles so Dawn's setImmediate-based
-      // event pump can process compile events.
-      await new Promise((r) => setImmediate(r));
     }
     console.log(`[dawn] all ${Object.keys(this.pipelines).length} pipelines compiled`);
     this._uploadWeights();
@@ -612,14 +601,7 @@ export class DawnForward {
 
     const tEncEnd = performance.now();
     dev.queue.submit([enc.finish()]);
-    // Pump Dawn's event loop while waiting for the map. setTimeout
-    // gives the event loop a full tick to drain accumulated work.
-    let mapped = false;
-    const mapPromise = readBuf.mapAsync(GPUMapMode.READ).then(() => { mapped = true; });
-    while (!mapped) {
-      await new Promise((r) => setTimeout(r, 0));
-    }
-    await mapPromise;
+    await readBuf.mapAsync(GPUMapMode.READ);
     if (process.env.DEBUG) console.log("[dawn] mapped");
     const got = new Uint8Array(readBuf.getMappedRange().slice(0));
     readBuf.unmap();
@@ -648,14 +630,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const ITERS = parseInt(process.env.ITERS ?? "10", 10);
   const WARMUP = parseInt(process.env.WARMUP ?? "3", 10);
   console.log(`[bench] WARMUP=${WARMUP} ITERS=${ITERS}`);
-  // Dawn-Node pumps wgpuInstanceProcessEvents via setImmediate. A tight
-  // await chain starves the immediate phase and `mapAsync` never resolves
-  // after a few iters. Yielding to setTimeout between forwards lets
-  // Dawn's event pump drain — setImmediate alone is sometimes not enough.
-  const yieldToEventLoop = () => new Promise((r) => setTimeout(r, 0));
-
   for (let i = 0; i < WARMUP; i++) {
-    await yieldToEventLoop();
     const t0 = performance.now();
     await fwd.forward(ids, mask);
     console.log(`  warmup ${i}: ${(performance.now() - t0).toFixed(1)} ms`);
@@ -665,7 +640,6 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const samples = [];
   const encs = [], subs = [];
   for (let i = 0; i < N; i++) {
-    await yieldToEventLoop();
     const t0 = performance.now();
     const logits = await fwd.forward(ids, mask);
     samples.push(performance.now() - t0);

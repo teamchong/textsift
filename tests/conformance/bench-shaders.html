@@ -1,0 +1,147 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>textsift conformance — browser shader microbench</title>
+  </head>
+  <body>
+    <pre id="out">starting</pre>
+    <script type="module">
+      // Browser-side microbench: for each shader registered in
+      // `tests/conformance/shaders.html`, time N dispatches against a
+      // single pre-built pipeline + bind group + buffers (no per-call
+      // setup), report median ms. The native side runs a matching
+      // microbench against `backendDispatch` and we compare in the
+      // Playwright spec.
+
+      import { f32_to_f16, pack_f16, makeRng } from "/tests/conformance/fp16.js";
+
+      const $out = document.getElementById("out");
+      const log = (m) => { $out.textContent += "\n" + m; };
+
+      async function loadShader(name) {
+        const r = await fetch(`/packages/textsift/src/native/shaders/${name}.wgsl`);
+        if (!r.ok) throw new Error(`fetch ${name}.wgsl: ${r.status}`);
+        return await r.text();
+      }
+
+      // Mirror the SHADERS registry from shaders.html via a fetch of
+      // the meta.json + raw .bin files dumped during conformance.
+      async function loadFixture(name) {
+        const dirRoot = "/tests/native/conformance/fixtures";
+        const meta = await fetch(`${dirRoot}/${name}/meta.json`).then((r) => r.json());
+        const bytes = async (path) => new Uint8Array(await fetch(`${dirRoot}/${name}/${path}`).then((r) => r.arrayBuffer()));
+        return {
+          meta,
+          uniform: await bytes("uniform.bin"),
+          extraUniforms: await Promise.all(meta.extraUniforms.map(async (eu) => ({
+            binding: eu.binding,
+            bytes: await bytes(`_uniform_${eu.name}.bin`),
+          }))),
+          inputs: await Promise.all(meta.inputs.map(async (i) => ({
+            binding: i.binding,
+            bytes: await bytes(`${i.name}.bin`),
+          }))),
+          outputInitial: meta.output.hasInitial ? await bytes("_output_initial.bin") : null,
+        };
+      }
+
+      const SHADERS = [
+        "rms_norm", "zero_f32", "cast_fp16_to_f32", "cast_f32_to_fp16_scaled",
+        "add_fp16", "swiglu_clamp", "rope_apply",
+        "matmul_int4_fp16_f16", "matmul_int4_f32_f32",
+        "embed_lookup_int4", "add_rmsnorm_fp16_to_f32", "router_topk",
+        "banded_attention", "qmoe_gate_up", "qmoe_down_scatter",
+      ];
+
+      const WARMUP = 5;
+      const ITERS = 50;
+
+      try {
+        if (!navigator.gpu) throw new Error("no navigator.gpu");
+        const adapter = await navigator.gpu.requestAdapter();
+        const device = await adapter.requestDevice({ requiredFeatures: ["shader-f16"] });
+
+        const results = {};
+        for (const name of SHADERS) {
+          log(`\n[${name}]`);
+          const wgsl = await loadShader(name);
+          const f = await loadFixture(name);
+          const outBytes = f.meta.output.byteLength;
+
+          const module = device.createShaderModule({ code: wgsl });
+          const pipeline = device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "main" } });
+          const uBuf = device.createBuffer({ size: f.uniform.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+          device.queue.writeBuffer(uBuf, 0, f.uniform);
+          const extraBufs = f.extraUniforms.map((eu) => {
+            const b = device.createBuffer({ size: eu.bytes.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+            device.queue.writeBuffer(b, 0, eu.bytes);
+            return { ...eu, buffer: b };
+          });
+          const inBufs = f.inputs.map((i) => {
+            const b = device.createBuffer({ size: i.bytes.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+            device.queue.writeBuffer(b, 0, i.bytes);
+            return { ...i, buffer: b };
+          });
+          const outBuf = device.createBuffer({
+            size: outBytes,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+          });
+          if (f.outputInitial) device.queue.writeBuffer(outBuf, 0, f.outputInitial);
+          const readback = device.createBuffer({
+            size: outBytes,
+            usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+          });
+          const bg = device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [
+              { binding: f.meta.uniform.binding, resource: { buffer: uBuf } },
+              ...extraBufs.map((e) => ({ binding: e.binding, resource: { buffer: e.buffer } })),
+              ...inBufs.map((i) => ({ binding: i.binding, resource: { buffer: i.buffer } })),
+              { binding: f.meta.output.binding, resource: { buffer: outBuf } },
+            ],
+          });
+
+          const dispatchOnce = () => {
+            const enc = device.createCommandEncoder();
+            const pass = enc.beginComputePass();
+            pass.setPipeline(pipeline);
+            pass.setBindGroup(0, bg);
+            pass.dispatchWorkgroups(...f.meta.dispatch);
+            pass.end();
+            enc.copyBufferToBuffer(outBuf, 0, readback, 0, outBytes);
+            device.queue.submit([enc.finish()]);
+          };
+
+          // Warmup
+          for (let i = 0; i < WARMUP; i++) {
+            dispatchOnce();
+            await readback.mapAsync(GPUMapMode.READ);
+            readback.unmap();
+          }
+          // Timed loop — each iter includes encode + submit + readback,
+          // matching what backendDispatch does on the native side.
+          const samples = [];
+          for (let i = 0; i < ITERS; i++) {
+            const t = performance.now();
+            dispatchOnce();
+            await readback.mapAsync(GPUMapMode.READ);
+            readback.unmap();
+            samples.push(performance.now() - t);
+          }
+          samples.sort((a, b) => a - b);
+          const med = samples[Math.floor(samples.length / 2)];
+          const min = samples[0];
+          log(`  ${name}: median=${med.toFixed(3)}ms min=${min.toFixed(3)}ms (${ITERS} iters)`);
+          results[name] = { median: med, min, samples: samples.length };
+        }
+        window.__bench = results;
+        log("\ndone");
+      } catch (e) {
+        window.__bench = { error: String(e), stack: e.stack };
+        log("ERROR: " + e);
+        throw e;
+      }
+    </script>
+  </body>
+</html>

@@ -1,0 +1,30 @@
+{
+  "dims": {
+    "T": 4,
+    "D": 128,
+    "eps": 0.000001
+  },
+  "dispatch": [
+    4,
+    1,
+    1
+  ],
+  "workgroupSize": [
+    64,
+    1,
+    1
+  ],
+  "outputDtype": "f16",
+  "outputBytes": 1024,
+  "uniformBytes": 16,
+  "inputs": [
+    {
+      "name": "x",
+      "bytes": 1024
+    },
+    {
+      "name": "gamma",
+      "bytes": 256
+    }
+  ]
+}

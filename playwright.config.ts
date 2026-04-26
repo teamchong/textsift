@@ -1,7 +1,8 @@
 import { defineConfig } from "@playwright/test";
 
 export default defineConfig({
-  testDir: "tests/browser",
+  testDir: "tests",
+  testMatch: ["browser/**/*.spec.ts", "conformance/**/*.spec.ts"],
   fullyParallel: false,
   // Cold-cache runs download ~770 MB. Set a generous default timeout
   // so tests don't fail the first time they touch a new model source.

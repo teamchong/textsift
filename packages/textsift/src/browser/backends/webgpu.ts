@@ -28,6 +28,24 @@ import type {
   InferenceBackend,
   Logits,
 } from "./abstract.js";
+import {
+  INT4_ACCESS_WGSL,
+  MATMUL_INT4_F32_F32_WGSL,
+  MATMUL_INT4_FP16_F16_WGSL,
+  EMBED_LOOKUP_INT4_WGSL,
+  RMS_NORM_WGSL,
+  ADD_RMSNORM_FP16_TO_F32_WGSL,
+  CAST_FP16_TO_F32_WGSL,
+  CAST_F32_TO_FP16_SCALED_WGSL,
+  ADD_FP16_WGSL,
+  ZERO_F32_WGSL,
+  ROPE_APPLY_WGSL,
+  BANDED_ATTENTION_WGSL,
+  ROUTER_TOPK_WGSL,
+  SWIGLU_CLAMP_WGSL,
+  QMOE_GATE_UP_WGSL,
+  QMOE_DOWN_SCATTER_WGSL,
+} from "./shaders.js";
 import { parseOnnxGraph, resolveTensorBytes } from "../model/onnx-reader.js";
 import { fetchBytesCached } from "../model/opfs-fetch.js";
 import { buildRopeTables } from "../inference/rope.js";
@@ -55,19 +73,7 @@ export interface GpuTensor {
  * is the canonical storage container for packed uint8/uint4 data —
  * storage buffers can't be declared as array<u8> directly.
  */
-const INT4_ACCESS_WGSL = /* wgsl */ `
-fn load_byte(arr: ptr<storage, array<u32>, read>, byte_idx: u32) -> u32 {
-    let word = (*arr)[byte_idx >> 2u];
-    let shift = (byte_idx & 3u) * 8u;
-    return (word >> shift) & 0xFFu;
-}
 
-fn load_nibble(arr: ptr<storage, array<u32>, read>, nibble_idx: u32) -> u32 {
-    let byte_val = load_byte(arr, nibble_idx >> 1u);
-    let hi = (nibble_idx & 1u) == 1u;
-    return select(byte_val & 0xFu, (byte_val >> 4u) & 0xFu, hi);
-}
-`;
 
 // ---------- WGSL: int4 matmul, f32 x → f32 out ----------
 
@@ -83,76 +89,7 @@ fn load_nibble(arr: ptr<storage, array<u32>, read>, nibble_idx: u32) -> u32 {
  *   `w_zp`: [N, ceil(K/32/2)] u8 — uint4 zero-points, 2/byte.
  *   `bias`: [N] f16.
  */
-const MATMUL_INT4_F32_F32_WGSL = /* wgsl */ `
-enable f16;
 
-struct Dims { T: u32, N: u32, K: u32, _pad: u32 };
-
-@group(0) @binding(0) var<uniform> dims: Dims;
-@group(0) @binding(1) var<storage, read> x: array<f32>;
-@group(0) @binding(2) var<storage, read> w_int4: array<u32>;
-@group(0) @binding(3) var<storage, read> w_scales: array<f16>;
-@group(0) @binding(4) var<storage, read> w_zp: array<u32>;
-@group(0) @binding(5) var<storage, read> bias: array<f16>;
-@group(0) @binding(6) var<storage, read_write> y: array<f32>;
-
-const BLOCK: u32 = 32u;
-
-${INT4_ACCESS_WGSL}
-
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let tn = gid.x;
-    let total = dims.T * dims.N;
-    if (tn >= total) { return; }
-    let t = tn / dims.N;
-    let n = tn % dims.N;
-    let K = dims.K;
-    let n_blocks = K / BLOCK;
-    let zp_per_row = (n_blocks + 1u) >> 1u;
-
-    let nibble_row_base = n * K;
-    let scale_row = n * n_blocks;
-    let x_row = t * K;
-
-    var acc: f32 = 0.0;
-    for (var b: u32 = 0u; b < n_blocks; b = b + 1u) {
-        let scale: f32 = f32(w_scales[scale_row + b]);
-        let zp_byte_idx = n * zp_per_row + (b >> 1u);
-        let zp_byte = load_byte(&w_zp, zp_byte_idx);
-        let zp_nib = select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (b & 1u) == 1u);
-        let zp_f: f32 = f32(zp_nib);
-
-        let word_base = (nibble_row_base + b * BLOCK) >> 3u;
-        let xb = x_row + b * BLOCK;
-
-        var block_sum: f32 = 0.0;
-        for (var w: u32 = 0u; w < 4u; w = w + 1u) {
-            let word = w_int4[word_base + w];
-            let kb = w * 8u;
-            let q0 = f32( word        & 0xFu) - zp_f;
-            let q1 = f32((word >>  4u) & 0xFu) - zp_f;
-            let q2 = f32((word >>  8u) & 0xFu) - zp_f;
-            let q3 = f32((word >> 12u) & 0xFu) - zp_f;
-            let q4 = f32((word >> 16u) & 0xFu) - zp_f;
-            let q5 = f32((word >> 20u) & 0xFu) - zp_f;
-            let q6 = f32((word >> 24u) & 0xFu) - zp_f;
-            let q7 = f32((word >> 28u) & 0xFu) - zp_f;
-            block_sum = fma(q0, x[xb + kb + 0u], block_sum);
-            block_sum = fma(q1, x[xb + kb + 1u], block_sum);
-            block_sum = fma(q2, x[xb + kb + 2u], block_sum);
-            block_sum = fma(q3, x[xb + kb + 3u], block_sum);
-            block_sum = fma(q4, x[xb + kb + 4u], block_sum);
-            block_sum = fma(q5, x[xb + kb + 5u], block_sum);
-            block_sum = fma(q6, x[xb + kb + 6u], block_sum);
-            block_sum = fma(q7, x[xb + kb + 7u], block_sum);
-        }
-        acc = fma(block_sum, scale, acc);
-    }
-    acc = acc + f32(bias[n]);
-    y[t * dims.N + n] = acc;
-}
-`;
 
 // ---------- WGSL: int4 matmul, fp16 x → f16 out ----------
 
@@ -162,145 +99,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
  * skip the explicit pre-widen cast dispatch — the activation traffic
  * is halved (f16 vs f32) which offsets the extra per-load widen work.
  */
-const MATMUL_INT4_FP16_F16_WGSL = /* wgsl */ `
-enable f16;
 
-struct Dims { T: u32, N: u32, K: u32, _pad: u32 };
-
-@group(0) @binding(0) var<uniform> dims: Dims;
-@group(0) @binding(1) var<storage, read> x: array<f16>;
-@group(0) @binding(2) var<storage, read> w_int4: array<u32>;
-@group(0) @binding(3) var<storage, read> w_scales: array<f16>;
-@group(0) @binding(4) var<storage, read> w_zp: array<u32>;
-@group(0) @binding(5) var<storage, read> bias: array<f16>;
-@group(0) @binding(6) var<storage, read_write> y: array<f16>;
-
-const BLOCK: u32 = 32u;
-const TR: u32 = 4u;
-const WG: u32 = 64u;
-const X_TILE_SIZE: u32 = TR * BLOCK;  // 4 * 32 = 128 floats per tile
-
-// Workgroup-shared X tile: each iteration of the K loop loads
-// (TR rows × BLOCK cols) of X into on-chip memory once, and all 64
-// threads read from this tile rather than reissuing 64 × TR global
-// loads per K block.
-var<workgroup> x_tile: array<f32, X_TILE_SIZE>;
-
-${INT4_ACCESS_WGSL}
-
-// 2D dispatch: workgroup_id.x indexes 64-wide N tiles, .y indexes
-// 4-wide T tiles. Each thread owns one N column and four T rows; the
-// int4 weight decode for that (n, k_block) is reused across the four
-// T accumulators, and the X reads are amortized across the workgroup
-// via on-chip x_tile. TR=8 was tried and produced a wash (register
-// pressure on Apple Silicon GPRs cancelled the W-decode amortization
-// gain).
-@compute @workgroup_size(64, 1, 1)
-fn main(
-    @builtin(workgroup_id) wg_id: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>,
-) {
-    let tid = lid.x;
-    let n = wg_id.x * WG + lid.x;
-    let t_base = wg_id.y * TR;
-
-    let K = dims.K;
-    let n_blocks = K / BLOCK;
-    let zp_per_row = (n_blocks + 1u) >> 1u;
-
-    var acc0: f32 = 0.0;
-    var acc1: f32 = 0.0;
-    var acc2: f32 = 0.0;
-    var acc3: f32 = 0.0;
-
-    let n_active = n < dims.N;
-    let nibble_row_base = select(0u, n * K, n_active);
-    let scale_row = select(0u, n * n_blocks, n_active);
-
-    for (var b: u32 = 0u; b < n_blocks; b = b + 1u) {
-        // Cooperative X load: 128 elements across 64 threads = 2 per
-        // thread, pulling block-b's slice of all four T rows into x_tile.
-        let i0 = tid * 2u;
-        let i1 = i0 + 1u;
-        let t0_row = i0 / BLOCK;
-        let k0 = i0 % BLOCK;
-        let t1_row = i1 / BLOCK;
-        let k1 = i1 % BLOCK;
-        let g0 = t_base + t0_row;
-        let g1 = t_base + t1_row;
-        x_tile[i0] = select(0.0, f32(x[g0 * K + b * BLOCK + k0]), g0 < dims.T);
-        x_tile[i1] = select(0.0, f32(x[g1 * K + b * BLOCK + k1]), g1 < dims.T);
-        workgroupBarrier();
-
-        if (n_active) {
-            let scale: f32 = f32(w_scales[scale_row + b]);
-            let zp_byte = load_byte(&w_zp, n * zp_per_row + (b >> 1u));
-            let zp_nib = select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (b & 1u) == 1u);
-            let zp_f: f32 = f32(zp_nib);
-            let word_base = (nibble_row_base + b * BLOCK) >> 3u;
-
-            var blk0: f32 = 0.0;
-            var blk1: f32 = 0.0;
-            var blk2: f32 = 0.0;
-            var blk3: f32 = 0.0;
-
-            for (var w: u32 = 0u; w < 4u; w = w + 1u) {
-                let word = w_int4[word_base + w];
-                let kb = w * 8u;
-                let q_lo = vec4<f32>(
-                    f32( word        & 0xFu) - zp_f,
-                    f32((word >>  4u) & 0xFu) - zp_f,
-                    f32((word >>  8u) & 0xFu) - zp_f,
-                    f32((word >> 12u) & 0xFu) - zp_f,
-                );
-                let q_hi = vec4<f32>(
-                    f32((word >> 16u) & 0xFu) - zp_f,
-                    f32((word >> 20u) & 0xFu) - zp_f,
-                    f32((word >> 24u) & 0xFu) - zp_f,
-                    f32((word >> 28u) & 0xFu) - zp_f,
-                );
-
-                let xb0 = 0u * BLOCK + kb;
-                let x0_lo = vec4<f32>(x_tile[xb0 + 0u], x_tile[xb0 + 1u], x_tile[xb0 + 2u], x_tile[xb0 + 3u]);
-                let x0_hi = vec4<f32>(x_tile[xb0 + 4u], x_tile[xb0 + 5u], x_tile[xb0 + 6u], x_tile[xb0 + 7u]);
-                blk0 = blk0 + dot(q_lo, x0_lo) + dot(q_hi, x0_hi);
-
-                let xb1 = 1u * BLOCK + kb;
-                let x1_lo = vec4<f32>(x_tile[xb1 + 0u], x_tile[xb1 + 1u], x_tile[xb1 + 2u], x_tile[xb1 + 3u]);
-                let x1_hi = vec4<f32>(x_tile[xb1 + 4u], x_tile[xb1 + 5u], x_tile[xb1 + 6u], x_tile[xb1 + 7u]);
-                blk1 = blk1 + dot(q_lo, x1_lo) + dot(q_hi, x1_hi);
-
-                let xb2 = 2u * BLOCK + kb;
-                let x2_lo = vec4<f32>(x_tile[xb2 + 0u], x_tile[xb2 + 1u], x_tile[xb2 + 2u], x_tile[xb2 + 3u]);
-                let x2_hi = vec4<f32>(x_tile[xb2 + 4u], x_tile[xb2 + 5u], x_tile[xb2 + 6u], x_tile[xb2 + 7u]);
-                blk2 = blk2 + dot(q_lo, x2_lo) + dot(q_hi, x2_hi);
-
-                let xb3 = 3u * BLOCK + kb;
-                let x3_lo = vec4<f32>(x_tile[xb3 + 0u], x_tile[xb3 + 1u], x_tile[xb3 + 2u], x_tile[xb3 + 3u]);
-                let x3_hi = vec4<f32>(x_tile[xb3 + 4u], x_tile[xb3 + 5u], x_tile[xb3 + 6u], x_tile[xb3 + 7u]);
-                blk3 = blk3 + dot(q_lo, x3_lo) + dot(q_hi, x3_hi);
-            }
-            acc0 = fma(blk0, scale, acc0);
-            acc1 = fma(blk1, scale, acc1);
-            acc2 = fma(blk2, scale, acc2);
-            acc3 = fma(blk3, scale, acc3);
-        }
-        workgroupBarrier();
-    }
-
-    if (n_active) {
-        let bias_f = f32(bias[n]);
-        let t0 = t_base + 0u;
-        let t1 = t_base + 1u;
-        let t2 = t_base + 2u;
-        let t3 = t_base + 3u;
-        if (t0 < dims.T) { y[t0 * dims.N + n] = f16(acc0 + bias_f); }
-        if (t1 < dims.T) { y[t1 * dims.N + n] = f16(acc1 + bias_f); }
-        if (t2 < dims.T) { y[t2 * dims.N + n] = f16(acc2 + bias_f); }
-        if (t3 < dims.T) { y[t3 * dims.N + n] = f16(acc3 + bias_f); }
-    }
-}
-`;
 
 // ---------- WGSL: GatherBlockQuantized embedding ----------
 
@@ -312,50 +111,7 @@ fn main(
  *
  * OOB ids zero-fill, same as WASM `embed_lookup_int4`.
  */
-const EMBED_LOOKUP_INT4_WGSL = /* wgsl */ `
-enable f16;
 
-struct Dims { T: u32, V: u32, D: u32, _pad: u32 };
-
-@group(0) @binding(0) var<uniform> dims: Dims;
-@group(0) @binding(1) var<storage, read> embed_int4: array<u32>;
-@group(0) @binding(2) var<storage, read> embed_scales: array<f16>;
-@group(0) @binding(3) var<storage, read> embed_zp: array<u32>;
-@group(0) @binding(4) var<storage, read> ids: array<i32>;
-@group(0) @binding(5) var<storage, read_write> out: array<f16>;
-
-const EMBED_BLOCK: u32 = 32u;
-
-${INT4_ACCESS_WGSL}
-
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let td = gid.x;
-    let D = dims.D;
-    let total = dims.T * D;
-    if (td >= total) { return; }
-    let t = td / D;
-    let d = td % D;
-
-    let id = ids[t];
-    if (id < 0 || u32(id) >= dims.V) {
-        out[td] = f16(0.0);
-        return;
-    }
-    let row = u32(id);
-    let n_blocks = D / EMBED_BLOCK;
-    let zp_per_row = (n_blocks + 1u) >> 1u;
-
-    let b = d / EMBED_BLOCK;
-    let scale = f32(embed_scales[row * n_blocks + b]);
-    let zp_byte = load_byte(&embed_zp, row * zp_per_row + (b >> 1u));
-    let zp_nib: u32 = select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (b & 1u) == 1u);
-    let nib_idx = row * D + d;
-    let nib = load_nibble(&embed_int4, nib_idx);
-    let q = f32(nib) - f32(zp_nib);
-    out[td] = f16(q * scale);
-}
-`;
 
 // ---------- WGSL: RMSNorm ----------
 
@@ -367,59 +123,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
  * workgroup memory tree (6 rounds for 64 threads). All accumulation in
  * f32 — 640-wide fp16 would lose bits.
  */
-const RMS_NORM_WGSL = /* wgsl */ `
-enable f16;
 
-struct Dims { T: u32, D: u32, eps: f32, _pad: u32 };
-
-@group(0) @binding(0) var<uniform> dims: Dims;
-@group(0) @binding(1) var<storage, read> x: array<f16>;
-@group(0) @binding(2) var<storage, read> gamma: array<f16>;
-@group(0) @binding(3) var<storage, read_write> y: array<f16>;
-
-var<workgroup> wg_sum: array<f32, 64>;
-
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let t = wg.x;
-    if (t >= dims.T) { return; }
-    let D = dims.D;
-    let row = t * D;
-    let tid = lid.x;
-
-    var ssq: f32 = 0.0;
-    var d = tid;
-    loop {
-        if (d >= D) { break; }
-        let v = f32(x[row + d]);
-        ssq = ssq + v * v;
-        d = d + 64u;
-    }
-    wg_sum[tid] = ssq;
-    workgroupBarrier();
-
-    var stride: u32 = 32u;
-    loop {
-        if (tid < stride) {
-            wg_sum[tid] = wg_sum[tid] + wg_sum[tid + stride];
-        }
-        workgroupBarrier();
-        if (stride == 1u) { break; }
-        stride = stride / 2u;
-    }
-
-    let inv_rms = inverseSqrt(wg_sum[0] / f32(D) + dims.eps);
-
-    d = tid;
-    loop {
-        if (d >= D) { break; }
-        let g = f32(gamma[d]);
-        let xv = f32(x[row + d]);
-        y[row + d] = f16(xv * inv_rms * g);
-        d = d + 64u;
-    }
-}
-`;
 
 // ---------- WGSL: fused (a+b) → fp16 sum + RMSNorm → f32 ----------
 
@@ -435,124 +139,17 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
  * reduce, threads re-read fp16 sum, apply gamma * inv_rms, and write
  * the f32 norm output.
  */
-const ADD_RMSNORM_FP16_TO_F32_WGSL = /* wgsl */ `
-enable f16;
 
-struct Dims { T: u32, D: u32, eps: f32, _pad: u32 };
-
-@group(0) @binding(0) var<uniform> dims: Dims;
-@group(0) @binding(1) var<storage, read> a: array<f16>;
-@group(0) @binding(2) var<storage, read> b: array<f16>;
-@group(0) @binding(3) var<storage, read> gamma: array<f16>;
-@group(0) @binding(4) var<storage, read_write> sum_out: array<f16>;
-@group(0) @binding(5) var<storage, read_write> norm_out: array<f32>;
-
-var<workgroup> wg_sum: array<f32, 64>;
-
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let t = wg.x;
-    if (t >= dims.T) { return; }
-    let D = dims.D;
-    let row = t * D;
-    let tid = lid.x;
-
-    var ssq: f32 = 0.0;
-    var d = tid;
-    loop {
-        if (d >= D) { break; }
-        let av = f32(a[row + d]);
-        let bv = f32(b[row + d]);
-        let sv = av + bv;
-        sum_out[row + d] = f16(sv);
-        ssq = ssq + sv * sv;
-        d = d + 64u;
-    }
-    wg_sum[tid] = ssq;
-    workgroupBarrier();
-
-    var stride: u32 = 32u;
-    loop {
-        if (tid < stride) {
-            wg_sum[tid] = wg_sum[tid] + wg_sum[tid + stride];
-        }
-        workgroupBarrier();
-        if (stride == 1u) { break; }
-        stride = stride / 2u;
-    }
-
-    let inv_rms = inverseSqrt(wg_sum[0] / f32(D) + dims.eps);
-
-    // Re-read the fp16 sum we just wrote. Each thread reads only its
-    // own writes (strided by 64) so there's no cross-thread dep, and
-    // the write→read of the same fp16 is round-trip identical.
-    d = tid;
-    loop {
-        if (d >= D) { break; }
-        let g = f32(gamma[d]);
-        let sv = f32(sum_out[row + d]);
-        norm_out[row + d] = sv * inv_rms * g;
-        d = d + 64u;
-    }
-}
-`;
 
 // ---------- WGSL: dtype casts ----------
 
-const CAST_FP16_TO_F32_WGSL = /* wgsl */ `
-enable f16;
 
-struct Dims { n: u32, _pad0: u32, _pad1: u32, _pad2: u32 };
-@group(0) @binding(0) var<uniform> dims: Dims;
-@group(0) @binding(1) var<storage, read> src: array<f16>;
-@group(0) @binding(2) var<storage, read_write> dst: array<f32>;
 
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i >= dims.n) { return; }
-    dst[i] = f32(src[i]);
-}
-`;
 
-const CAST_F32_TO_FP16_SCALED_WGSL = /* wgsl */ `
-enable f16;
-
-struct Dims { n: u32, _pad0: u32, _pad1: u32, _pad2: u32 };
-struct Scale { v: f32 };
-@group(0) @binding(0) var<uniform> dims: Dims;
-@group(0) @binding(1) var<uniform> scale: Scale;
-@group(0) @binding(2) var<storage, read> src: array<f32>;
-@group(0) @binding(3) var<storage, read_write> dst: array<f16>;
-
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i >= dims.n) { return; }
-    dst[i] = f16(src[i] * scale.v);
-}
-`;
 
 // ---------- WGSL: elementwise add, zero ----------
 
-const ADD_FP16_WGSL = /* wgsl */ `
-enable f16;
 
-struct Dims { n: u32, _pad0: u32, _pad1: u32, _pad2: u32 };
-@group(0) @binding(0) var<uniform> dims: Dims;
-@group(0) @binding(1) var<storage, read> a: array<f16>;
-@group(0) @binding(2) var<storage, read> b: array<f16>;
-@group(0) @binding(3) var<storage, read_write> out: array<f16>;
-
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i >= dims.n) { return; }
-    // Widen to f32 for the add, then round once — matches WASM add_fp16
-    // semantics: f32ToFp16(fp16ToF32(a) + fp16ToF32(b)).
-    out[i] = f16(f32(a[i]) + f32(b[i]));
-}
-`;
 
 /**
  * Zeros the MoE accumulator before each block's scatter pass. Declared
@@ -560,18 +157,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
  * array<atomic<u32>>. WebGPU permits different shader views of the same
  * buffer as long as usage flags (STORAGE) cover both.
  */
-const ZERO_F32_WGSL = /* wgsl */ `
-struct Dims { n: u32, _pad0: u32, _pad1: u32, _pad2: u32 };
-@group(0) @binding(0) var<uniform> dims: Dims;
-@group(0) @binding(1) var<storage, read_write> buf: array<u32>;
 
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i >= dims.n) { return; }
-    buf[i] = 0u;
-}
-`;
 
 // ---------- WGSL: RoPE apply (interleaved) ----------
 
@@ -586,44 +172,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
  * rounds, then the subtract rounds — three roundings per output,
  * matching PyTorch eager fp16.
  */
-const ROPE_APPLY_WGSL = /* wgsl */ `
-enable f16;
 
-struct Dims { T: u32, H: u32, head_dim: u32, _pad: u32 };
-
-@group(0) @binding(0) var<uniform> dims: Dims;
-@group(0) @binding(1) var<storage, read_write> qk: array<f16>;
-@group(0) @binding(2) var<storage, read> cos_tab: array<f16>;
-@group(0) @binding(3) var<storage, read> sin_tab: array<f16>;
-
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let half_dim = dims.head_dim / 2u;
-    let idx = gid.x;
-    let tp_total = dims.T * dims.H * half_dim;
-    if (idx >= tp_total) { return; }
-
-    let p = idx % half_dim;
-    let th = idx / half_dim;
-    let h = th % dims.H;
-    let t = th / dims.H;
-
-    let c: f16 = cos_tab[t * half_dim + p];
-    let s: f16 = sin_tab[t * half_dim + p];
-
-    let head_base = (t * dims.H + h) * dims.head_dim;
-    let a: f16 = qk[head_base + 2u * p];
-    let b: f16 = qk[head_base + 2u * p + 1u];
-
-    let ac: f16 = a * c;
-    let bs: f16 = b * s;
-    let bc: f16 = b * c;
-    let as_: f16 = a * s;
-
-    qk[head_base + 2u * p]      = ac - bs;
-    qk[head_base + 2u * p + 1u] = bc + as_;
-}
-`;
 
 // ---------- WGSL: banded GQA attention with sinks ----------
 
@@ -645,163 +194,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
  * `sink` contributes to the softmax denominator but not to the AV
  * combine — the 0-dim "sink key" with no value vector.
  */
-const BANDED_ATTENTION_WGSL = /* wgsl */ `
-enable f16;
 
-struct Dims {
-    T: u32, H_q: u32, H_kv: u32, head_dim: u32,
-    window: u32, use_mask: u32, _pad0: u32, _pad1: u32,
-};
-
-@group(0) @binding(0) var<uniform> dims: Dims;
-@group(0) @binding(1) var<storage, read> q: array<f16>;
-@group(0) @binding(2) var<storage, read> k: array<f16>;
-@group(0) @binding(3) var<storage, read> v: array<f16>;
-@group(0) @binding(4) var<storage, read> sinks: array<f32>;
-@group(0) @binding(5) var<storage, read> mask: array<u32>;
-@group(0) @binding(6) var<storage, read_write> out: array<f16>;
-
-const MAX_WINDOW_TOTAL: u32 = 257u;
-const NEG_INF: f32 = -1e30;
-
-var<workgroup> wg_scores: array<f32, MAX_WINDOW_TOTAL>;
-var<workgroup> wg_tmp: array<f32, 64>;
-var<workgroup> wg_broadcast: array<f32, 2>;  // [0] = row_max, [1] = inv_sum
-
-fn read_mask_byte(i: u32) -> u32 {
-    let word = mask[i >> 2u];
-    return (word >> ((i & 3u) * 8u)) & 0xFFu;
-}
-
-@compute @workgroup_size(64, 1, 1)
-fn main(
-    @builtin(workgroup_id) wg_id: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>,
-) {
-    let tid = lid.x;
-    let t_q_h_q = wg_id.x;
-    let H_q = dims.H_q;
-    if (t_q_h_q >= dims.T * H_q) { return; }
-    let t_q = t_q_h_q / H_q;
-    let h_q = t_q_h_q % H_q;
-    let head_dim = dims.head_dim;
-    let kv_group = H_q / dims.H_kv;
-    let h_kv = h_q / kv_group;
-
-    let q_stride_t = H_q * head_dim;
-    let k_stride_t = dims.H_kv * head_dim;
-    let q_base = t_q * q_stride_t + h_q * head_dim;
-
-    let window = dims.window;
-    var ws: u32 = 0u;
-    if (t_q > window) { ws = t_q - window; }
-    var we: u32 = dims.T;
-    if (t_q + window + 1u < dims.T) { we = t_q + window + 1u; }
-    let n_keys = we - ws;
-
-    // Pass 1: each thread computes scores for its strided keys and
-    // writes them into workgroup memory.
-    var thread_max: f32 = NEG_INF;
-    var idx = tid;
-    loop {
-        if (idx >= n_keys) { break; }
-        let abs_k = ws + idx;
-        var is_valid: bool = true;
-        if (dims.use_mask == 1u) {
-            is_valid = read_mask_byte(abs_k) != 0u;
-        }
-        var s: f32 = NEG_INF;
-        if (is_valid) {
-            let k_base = abs_k * k_stride_t + h_kv * head_dim;
-            var dot: f32 = 0.0;
-            for (var d: u32 = 0u; d < head_dim; d = d + 1u) {
-                dot = fma(f32(q[q_base + d]), f32(k[k_base + d]), dot);
-            }
-            s = dot;
-        }
-        wg_scores[idx] = s;
-        if (s > thread_max) { thread_max = s; }
-        idx = idx + 64u;
-    }
-    // Include sink in max comparison (thread 0 seeds with sink).
-    if (tid == 0u) {
-        let sink_s = sinks[h_q];
-        if (sink_s > thread_max) { thread_max = sink_s; }
-    }
-    wg_tmp[tid] = thread_max;
-    workgroupBarrier();
-
-    // Tree reduce max across 64 threads.
-    var stride: u32 = 32u;
-    loop {
-        if (tid < stride) {
-            wg_tmp[tid] = max(wg_tmp[tid], wg_tmp[tid + stride]);
-        }
-        workgroupBarrier();
-        if (stride == 1u) { break; }
-        stride = stride / 2u;
-    }
-    if (tid == 0u) { wg_broadcast[0] = wg_tmp[0]; }
-    workgroupBarrier();
-    let row_max = wg_broadcast[0];
-
-    // Pass 2: exp(score - max), accumulate sum.
-    var thread_sum: f32 = 0.0;
-    idx = tid;
-    loop {
-        if (idx >= n_keys) { break; }
-        let e = exp(wg_scores[idx] - row_max);
-        wg_scores[idx] = e;
-        thread_sum = thread_sum + e;
-        idx = idx + 64u;
-    }
-    // Sink contributes to denominator.
-    if (tid == 0u) {
-        thread_sum = thread_sum + exp(sinks[h_q] - row_max);
-    }
-    wg_tmp[tid] = thread_sum;
-    workgroupBarrier();
-
-    stride = 32u;
-    loop {
-        if (tid < stride) {
-            wg_tmp[tid] = wg_tmp[tid] + wg_tmp[tid + stride];
-        }
-        workgroupBarrier();
-        if (stride == 1u) { break; }
-        stride = stride / 2u;
-    }
-    if (tid == 0u) {
-        let s = wg_tmp[0];
-        wg_broadcast[1] = select(0.0, 1.0 / s, s > 0.0);
-    }
-    workgroupBarrier();
-    let inv_sum = wg_broadcast[1];
-
-    // Pass 3: normalize softmax in-place so pass 4 reads a single value.
-    idx = tid;
-    loop {
-        if (idx >= n_keys) { break; }
-        wg_scores[idx] = wg_scores[idx] * inv_sum;
-        idx = idx + 64u;
-    }
-    workgroupBarrier();
-
-    // Pass 4: each thread owns one head_dim lane and combines V across
-    // all keys in the window. Requires workgroup_size >= head_dim; our
-    // head_dim is 64 so each of 64 threads handles exactly one lane.
-    if (tid < head_dim) {
-        var acc: f32 = 0.0;
-        for (var i: u32 = 0u; i < n_keys; i = i + 1u) {
-            let abs_k = ws + i;
-            let v_base = abs_k * k_stride_t + h_kv * head_dim;
-            acc = fma(wg_scores[i], f32(v[v_base + tid]), acc);
-        }
-        let out_base = t_q * q_stride_t + h_q * head_dim;
-        out[out_base + tid] = f16(acc);
-    }
-}
-`;
 
 // ---------- WGSL: router top-K + softmax / K ----------
 
@@ -816,69 +209,7 @@ fn main(
  * top-K arrays fit in registers. For 128 experts × 8 slots = 1024
  * compares per thread, comfortably within a single dispatch.
  */
-const ROUTER_TOPK_WGSL = /* wgsl */ `
-struct Dims { T: u32, E: u32, K: u32, _pad: u32 };
 
-@group(0) @binding(0) var<uniform> dims: Dims;
-@group(0) @binding(1) var<storage, read> logits: array<f32>;
-@group(0) @binding(2) var<storage, read_write> out_idx: array<i32>;
-@group(0) @binding(3) var<storage, read_write> out_scores: array<f32>;
-
-const MAX_K: u32 = 8u;
-const NEG_INF: f32 = -1e30;
-
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let t = gid.x;
-    if (t >= dims.T) { return; }
-    let K = dims.K;
-    let row = t * dims.E;
-
-    var top_val: array<f32, MAX_K>;
-    var top_idx: array<u32, MAX_K>;
-    for (var i: u32 = 0u; i < MAX_K; i = i + 1u) {
-        top_val[i] = NEG_INF;
-        top_idx[i] = 0u;
-    }
-
-    for (var e: u32 = 0u; e < dims.E; e = e + 1u) {
-        let v = logits[row + e];
-        // Locate slot with the smallest current value.
-        var min_k: u32 = 0u;
-        var min_v: f32 = top_val[0];
-        for (var k: u32 = 1u; k < K; k = k + 1u) {
-            if (top_val[k] < min_v) {
-                min_v = top_val[k];
-                min_k = k;
-            }
-        }
-        if (v > min_v) {
-            top_val[min_k] = v;
-            top_idx[min_k] = e;
-        }
-    }
-
-    // Softmax over top K.
-    var max_v: f32 = top_val[0];
-    for (var k: u32 = 1u; k < K; k = k + 1u) {
-        max_v = max(max_v, top_val[k]);
-    }
-    var sum: f32 = 0.0;
-    for (var k: u32 = 0u; k < K; k = k + 1u) {
-        let e = exp(top_val[k] - max_v);
-        top_val[k] = e;
-        sum = sum + e;
-    }
-    let inv_sum = select(0.0, 1.0 / sum, sum > 0.0);
-    let inv_K = 1.0 / f32(K);
-
-    let out_base = t * K;
-    for (var k: u32 = 0u; k < K; k = k + 1u) {
-        out_idx[out_base + k] = i32(top_idx[k]);
-        out_scores[out_base + k] = top_val[k] * inv_sum * inv_K;
-    }
-}
-`;
 
 // ---------- WGSL: SwiGLU with clamp (packed gate/up) ----------
 
@@ -893,43 +224,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
  * All compute in f32 — upstream's expert forward runs `.float()` the
  * entire expert block.
  */
-const SWIGLU_CLAMP_WGSL = /* wgsl */ `
-struct Dims { rows: u32, dff: u32, _pad0: u32, _pad1: u32 };
 
-@group(0) @binding(0) var<uniform> dims: Dims;
-@group(0) @binding(1) var<storage, read> gate_up: array<f32>;
-@group(0) @binding(2) var<storage, read_write> out: array<f32>;
-
-const LIMIT: f32 = 7.0;
-const ALPHA: f32 = 1.702;
-
-fn sigmoid_f32(x: f32) -> f32 {
-    // Numerically stable: σ(x) = 1/(1+exp(-|x|)) on both sides, flipped for
-    // negative x. Keeps the exp argument ≤ 0 so no intermediate overflow.
-    if (x >= 0.0) {
-        return 1.0 / (1.0 + exp(-x));
-    }
-    let e = exp(x);
-    return e / (1.0 + e);
-}
-
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    let total = dims.rows * dims.dff;
-    if (idx >= total) { return; }
-    let row = idx / dims.dff;
-    let col = idx % dims.dff;
-
-    let stride = 2u * dims.dff;
-    let gate_raw = gate_up[row * stride + 2u * col];
-    let up_raw   = gate_up[row * stride + 2u * col + 1u];
-    let gate = min(gate_raw, LIMIT);
-    let up   = clamp(up_raw, -LIMIT, LIMIT);
-    let glu  = gate * sigmoid_f32(gate * ALPHA);
-    out[idx] = (up + 1.0) * glu;
-}
-`;
 
 // ---------- WGSL: QMoE gate_up (per-expert int4 matmul) ----------
 
@@ -949,109 +244,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
  * One thread per output element (tk_pair, n-in-2*dff). Each thread
  * reads `routing_idx[tk_pair]` once and does the usual int4 MAC chain.
  */
-const QMOE_GATE_UP_WGSL = /* wgsl */ `
-enable f16;
 
-struct Dims {
-    T: u32, K: u32, N: u32, D: u32,
-    _pad0: u32, _pad1: u32, _pad2: u32, _pad3: u32,
-};
-
-@group(0) @binding(0) var<uniform> dims: Dims;
-@group(0) @binding(1) var<storage, read> x: array<f32>;
-@group(0) @binding(2) var<storage, read> routing_idx: array<i32>;
-@group(0) @binding(3) var<storage, read> w_int4: array<u32>;
-@group(0) @binding(4) var<storage, read> w_scales: array<f16>;
-@group(0) @binding(5) var<storage, read> w_zp: array<u32>;
-@group(0) @binding(6) var<storage, read> bias: array<f16>;
-@group(0) @binding(7) var<storage, read_write> out: array<f32>;
-
-const BLOCK: u32 = 32u;
-const D_MAX: u32 = 640u;  // pii-filter hidden_size; assert at dispatch time
-const WG: u32 = 64u;
-
-// Workgroup-shared input row. All 64 threads in a wg share the same
-// (t, k_pick) so they read the same x row — load it once cooperatively
-// and reuse from on-chip memory instead of replaying 64 global loads.
-var<workgroup> x_tile: array<f32, D_MAX>;
-
-${INT4_ACCESS_WGSL}
-
-// 2D dispatch: workgroup_id.x is the (token, k_pick) pair (0..T*K),
-// workgroup_id.y is the N-tile index (0..N/64). Each thread writes one
-// N column for that (tk, n_tile) tile.
-@compute @workgroup_size(64, 1, 1)
-fn main(
-    @builtin(workgroup_id) wg_id: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>,
-) {
-    let tid = lid.x;
-    let tk = wg_id.x;
-    if (tk >= dims.T * dims.K) { return; }
-    let n_base = wg_id.y * WG;
-    let n = n_base + tid;
-
-    let t = tk / dims.K;
-    let e = u32(routing_idx[tk]);
-
-    let D = dims.D;
-    let N = dims.N;
-    let n_blocks = D / BLOCK;
-    let zp_per_row = (n_blocks + 1u) >> 1u;
-
-    // Cooperative X load. D=640 with WG=64 → 10 elements per thread.
-    for (var i: u32 = 0u; i < 10u; i = i + 1u) {
-        let k_idx = i * WG + tid;
-        if (k_idx < D) {
-            x_tile[k_idx] = x[t * D + k_idx];
-        }
-    }
-    workgroupBarrier();
-
-    if (n >= N) { return; }
-
-    let expert_nibble_base = e * N * D + n * D;
-    let expert_scale_base  = e * N * n_blocks + n * n_blocks;
-    let expert_zp_base     = e * N * zp_per_row + n * zp_per_row;
-    let expert_bias_base   = e * N + n;
-
-    var acc: f32 = 0.0;
-    for (var b: u32 = 0u; b < n_blocks; b = b + 1u) {
-        let scale: f32 = f32(w_scales[expert_scale_base + b]);
-        let zp_byte = load_byte(&w_zp, expert_zp_base + (b >> 1u));
-        let zp_nib = select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (b & 1u) == 1u);
-        let zp_f: f32 = f32(zp_nib);
-
-        let word_base = (expert_nibble_base + b * BLOCK) >> 3u;
-        let xb = b * BLOCK;
-
-        var block_sum: f32 = 0.0;
-        for (var w: u32 = 0u; w < 4u; w = w + 1u) {
-            let word = w_int4[word_base + w];
-            let kb = w * 8u;
-            let q0 = f32( word        & 0xFu) - zp_f;
-            let q1 = f32((word >>  4u) & 0xFu) - zp_f;
-            let q2 = f32((word >>  8u) & 0xFu) - zp_f;
-            let q3 = f32((word >> 12u) & 0xFu) - zp_f;
-            let q4 = f32((word >> 16u) & 0xFu) - zp_f;
-            let q5 = f32((word >> 20u) & 0xFu) - zp_f;
-            let q6 = f32((word >> 24u) & 0xFu) - zp_f;
-            let q7 = f32((word >> 28u) & 0xFu) - zp_f;
-            block_sum = fma(q0, x_tile[xb + kb + 0u], block_sum);
-            block_sum = fma(q1, x_tile[xb + kb + 1u], block_sum);
-            block_sum = fma(q2, x_tile[xb + kb + 2u], block_sum);
-            block_sum = fma(q3, x_tile[xb + kb + 3u], block_sum);
-            block_sum = fma(q4, x_tile[xb + kb + 4u], block_sum);
-            block_sum = fma(q5, x_tile[xb + kb + 5u], block_sum);
-            block_sum = fma(q6, x_tile[xb + kb + 6u], block_sum);
-            block_sum = fma(q7, x_tile[xb + kb + 7u], block_sum);
-        }
-        acc = fma(block_sum, scale, acc);
-    }
-    acc = acc + f32(bias[expert_bias_base]);
-    out[tk * N + n] = acc;
-}
-`;
 
 // ---------- WGSL: QMoE down + atomic scatter-add ----------
 
@@ -1065,125 +258,7 @@ fn main(
  * the loop reads the current u32, bit-casts to f32, adds, bit-casts
  * back, tries `atomicCompareExchangeWeak`, retries on failure.
  */
-const QMOE_DOWN_SCATTER_WGSL = /* wgsl */ `
-enable f16;
 
-struct Dims {
-    T: u32, K: u32, N: u32, D: u32,
-    _pad0: u32, _pad1: u32, _pad2: u32, _pad3: u32,
-};
-
-@group(0) @binding(0) var<uniform> dims: Dims;
-@group(0) @binding(1) var<storage, read> glu: array<f32>;
-@group(0) @binding(2) var<storage, read> routing_idx: array<i32>;
-@group(0) @binding(3) var<storage, read> routing_scores: array<f32>;
-@group(0) @binding(4) var<storage, read> w_int4: array<u32>;
-@group(0) @binding(5) var<storage, read> w_scales: array<f16>;
-@group(0) @binding(6) var<storage, read> w_zp: array<u32>;
-@group(0) @binding(7) var<storage, read> bias: array<f16>;
-@group(0) @binding(8) var<storage, read_write> acc: array<atomic<u32>>;
-
-const BLOCK: u32 = 32u;
-const D_MAX: u32 = 640u;  // dff for openai/privacy-filter
-const WG: u32 = 64u;
-
-// Workgroup-shared input tile. All 64 threads in a workgroup share the
-// same (token, k_pick) so they read the same glu row — load it once
-// cooperatively and reuse from on-chip memory rather than reissuing
-// 64 redundant global loads per K block.
-var<workgroup> glu_tile: array<f32, D_MAX>;
-
-${INT4_ACCESS_WGSL}
-
-fn atomic_add_f32(slot: u32, val: f32) {
-    var old_u = atomicLoad(&acc[slot]);
-    loop {
-        let new_f = bitcast<f32>(old_u) + val;
-        let new_u = bitcast<u32>(new_f);
-        let r = atomicCompareExchangeWeak(&acc[slot], old_u, new_u);
-        if (r.exchanged) { break; }
-        old_u = r.old_value;
-    }
-}
-
-// 2D dispatch: workgroup_id.x is the (token, k_pick) pair, .y is the
-// N-tile index (0..N/64). Each thread writes one N column for that
-// (tk, n_tile) tile via atomic scatter-add.
-@compute @workgroup_size(64, 1, 1)
-fn main(
-    @builtin(workgroup_id) wg_id: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>,
-) {
-    let tid = lid.x;
-    let tk = wg_id.x;
-    if (tk >= dims.T * dims.K) { return; }
-    let n_base = wg_id.y * WG;
-    let n = n_base + tid;
-
-    let t = tk / dims.K;
-    let e = u32(routing_idx[tk]);
-    let w = routing_scores[tk];
-
-    let D = dims.D;  // inner dim = dff
-    let N = dims.N;  // output dim = d_model
-    let n_blocks = D / BLOCK;
-    let zp_per_row = (n_blocks + 1u) >> 1u;
-
-    // Cooperatively load the glu row (D = dff = 640 elements) once.
-    // 64 threads, 10 elements each.
-    for (var i: u32 = 0u; i < 10u; i = i + 1u) {
-        let k_idx = i * WG + tid;
-        if (k_idx < D) {
-            glu_tile[k_idx] = glu[tk * D + k_idx];
-        }
-    }
-    workgroupBarrier();
-
-    if (n >= N) { return; }
-
-    let expert_nibble_base = e * N * D + n * D;
-    let expert_scale_base  = e * N * n_blocks + n * n_blocks;
-    let expert_zp_base     = e * N * zp_per_row + n * zp_per_row;
-    let expert_bias_base   = e * N + n;
-
-    var acc_local: f32 = 0.0;
-    for (var b: u32 = 0u; b < n_blocks; b = b + 1u) {
-        let scale: f32 = f32(w_scales[expert_scale_base + b]);
-        let zp_byte = load_byte(&w_zp, expert_zp_base + (b >> 1u));
-        let zp_nib = select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (b & 1u) == 1u);
-        let zp_f: f32 = f32(zp_nib);
-
-        let word_base = (expert_nibble_base + b * BLOCK) >> 3u;
-        let xb = b * BLOCK;
-
-        var block_sum: f32 = 0.0;
-        for (var wi: u32 = 0u; wi < 4u; wi = wi + 1u) {
-            let word = w_int4[word_base + wi];
-            let kb = wi * 8u;
-            let q0 = f32( word        & 0xFu) - zp_f;
-            let q1 = f32((word >>  4u) & 0xFu) - zp_f;
-            let q2 = f32((word >>  8u) & 0xFu) - zp_f;
-            let q3 = f32((word >> 12u) & 0xFu) - zp_f;
-            let q4 = f32((word >> 16u) & 0xFu) - zp_f;
-            let q5 = f32((word >> 20u) & 0xFu) - zp_f;
-            let q6 = f32((word >> 24u) & 0xFu) - zp_f;
-            let q7 = f32((word >> 28u) & 0xFu) - zp_f;
-            block_sum = fma(q0, glu_tile[xb + kb + 0u], block_sum);
-            block_sum = fma(q1, glu_tile[xb + kb + 1u], block_sum);
-            block_sum = fma(q2, glu_tile[xb + kb + 2u], block_sum);
-            block_sum = fma(q3, glu_tile[xb + kb + 3u], block_sum);
-            block_sum = fma(q4, glu_tile[xb + kb + 4u], block_sum);
-            block_sum = fma(q5, glu_tile[xb + kb + 5u], block_sum);
-            block_sum = fma(q6, glu_tile[xb + kb + 6u], block_sum);
-            block_sum = fma(q7, glu_tile[xb + kb + 7u], block_sum);
-        }
-        acc_local = fma(block_sum, scale, acc_local);
-    }
-    acc_local = acc_local + f32(bias[expert_bias_base]);
-
-    atomic_add_f32(t * N + n, w * acc_local);
-}
-`;
 
 // ---------- backend options ----------
 

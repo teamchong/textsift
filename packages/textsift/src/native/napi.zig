@@ -21,6 +21,7 @@ export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) c.napi
     register(env, exports, "roundtripBuffer", napiRoundtripBuffer) catch return null;
     register(env, exports, "dispatchDouble", napiDispatchDouble) catch return null;
     register(env, exports, "matmulF32", napiMatmulF32) catch return null;
+    register(env, exports, "dispatchRmsnorm", napiDispatchRmsnorm) catch return null;
     return exports;
 }
 
@@ -304,6 +305,65 @@ fn napiMatmulF32(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.nap
     };
 
     return out_typedarray;
+}
+
+fn napiGetUint8Array(env: c.napi_env, value: c.napi_value, label: [*:0]const u8) ?[]const u8 {
+    var arr_type: c.napi_typedarray_type = undefined;
+    var data_ptr: ?*anyopaque = null;
+    var byte_len: usize = 0;
+    if (c.napi_get_typedarray_info(env, value, &arr_type, &byte_len, &data_ptr, null, null) != c.napi_ok) {
+        _ = c.napi_throw_error(env, null, label);
+        return null;
+    }
+    if (arr_type != c.napi_uint8_array or data_ptr == null) {
+        _ = c.napi_throw_error(env, null, label);
+        return null;
+    }
+    return @as([*]const u8, @ptrCast(data_ptr.?))[0..byte_len];
+}
+
+fn napiDispatchRmsnorm(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argc: usize = 5;
+    var argv: [5]c.napi_value = undefined;
+    if (c.napi_get_cb_info(env, info, &argc, &argv, null, null) != c.napi_ok) {
+        return napiThrow(env, "napi_get_cb_info failed");
+    }
+    if (argc < 5) {
+        return napiThrow(env, "dispatchRmsnorm(uniform, x, gamma, dispatchX, outputSize) requires five arguments");
+    }
+    const uniform = napiGetUint8Array(env, argv[0], "argument 0 must be Uint8Array (uniform)") orelse return null;
+    const x = napiGetUint8Array(env, argv[1], "argument 1 must be Uint8Array (x)") orelse return null;
+    const gamma = napiGetUint8Array(env, argv[2], "argument 2 must be Uint8Array (gamma)") orelse return null;
+    const dispatch_x = napiGetU32(env, argv[3], "argument 3 must be u32 (dispatchX)") orelse return null;
+    const output_size = napiGetU32(env, argv[4], "argument 4 must be u32 (outputSize)") orelse return null;
+
+    var out_ab: c.napi_value = undefined;
+    var out_data_ptr: ?*anyopaque = null;
+    if (c.napi_create_arraybuffer(env, output_size, &out_data_ptr, &out_ab) != c.napi_ok) {
+        return napiThrow(env, "napi: failed to allocate output ArrayBuffer");
+    }
+    var out_typed: c.napi_value = undefined;
+    if (c.napi_create_typedarray(env, c.napi_uint8_array, output_size, out_ab, 0, &out_typed) != c.napi_ok) {
+        return napiThrow(env, "napi: failed to allocate output Uint8Array");
+    }
+    const output = @as([*]u8, @ptrCast(out_data_ptr.?))[0..output_size];
+
+    wgpu.dispatchRmsnorm(uniform, x, gamma, output, dispatch_x) catch |err| {
+        return switch (err) {
+            wgpu.WgpuError.BufferCreateFailed => napiThrow(env, "wgpu: createBuffer failed"),
+            wgpu.WgpuError.BufferMapFailed => napiThrow(env, "wgpu: mapAsync failed"),
+            wgpu.WgpuError.BufferRangeFailed => napiThrow(env, "wgpu: buffer range failed"),
+            wgpu.WgpuError.ShaderModuleFailed => napiThrow(env, "wgpu: createShaderModule failed"),
+            wgpu.WgpuError.ComputePipelineFailed => napiThrow(env, "wgpu: createComputePipeline failed"),
+            wgpu.WgpuError.BindGroupFailed => napiThrow(env, "wgpu: createBindGroup failed"),
+            wgpu.WgpuError.AdapterUnavailable =>
+                napiThrow(env, "WebGPU adapter not available on this host. Use textsift/browser instead."),
+            wgpu.WgpuError.ShaderF16Unavailable =>
+                napiThrow(env, "WebGPU adapter lacks shader-f16. Use textsift/browser instead."),
+            else => napiThrow(env, "wgpu: dispatchRmsnorm failed"),
+        };
+    };
+    return out_typed;
 }
 
 fn napiGetDeviceInfo(env: c.napi_env, _: c.napi_callback_info) callconv(.c) c.napi_value {

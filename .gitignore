@@ -21,3 +21,8 @@ measurements/
 tests/fixtures/pii-weights-full.bin
 # SPIR-V artifacts — compiled at build time from src/native/vulkan/shaders/*.comp.glsl
 packages/textsift/src/native/vulkan/shaders/*.spv
+# Vendored Dawn artifacts — built per-platform in CI (release.yml + bench.yml)
+# and downloaded into vendor/dawn/ at build time.
+packages/textsift/vendor/dawn/lib/*.a
+packages/textsift/vendor/dawn/lib/*.lib
+packages/textsift/vendor/dawn/lib/*.dll

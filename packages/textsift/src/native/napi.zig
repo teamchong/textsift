@@ -20,6 +20,7 @@ const builtin = @import("builtin");
 // (libvulkan-dev) out of macOS/Windows builds.
 const is_macos = builtin.os.tag == .macos;
 const is_linux = builtin.os.tag == .linux;
+const is_windows = builtin.os.tag == .windows;
 
 const c = @cImport({
     @cInclude("node_api.h");
@@ -28,6 +29,7 @@ const c = @cImport({
 export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) c.napi_value {
     Metal.registerAll(env, exports) catch return null;
     Vulkan.registerAll(env, exports) catch return null;
+    Dawn.registerAll(env, exports) catch return null;
     return exports;
 }
 
@@ -846,6 +848,349 @@ const Vulkan = if (is_linux) struct {
         }
         const out = @as([*]u8, @ptrCast(data_ptr.?))[0..byte_len];
         vk.submitAndReadback(e, out_buf, offset, out);
+        return typed;
+    }
+} else struct {
+    pub fn registerAll(env: c.napi_env, exports: c.napi_value) !void {
+        _ = env;
+        _ = exports;
+    }
+};
+
+// ── Dawn-direct backend (Linux + Windows) ──
+//
+// Statically-linked Google Dawn C++ library with a thin C bridge in
+// dawn/bridge.{h,c}. Tint compiles the canonical WGSL kernels at runtime
+// to SPIR-V (Linux/Vulkan backend) or HLSL→D3D12 (Windows/D3D12 backend);
+// Dawn handles the platform abstraction internally.
+//
+// On Linux this lives alongside Vulkan-direct so we can A/B Tint codegen
+// vs our hand-written GLSL→SPIR-V on the same hardware. On Windows it's
+// the only path (until/unless someone writes D3D12-direct with hand-tuned
+// HLSL kernels — analogous effort to the Mac Metal-direct port).
+//
+// JS calling convention for dawn* dispatches:
+//   - bindings: Array<BigInt> — buf handles in storage-binding-slot order.
+//   - uniformData: Uint8Array — bytes of the WGSL `var<uniform>` block(s)
+//                  concatenated in binding order (must total to the
+//                  pipeline's uniform_total_size; empty if 0).
+//   - grid:     Array<u32>[3] — workgroup count.
+const Dawn = if (is_linux or is_windows) struct {
+    const dn = @import("dawn_backend.zig");
+
+    pub fn registerAll(env: c.napi_env, exports: c.napi_value) !void {
+        try register(env, exports, "dawnCreateBackend", napiDnCreateBackend);
+        try register(env, exports, "dawnDestroyBackend", napiDnDestroyBackend);
+        try register(env, exports, "dawnDeviceName", napiDnDeviceName);
+        try register(env, exports, "dawnCreateBuffer", napiDnCreateBuffer);
+        try register(env, exports, "dawnCreateEmptyBuffer", napiDnCreateEmptyBuffer);
+        try register(env, exports, "dawnReleaseBuffer", napiDnReleaseBuffer);
+        try register(env, exports, "dawnReadBuffer", napiDnReadBuffer);
+        try register(env, exports, "dawnWriteBuffer", napiDnWriteBuffer);
+        try register(env, exports, "dawnDispatchOneShot", napiDnDispatchOneShot);
+        try register(env, exports, "dawnBeginEncoder", napiDnBeginEncoder);
+        try register(env, exports, "dawnEnqueueDispatch", napiDnEnqueueDispatch);
+        try register(env, exports, "dawnSubmitAndReadback", napiDnSubmitAndReadback);
+    }
+
+    fn napiDnCreateBackend(env: c.napi_env, _: c.napi_callback_info) callconv(.c) c.napi_value {
+        const b = dn.createBackend() catch |err| {
+            return switch (err) {
+                dn.DawnError.BackendCreateFailed => napiThrow(env, "dawn: createBackend failed (no Dawn-compatible adapter, or required features missing — see stderr)"),
+                else => napiThrow(env, "dawn: createBackend failed"),
+            };
+        };
+        var bn: c.napi_value = undefined;
+        if (c.napi_create_bigint_uint64(env, @intCast(@intFromPtr(b)), &bn) != c.napi_ok) {
+            dn.destroyBackend(b);
+            return napiThrow(env, "napi: failed to create handle bigint");
+        }
+        return bn;
+    }
+
+    fn napiDnDestroyBackend(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+        var argc: usize = 1; var argv: [1]c.napi_value = undefined;
+        _ = c.napi_get_cb_info(env, info, &argc, &argv, null, null);
+        if (argc < 1) return napiThrow(env, "dawnDestroyBackend(handle) requires 1 arg");
+        var raw: u64 = 0; var lossless: bool = false;
+        if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok) {
+            return napiThrow(env, "argument 0 must be BigInt handle");
+        }
+        if (raw != 0) {
+            const b: *dn.Backend = @ptrFromInt(@as(usize, @intCast(raw)));
+            dn.destroyBackend(b);
+        }
+        var u: c.napi_value = undefined;
+        _ = c.napi_get_undefined(env, &u);
+        return u;
+    }
+
+    fn napiDnDeviceName(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+        var argc: usize = 1; var argv: [1]c.napi_value = undefined;
+        _ = c.napi_get_cb_info(env, info, &argc, &argv, null, null);
+        if (argc < 1) return napiThrow(env, "dawnDeviceName(handle) requires 1 arg");
+        var raw: u64 = 0; var lossless: bool = false;
+        if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok or raw == 0) {
+            return napiThrow(env, "argument 0 must be non-null BigInt handle");
+        }
+        const b: *dn.Backend = @ptrFromInt(@as(usize, @intCast(raw)));
+        const name = dn.deviceName(b);
+        var s: c.napi_value = undefined;
+        if (c.napi_create_string_utf8(env, name, c.NAPI_AUTO_LENGTH, &s) != c.napi_ok) {
+            return napiThrow(env, "napi: failed to create string");
+        }
+        return s;
+    }
+
+    fn napiDnCreateBuffer(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+        var argc: usize = 2; var argv: [2]c.napi_value = undefined;
+        _ = c.napi_get_cb_info(env, info, &argc, &argv, null, null);
+        if (argc < 2) return napiThrow(env, "dawnCreateBuffer(handle, bytes) requires 2 args");
+        var raw: u64 = 0; var lossless: bool = false;
+        if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok or raw == 0) {
+            return napiThrow(env, "argument 0 must be non-null BigInt handle");
+        }
+        const b: *dn.Backend = @ptrFromInt(@as(usize, @intCast(raw)));
+        const bytes = napiGetUint8Array(env, argv[1], "argument 1 must be Uint8Array (bytes)") orelse return null;
+        const buf = dn.createBuffer(b, bytes) catch return napiThrow(env, "dawn: createBuffer failed");
+        var bn: c.napi_value = undefined;
+        if (c.napi_create_bigint_uint64(env, @intCast(@intFromPtr(buf)), &bn) != c.napi_ok) {
+            dn.releaseBuffer(b, buf);
+            return napiThrow(env, "napi: failed to create buffer handle");
+        }
+        return bn;
+    }
+
+    fn napiDnCreateEmptyBuffer(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+        var argc: usize = 2; var argv: [2]c.napi_value = undefined;
+        _ = c.napi_get_cb_info(env, info, &argc, &argv, null, null);
+        if (argc < 2) return napiThrow(env, "dawnCreateEmptyBuffer(handle, byteLen) requires 2 args");
+        var raw: u64 = 0; var lossless: bool = false;
+        if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok or raw == 0) {
+            return napiThrow(env, "argument 0 must be non-null BigInt handle");
+        }
+        const b: *dn.Backend = @ptrFromInt(@as(usize, @intCast(raw)));
+        const len = napiGetU32(env, argv[1], "argument 1 must be u32 (byteLen)") orelse return null;
+        const buf = dn.createEmptyBuffer(b, len) catch return napiThrow(env, "dawn: createEmptyBuffer failed");
+        var bn: c.napi_value = undefined;
+        if (c.napi_create_bigint_uint64(env, @intCast(@intFromPtr(buf)), &bn) != c.napi_ok) {
+            dn.releaseBuffer(b, buf);
+            return napiThrow(env, "napi: failed to create buffer handle");
+        }
+        return bn;
+    }
+
+    fn napiDnReleaseBuffer(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+        var argc: usize = 2; var argv: [2]c.napi_value = undefined;
+        _ = c.napi_get_cb_info(env, info, &argc, &argv, null, null);
+        if (argc < 2) return napiThrow(env, "dawnReleaseBuffer(handle, buf) requires 2 args");
+        var raw: u64 = 0; var lossless: bool = false;
+        if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok or raw == 0) {
+            return napiThrow(env, "argument 0 must be non-null BigInt handle");
+        }
+        const b: *dn.Backend = @ptrFromInt(@as(usize, @intCast(raw)));
+        var bufRaw: u64 = 0;
+        if (c.napi_get_value_bigint_uint64(env, argv[1], &bufRaw, &lossless) != c.napi_ok) {
+            return napiThrow(env, "argument 1 must be BigInt buffer handle");
+        }
+        if (bufRaw != 0) {
+            const buf: dn.cb.TsDawnBuffer = @ptrFromInt(@as(usize, @intCast(bufRaw)));
+            dn.releaseBuffer(b, buf);
+        }
+        var u: c.napi_value = undefined;
+        _ = c.napi_get_undefined(env, &u);
+        return u;
+    }
+
+    fn napiDnWriteBuffer(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+        var argc: usize = 4; var argv: [4]c.napi_value = undefined;
+        _ = c.napi_get_cb_info(env, info, &argc, &argv, null, null);
+        if (argc < 4) return napiThrow(env, "dawnWriteBuffer(handle, buf, offset, bytes) requires 4 args");
+        var raw: u64 = 0; var lossless: bool = false;
+        if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok or raw == 0) {
+            return napiThrow(env, "argument 0 must be non-null backend BigInt");
+        }
+        const b: *dn.Backend = @ptrFromInt(@as(usize, @intCast(raw)));
+        var bufRaw: u64 = 0;
+        if (c.napi_get_value_bigint_uint64(env, argv[1], &bufRaw, &lossless) != c.napi_ok or bufRaw == 0) {
+            return napiThrow(env, "argument 1 must be non-null buffer BigInt");
+        }
+        const buf: dn.cb.TsDawnBuffer = @ptrFromInt(@as(usize, @intCast(bufRaw)));
+        const offset = napiGetU32(env, argv[2], "argument 2 must be u32 (offset)") orelse return null;
+        const bytes = napiGetUint8Array(env, argv[3], "argument 3 must be Uint8Array (bytes)") orelse return null;
+        dn.writeBuffer(b, buf, offset, bytes);
+        var u: c.napi_value = undefined;
+        _ = c.napi_get_undefined(env, &u);
+        return u;
+    }
+
+    fn napiDnReadBuffer(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+        var argc: usize = 4; var argv: [4]c.napi_value = undefined;
+        _ = c.napi_get_cb_info(env, info, &argc, &argv, null, null);
+        if (argc < 4) return napiThrow(env, "dawnReadBuffer(handle, buf, offset, byteLen) requires 4 args");
+        var raw: u64 = 0; var lossless: bool = false;
+        if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok or raw == 0) {
+            return napiThrow(env, "argument 0 must be non-null backend BigInt");
+        }
+        const b: *dn.Backend = @ptrFromInt(@as(usize, @intCast(raw)));
+        var bufRaw: u64 = 0;
+        if (c.napi_get_value_bigint_uint64(env, argv[1], &bufRaw, &lossless) != c.napi_ok or bufRaw == 0) {
+            return napiThrow(env, "argument 1 must be non-null buffer BigInt");
+        }
+        const buf: dn.cb.TsDawnBuffer = @ptrFromInt(@as(usize, @intCast(bufRaw)));
+        const offset = napiGetU32(env, argv[2], "argument 2 must be u32 (offset)") orelse return null;
+        const byte_len = napiGetU32(env, argv[3], "argument 3 must be u32 (byteLen)") orelse return null;
+
+        var ab: c.napi_value = undefined;
+        var data_ptr: ?*anyopaque = null;
+        if (c.napi_create_arraybuffer(env, byte_len, &data_ptr, &ab) != c.napi_ok) {
+            return napiThrow(env, "napi: alloc out ArrayBuffer failed");
+        }
+        var typed: c.napi_value = undefined;
+        if (c.napi_create_typedarray(env, c.napi_uint8_array, byte_len, ab, 0, &typed) != c.napi_ok) {
+            return napiThrow(env, "napi: alloc Uint8Array failed");
+        }
+        const out = @as([*]u8, @ptrCast(data_ptr.?))[0..byte_len];
+        dn.readBuffer(b, buf, offset, out);
+        return typed;
+    }
+
+    const ParseError = error{ ParseFailed };
+    fn parseBindings(env: c.napi_env, arr: c.napi_value, out: *[16]dn.cb.TsDawnBuffer) ParseError!u32 {
+        const n = napiArrayLen(env, arr) orelse {
+            _ = napiThrow(env, "bindings must be Array");
+            return ParseError.ParseFailed;
+        };
+        if (n > 16) {
+            _ = napiThrow(env, "too many bindings (max 16)");
+            return ParseError.ParseFailed;
+        }
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            const item = napiArrayGet(env, arr, i) orelse {
+                _ = napiThrow(env, "bindings[i] missing");
+                return ParseError.ParseFailed;
+            };
+            var raw: u64 = 0; var lossless: bool = false;
+            if (c.napi_get_value_bigint_uint64(env, item, &raw, &lossless) != c.napi_ok or raw == 0) {
+                _ = napiThrow(env, "bindings[i] must be non-null BigInt buffer handle");
+                return ParseError.ParseFailed;
+            }
+            out[i] = @ptrFromInt(@as(usize, @intCast(raw)));
+        }
+        return n;
+    }
+
+    fn parseGrid(env: c.napi_env, arr: c.napi_value) ?[3]u32 {
+        const gx = napiGetU32(env, napiArrayGet(env, arr, 0) orelse return null, "grid[0]") orelse return null;
+        const gy = napiGetU32(env, napiArrayGet(env, arr, 1) orelse return null, "grid[1]") orelse return null;
+        const gz = napiGetU32(env, napiArrayGet(env, arr, 2) orelse return null, "grid[2]") orelse return null;
+        return .{ gx, gy, gz };
+    }
+
+    fn napiDnDispatchOneShot(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+        var argc: usize = 5; var argv: [5]c.napi_value = undefined;
+        _ = c.napi_get_cb_info(env, info, &argc, &argv, null, null);
+        if (argc < 5) return napiThrow(env, "dawnDispatchOneShot(handle, name, bindings, uniformData, grid) requires 5 args");
+        var raw: u64 = 0; var lossless: bool = false;
+        if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok or raw == 0) {
+            return napiThrow(env, "argument 0 must be non-null backend BigInt");
+        }
+        const b: *dn.Backend = @ptrFromInt(@as(usize, @intCast(raw)));
+        const name_buf = napiGetString(env, argv[1], "argument 1 must be string (name)") orelse return null;
+        defer std.heap.c_allocator.free(name_buf);
+        var bindings: [16]dn.cb.TsDawnBuffer = undefined;
+        const n = parseBindings(env, argv[2], &bindings) catch return null;
+        const uni = napiGetUint8Array(env, argv[3], "argument 3 must be Uint8Array (uniformData)") orelse return null;
+        const grid = parseGrid(env, argv[4]) orelse return null;
+
+        dn.dispatchOneShot(b, name_buf, bindings[0..n], uni, grid) catch |err| {
+            return switch (err) {
+                dn.DawnError.UnknownKernel => napiThrow(env, "dawn: unknown kernel name (not in SHADERS table)"),
+                dn.DawnError.PipelineCreateFailed => napiThrow(env, "dawn: pipeline creation failed (see stderr)"),
+                dn.DawnError.BindingMismatch => napiThrow(env, "dawn: binding count or uniform size mismatch vs pipeline"),
+                else => napiThrow(env, "dawn: dispatchOneShot failed"),
+            };
+        };
+        var u: c.napi_value = undefined;
+        _ = c.napi_get_undefined(env, &u);
+        return u;
+    }
+
+    fn napiDnBeginEncoder(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+        var argc: usize = 1; var argv: [1]c.napi_value = undefined;
+        _ = c.napi_get_cb_info(env, info, &argc, &argv, null, null);
+        if (argc < 1) return napiThrow(env, "dawnBeginEncoder(handle) requires 1 arg");
+        var raw: u64 = 0; var lossless: bool = false;
+        if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok or raw == 0) {
+            return napiThrow(env, "argument 0 must be non-null backend BigInt");
+        }
+        const b: *dn.Backend = @ptrFromInt(@as(usize, @intCast(raw)));
+        const e = dn.beginEncoder(b) catch return napiThrow(env, "dawn: beginEncoder failed");
+        var bn: c.napi_value = undefined;
+        if (c.napi_create_bigint_uint64(env, @intCast(@intFromPtr(e)), &bn) != c.napi_ok) {
+            return napiThrow(env, "napi: failed to create encoder handle");
+        }
+        return bn;
+    }
+
+    fn napiDnEnqueueDispatch(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+        var argc: usize = 5; var argv: [5]c.napi_value = undefined;
+        _ = c.napi_get_cb_info(env, info, &argc, &argv, null, null);
+        if (argc < 5) return napiThrow(env, "dawnEnqueueDispatch(encoder, name, bindings, uniformData, grid) requires 5 args");
+        var raw: u64 = 0; var lossless: bool = false;
+        if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok or raw == 0) {
+            return napiThrow(env, "argument 0 must be non-null encoder BigInt");
+        }
+        const e: *dn.Encoder = @ptrFromInt(@as(usize, @intCast(raw)));
+        const name_buf = napiGetString(env, argv[1], "argument 1 must be string (name)") orelse return null;
+        defer std.heap.c_allocator.free(name_buf);
+        var bindings: [16]dn.cb.TsDawnBuffer = undefined;
+        const n = parseBindings(env, argv[2], &bindings) catch return null;
+        const uni = napiGetUint8Array(env, argv[3], "argument 3 must be Uint8Array (uniformData)") orelse return null;
+        const grid = parseGrid(env, argv[4]) orelse return null;
+
+        dn.enqueueOnEncoder(e, name_buf, bindings[0..n], uni, grid) catch |err| {
+            return switch (err) {
+                dn.DawnError.UnknownKernel => napiThrow(env, "dawn: unknown kernel name (not in SHADERS table)"),
+                dn.DawnError.PipelineCreateFailed => napiThrow(env, "dawn: pipeline creation failed (see stderr)"),
+                dn.DawnError.BindingMismatch => napiThrow(env, "dawn: binding count or uniform size mismatch vs pipeline"),
+                else => napiThrow(env, "dawn: enqueueDispatch failed"),
+            };
+        };
+        var u: c.napi_value = undefined;
+        _ = c.napi_get_undefined(env, &u);
+        return u;
+    }
+
+    fn napiDnSubmitAndReadback(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+        var argc: usize = 4; var argv: [4]c.napi_value = undefined;
+        _ = c.napi_get_cb_info(env, info, &argc, &argv, null, null);
+        if (argc < 4) return napiThrow(env, "dawnSubmitAndReadback(encoder, outBuf, offset, byteLen) requires 4 args");
+        var raw: u64 = 0; var lossless: bool = false;
+        if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok or raw == 0) {
+            return napiThrow(env, "argument 0 must be non-null encoder BigInt");
+        }
+        const e: *dn.Encoder = @ptrFromInt(@as(usize, @intCast(raw)));
+        var bufRaw: u64 = 0;
+        if (c.napi_get_value_bigint_uint64(env, argv[1], &bufRaw, &lossless) != c.napi_ok or bufRaw == 0) {
+            return napiThrow(env, "argument 1 must be non-null buffer BigInt");
+        }
+        const out_buf: dn.cb.TsDawnBuffer = @ptrFromInt(@as(usize, @intCast(bufRaw)));
+        const offset = napiGetU32(env, argv[2], "argument 2 must be u32 (offset)") orelse return null;
+        const byte_len = napiGetU32(env, argv[3], "argument 3 must be u32 (byteLen)") orelse return null;
+
+        var ab: c.napi_value = undefined;
+        var data_ptr: ?*anyopaque = null;
+        if (c.napi_create_arraybuffer(env, byte_len, &data_ptr, &ab) != c.napi_ok) {
+            return napiThrow(env, "napi: alloc out ArrayBuffer failed");
+        }
+        var typed: c.napi_value = undefined;
+        if (c.napi_create_typedarray(env, c.napi_uint8_array, byte_len, ab, 0, &typed) != c.napi_ok) {
+            return napiThrow(env, "napi: alloc Uint8Array failed");
+        }
+        const out = @as([*]u8, @ptrCast(data_ptr.?))[0..byte_len];
+        dn.submitAndReadback(e, out_buf, offset, out);
         return typed;
     }
 } else struct {

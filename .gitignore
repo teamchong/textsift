@@ -26,3 +26,10 @@ packages/textsift/src/native/vulkan/shaders/*.spv
 packages/textsift/vendor/dawn/lib/*.a
 packages/textsift/vendor/dawn/lib/*.lib
 packages/textsift/vendor/dawn/lib/*.dll
+# CI bench summary output (uploaded as workflow artifact, aggregated
+# across OS by scripts/bench-aggregate.mjs into the workflow summary).
+bench-results.json
+# Per-triple subpackage staging dir written by scripts/publish-natives.mjs.
+# Contents are published to npm as @textsift/native-{linux-x64,...} and
+# linked from the umbrella package's optionalDependencies.
+dist-pkg/

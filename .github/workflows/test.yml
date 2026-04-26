@@ -1,0 +1,172 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel older runs on the same ref so PRs don't queue forever.
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-x64
+            backend: vulkan
+          - os: macos-latest
+            label: darwin-arm64
+            backend: metal
+          # Windows runs Dawn-direct only — comptime gate skips Vulkan on win32.
+          - os: windows-latest
+            label: windows-x64
+            backend: dawn
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - uses: jdx/mise-action@v2
+        with:
+          experimental: true
+
+      # ── platform-specific prereqs ──
+      - name: Install Linux prereqs
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            glslang-tools \
+            libvulkan-dev \
+            vulkan-tools \
+            mesa-vulkan-drivers \
+            cmake \
+            ninja-build \
+            clang
+
+      - name: Install macOS prereqs
+        if: runner.os == 'macOS'
+        run: |
+          # glslang for the Vulkan path (unused on Mac but the build script
+          # checks for it anyway via comptime gate; harmless when present).
+          # Metal frameworks are stock on macOS — nothing to install.
+          brew install glslang cmake ninja
+
+      - name: Install Windows prereqs
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install -y cmake ninja
+          # Vulkan SDK (provides glslang on Windows; not strictly needed for
+          # the Dawn-only Windows build but doesn't hurt).
+          # choco install -y vulkan-sdk  # optional
+
+      # ── Dawn (Linux/Windows only — Mac doesn't compile Dawn into the .node) ──
+      - name: Cache Dawn build
+        if: matrix.backend != 'metal'
+        id: dawn-cache
+        uses: actions/cache@v4
+        with:
+          path: packages/textsift/vendor/dawn
+          key: dawn-${{ runner.os }}-${{ runner.arch }}-2026-04-26
+          # If the Dawn revision changes, bump the date suffix above.
+
+      - name: Build Dawn (cache miss)
+        if: matrix.backend != 'metal' && steps.dawn-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -e
+          git clone --depth 1 https://dawn.googlesource.com/dawn /tmp/dawn
+          cd /tmp/dawn
+          CC=clang CXX=clang++ cmake -B out -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_VISIBILITY_PRESET=hidden \
+            -DCMAKE_C_VISIBILITY_PRESET=hidden \
+            -DCMAKE_VISIBILITY_INLINES_HIDDEN=ON \
+            -DDAWN_FETCH_DEPENDENCIES=ON \
+            -DDAWN_BUILD_SAMPLES=OFF \
+            -DDAWN_USE_GLFW=OFF \
+            -DDAWN_USE_X11=OFF \
+            -DDAWN_USE_WAYLAND=OFF \
+            -DDAWN_ENABLE_OPENGLES=OFF \
+            -DDAWN_ENABLE_DESKTOP_GL=OFF \
+            -DDAWN_BUILD_TESTS=OFF \
+            -DTINT_BUILD_TESTS=OFF \
+            -DTINT_BUILD_CMD_TOOLS=OFF
+          ninja -C out -j$(nproc 2>/dev/null || echo 4) webgpu_dawn
+
+          # Vendor the artifacts.
+          DAWN_VENDOR="$GITHUB_WORKSPACE/packages/textsift/vendor/dawn"
+          mkdir -p "$DAWN_VENDOR/include/webgpu" "$DAWN_VENDOR/include/dawn" "$DAWN_VENDOR/lib"
+          cp /tmp/dawn/include/webgpu/webgpu.h "$DAWN_VENDOR/include/webgpu/"
+          cp /tmp/dawn/out/gen/include/dawn/webgpu.h "$DAWN_VENDOR/include/dawn/"
+          cp /tmp/dawn/out/src/dawn/native/libwebgpu_dawn.a "$DAWN_VENDOR/lib/"
+
+      # ── Build textsift-native.node ──
+      - name: Install npm deps
+        run: npm install --no-audit --no-fund
+
+      - name: Build native (.node)
+        shell: bash
+        run: bash packages/textsift/scripts/build-native.sh
+
+      - name: Build TS (dist/index.js)
+        shell: bash
+        run: cd packages/textsift && bun build src/index.ts --outdir dist --target node --format esm --sourcemap=external
+
+      # ── Conformance (per-backend) ──
+      - name: Conformance — Vulkan-direct
+        if: matrix.backend == 'vulkan'
+        run: node tests/native/vulkan/conformance-all.js
+
+      - name: Conformance — Dawn-direct
+        if: matrix.backend != 'metal'
+        run: node tests/native/dawn/conformance-all.js
+
+      - name: Conformance — Metal-direct
+        if: matrix.backend == 'metal'
+        run: node tests/native/metal/conformance-all.js
+
+      # ── End-to-end PrivacyFilter integration test ──
+      # Note: filter-redact downloads ~770 MB of model weights on first run.
+      # The cache keeps it across runs.
+      - name: Cache model weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/textsift
+          key: textsift-model-q4f16-2026-04-26
+
+      - name: Integration test — filter().redact() end-to-end (native GPU path)
+        run: node tests/native/integration/filter-redact.test.js
+
+      - name: Integration test — WASM fallback fires when native unavailable
+        run: node tests/native/integration/filter-fallback.test.js
+
+  # Browser test path — independent of the native test matrix above.
+  browser-test:
+    name: browser (playwright)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - run: npm install --no-audit --no-fund
+      - run: bun x playwright install --with-deps chromium
+      - run: bun x playwright test

@@ -1,0 +1,119 @@
+name: bench
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1"   # weekly Monday 06:00 UTC
+
+# One bench job per OS family — not one per OS/arch, because we mostly care
+# about cross-platform comparison (Linux vs Mac vs Windows) rather than
+# x64 vs arm64 within an OS.
+jobs:
+  bench:
+    name: bench ${{ matrix.os_family }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            os_family: linux
+            backend: vulkan
+          - os: macos-latest
+            os_family: darwin
+            backend: metal
+          - os: windows-latest
+            os_family: windows
+            backend: dawn
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - uses: jdx/mise-action@v2
+        with: { experimental: true }
+
+      - name: Linux prereqs
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslang-tools libvulkan-dev mesa-vulkan-drivers cmake ninja-build clang
+      - name: macOS prereqs
+        if: runner.os == 'macOS'
+        run: brew install glslang cmake ninja
+      - name: Windows prereqs
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install -y cmake ninja
+
+      - name: Cache Dawn
+        if: matrix.backend != 'metal'
+        id: dawn-cache
+        uses: actions/cache@v4
+        with:
+          path: packages/textsift/vendor/dawn
+          key: dawn-${{ runner.os }}-${{ runner.arch }}-2026-04-26
+
+      - name: Build Dawn (cache miss)
+        if: matrix.backend != 'metal' && steps.dawn-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -e
+          git clone --depth 1 https://dawn.googlesource.com/dawn /tmp/dawn
+          cd /tmp/dawn
+          CC=clang CXX=clang++ cmake -B out -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_VISIBILITY_PRESET=hidden \
+            -DCMAKE_C_VISIBILITY_PRESET=hidden \
+            -DCMAKE_VISIBILITY_INLINES_HIDDEN=ON \
+            -DDAWN_FETCH_DEPENDENCIES=ON \
+            -DDAWN_BUILD_SAMPLES=OFF \
+            -DDAWN_USE_GLFW=OFF -DDAWN_USE_X11=OFF -DDAWN_USE_WAYLAND=OFF \
+            -DDAWN_ENABLE_OPENGLES=OFF -DDAWN_ENABLE_DESKTOP_GL=OFF \
+            -DDAWN_BUILD_TESTS=OFF -DTINT_BUILD_TESTS=OFF -DTINT_BUILD_CMD_TOOLS=OFF
+          ninja -C out -j$(nproc 2>/dev/null || echo 4) webgpu_dawn
+          DAWN_VENDOR="$GITHUB_WORKSPACE/packages/textsift/vendor/dawn"
+          mkdir -p "$DAWN_VENDOR/include/webgpu" "$DAWN_VENDOR/include/dawn" "$DAWN_VENDOR/lib"
+          cp /tmp/dawn/include/webgpu/webgpu.h "$DAWN_VENDOR/include/webgpu/"
+          cp /tmp/dawn/out/gen/include/dawn/webgpu.h "$DAWN_VENDOR/include/dawn/"
+          cp /tmp/dawn/out/src/dawn/native/libwebgpu_dawn.a "$DAWN_VENDOR/lib/"
+
+      - run: npm install --no-audit --no-fund
+      - run: bash packages/textsift/scripts/build-native.sh
+      - run: cd packages/textsift && bun build src/index.ts --outdir dist --target node --format esm --sourcemap=external
+
+      # ── Bench: emit results as the GitHub Actions step summary ──
+      - name: Bench forward path
+        env:
+          OS_FAMILY: ${{ matrix.os_family }}
+          BACKEND: ${{ matrix.backend }}
+        shell: bash
+        run: node scripts/bench-summary.mjs
+
+      - name: Upload bench JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.os_family }}
+          path: bench-results.json
+          retention-days: 30
+
+  # Aggregator: pulls each OS's bench-results.json and writes a combined
+  # markdown summary on the parent workflow run.
+  summarize:
+    name: aggregate bench summary
+    runs-on: ubuntu-latest
+    needs: bench
+    if: always()    # show partial results even if one OS failed
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: bench-artifacts
+          pattern: bench-*
+
+      - name: Build aggregate summary
+        shell: bash
+        run: node scripts/bench-aggregate.mjs bench-artifacts >> $GITHUB_STEP_SUMMARY

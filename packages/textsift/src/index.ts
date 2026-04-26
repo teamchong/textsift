@@ -28,7 +28,11 @@ export type {
   RedactResult,
   Rule,
   SpanLabel,
+  MarkerStrategy,
 } from "./browser/types.js";
+
+export { secretRules, RULE_PRESETS, markerPresets } from "./browser/index.js";
+export type { RulePresetName, MarkerPresetName } from "./browser/index.js";
 
 /**
  * `PrivacyFilter` for Node — wraps the browser implementation but

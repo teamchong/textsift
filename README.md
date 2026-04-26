@@ -91,6 +91,18 @@ const filter = await PrivacyFilter.create({ presets: ["secrets"] });
 // npm tokens, PEM private-key headers. All severity "block".
 ```
 
+Faker mode — emit realistic fakes instead of `[private_email]` markers (so downstream validators / templates / pipelines still see PII-shaped data):
+
+```ts
+import { PrivacyFilter, markerPresets } from "textsift";
+
+const filter = await PrivacyFilter.create({ markers: markerPresets.faker() });
+await filter.redact("Hi Alice, email alice@example.com, phone +1-555-0123");
+// → "Hi Alice Anderson, email alice.anderson@example.com, phone +1-555-0100"
+//   Same input text → same fake within the filter's lifetime
+//   (so "Alice" appearing twice yields "Alice Anderson" both times)
+```
+
 Batch inputs, custom markers, per-category enabling — see the [API reference](https://teamchong.github.io/textsift/api/).
 
 ## Measured numbers

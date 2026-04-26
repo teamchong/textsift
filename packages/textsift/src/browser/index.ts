@@ -68,5 +68,10 @@ export type {
 export { secretRules, RULE_PRESETS } from "./inference/rule-presets.js";
 export type { RulePresetName } from "./inference/rule-presets.js";
 
+// Built-in marker strategies. `markerPresets.faker()` swaps the
+// default `[label]` markers for realistic-looking fake values.
+export { markerPresets } from "./inference/marker-presets.js";
+export type { MarkerPresetName } from "./inference/marker-presets.js";
+
 export { ALL_SPAN_LABELS, PrivacyFilterError } from "./types.js";
 export type { PrivacyFilterErrorCode } from "./types.js";

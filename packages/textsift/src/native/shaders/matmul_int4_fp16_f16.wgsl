@@ -22,17 +22,10 @@ const X_TILE_SIZE: u32 = TR * BLOCK;  // 4 * 32 = 128 floats per tile
 var<workgroup> x_tile: array<f32, X_TILE_SIZE>;
 
 
-fn load_byte(arr: ptr<storage, array<u32>, read>, byte_idx: u32) -> u32 {
-    let word = (*arr)[byte_idx >> 2u];
-    let shift = (byte_idx & 3u) * 8u;
-    return (word >> shift) & 0xFFu;
-}
-
-fn load_nibble(arr: ptr<storage, array<u32>, read>, nibble_idx: u32) -> u32 {
-    let byte_val = load_byte(arr, nibble_idx >> 1u);
-    let hi = (nibble_idx & 1u) == 1u;
-    return select(byte_val & 0xFu, (byte_val >> 4u) & 0xFu, hi);
-}
+// Inlined int4-access primitives — Naga (wgpu-native) rejects
+// ptr<storage, ...> as function args, so the helpers are spelled
+// out at every call site as direct array reads. See note in
+// embed_lookup_int4.wgsl.
 
 
 // 2D dispatch: workgroup_id.x indexes 64-wide N tiles, .y indexes
@@ -81,7 +74,8 @@ fn main(
 
         if (n_active) {
             let scale: f32 = f32(w_scales[scale_row + b]);
-            let zp_byte = load_byte(&w_zp, n * zp_per_row + (b >> 1u));
+            let zp_byte_idx = n * zp_per_row + (b >> 1u);
+            let zp_byte = (w_zp[zp_byte_idx >> 2u] >> ((zp_byte_idx & 3u) * 8u)) & 0xFFu;
             let zp_nib = select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (b & 1u) == 1u);
             let zp_f: f32 = f32(zp_nib);
             let word_base = (nibble_row_base + b * BLOCK) >> 3u;

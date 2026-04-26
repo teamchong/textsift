@@ -13,17 +13,7 @@ struct Dims { T: u32, N: u32, K: u32, _pad: u32 };
 const BLOCK: u32 = 32u;
 
 
-fn load_byte(arr: ptr<storage, array<u32>, read>, byte_idx: u32) -> u32 {
-    let word = (*arr)[byte_idx >> 2u];
-    let shift = (byte_idx & 3u) * 8u;
-    return (word >> shift) & 0xFFu;
-}
-
-fn load_nibble(arr: ptr<storage, array<u32>, read>, nibble_idx: u32) -> u32 {
-    let byte_val = load_byte(arr, nibble_idx >> 1u);
-    let hi = (nibble_idx & 1u) == 1u;
-    return select(byte_val & 0xFu, (byte_val >> 4u) & 0xFu, hi);
-}
+// Inlined int4-access (Naga rejects ptr<storage, ...> as fn args).
 
 
 @compute @workgroup_size(64, 1, 1)
@@ -45,7 +35,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var b: u32 = 0u; b < n_blocks; b = b + 1u) {
         let scale: f32 = f32(w_scales[scale_row + b]);
         let zp_byte_idx = n * zp_per_row + (b >> 1u);
-        let zp_byte = load_byte(&w_zp, zp_byte_idx);
+        let zp_byte = (w_zp[zp_byte_idx >> 2u] >> ((zp_byte_idx & 3u) * 8u)) & 0xFFu;
         let zp_nib = select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (b & 1u) == 1u);
         let zp_f: f32 = f32(zp_nib);
 

@@ -12,6 +12,8 @@ const SHADERS = [
   "add_fp16",
   "swiglu_clamp",
   "rope_apply",
+  "matmul_int4_fp16_f16",
+  "matmul_int4_f32_f32",
 ];
 
 let failed = 0;

@@ -12,6 +12,10 @@ pub const c = @cImport({
     @cInclude("webgpu/wgpu.h");
 });
 
+const std_c = @cImport({
+    @cInclude("stdio.h");
+});
+
 pub const AdapterInfo = struct {
     vendor: []const u8,
     architecture: []const u8,
@@ -174,6 +178,34 @@ pub fn requireShaderF16(adapter: c.WGPUAdapter) WgpuError!void {
     }
 }
 
+// Per-thread storage for the most recent uncaptured device error.
+// Naga's default handler panics, which crashes the Node process; we
+// install our own callback that just records the message so the
+// caller can fail gracefully and surface it to the test runner.
+var last_device_error_buf: [4096]u8 = undefined;
+var last_device_error_len: usize = 0;
+
+fn onUncapturedError(
+    _: ?*const c.WGPUDevice,
+    _: c.WGPUErrorType,
+    message: c.WGPUStringView,
+    _: ?*anyopaque,
+    _: ?*anyopaque,
+) callconv(.c) void {
+    const msg_len = if (message.length == std.math.maxInt(usize))
+        std.mem.len(@as([*:0]const u8, @ptrCast(message.data orelse return)))
+    else
+        message.length;
+    const copy_len = @min(msg_len, last_device_error_buf.len);
+    if (message.data) |d| {
+        @memcpy(last_device_error_buf[0..copy_len], d[0..copy_len]);
+    }
+    last_device_error_len = copy_len;
+    // Surface to stderr via libc so the test runner sees the
+    // actual WGSL validation error (avoids Zig stdlib API churn).
+    _ = std_c.fprintf(std_c.stderr(), "wgpu validation error: %.*s\n", @as(c_int, @intCast(copy_len)), last_device_error_buf[0..copy_len].ptr);
+}
+
 /// Request a device with the same limit clamps the browser
 /// WebGpuBackend uses (so a kernel that fits in the browser fits in
 /// the native binding too). Returns the device handle; caller owns
@@ -233,6 +265,12 @@ pub fn createDevice(
     desc.requiredFeatureCount = required_features.len;
     desc.requiredFeatures = &required_features;
     desc.requiredLimits = &required_limits;
+    desc.uncapturedErrorCallbackInfo = .{
+        .nextInChain = null,
+        .callback = onUncapturedError,
+        .userdata1 = null,
+        .userdata2 = null,
+    };
 
     var state = DeviceState{};
     const cb = c.WGPURequestDeviceCallbackInfo{

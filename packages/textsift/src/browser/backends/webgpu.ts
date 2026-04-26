@@ -29,7 +29,6 @@ import type {
   Logits,
 } from "./abstract.js";
 import {
-  INT4_ACCESS_WGSL,
   MATMUL_INT4_F32_F32_WGSL,
   MATMUL_INT4_FP16_F16_WGSL,
   EMBED_LOOKUP_INT4_WGSL,

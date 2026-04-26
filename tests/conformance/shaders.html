@@ -59,6 +59,48 @@
         for (let i = 0; i < n; i++) out[i] = Math.floor((rng() + 1) * 0.5 * max) >>> 0;
         return new Uint8Array(out.buffer);
       }
+      // Pack `nibbles` (uint4 values 0..15, length must be multiple of 8)
+      // into a u32 array, LSB-first nibble order. Matches the packing
+      // every int4 kernel in this codebase reads.
+      function packNibbles(nibbles) {
+        if ((nibbles.length & 7) !== 0) throw new Error("nibbles must be multiple of 8");
+        const words = new Uint32Array(nibbles.length >>> 3);
+        for (let i = 0; i < nibbles.length; i++) {
+          const w = i >>> 3;
+          const slot = i & 7;
+          words[w] |= (nibbles[i] & 0xf) << (slot * 4);
+        }
+        return new Uint8Array(words.buffer);
+      }
+      // Pack zero-points: per-row, 2 zp nibbles per byte, then bytes
+      // stored in a u32 array (loaded by load_byte). zpPerRow bytes
+      // per row of N. Returns Uint8Array sized to ceil(N*zpPerRow/4)*4
+      // u32 words.
+      function packZp(N, n_blocks, seed) {
+        const zp_per_row = (n_blocks + 1) >>> 1;
+        const total_bytes = N * zp_per_row;
+        const u32_count = (total_bytes + 3) >>> 2;
+        const words = new Uint32Array(u32_count);
+        const rng = makeRng(seed);
+        for (let n = 0; n < N; n++) {
+          for (let b = 0; b < zp_per_row; b++) {
+            const lo = Math.floor((rng() + 1) * 0.5 * 16) & 0xf;
+            const hi = Math.floor((rng() + 1) * 0.5 * 16) & 0xf;
+            const byte = (lo | (hi << 4)) & 0xff;
+            const byteIdx = n * zp_per_row + b;
+            const wIdx = byteIdx >>> 2;
+            const shift = (byteIdx & 3) * 8;
+            words[wIdx] |= byte << shift;
+          }
+        }
+        return new Uint8Array(words.buffer);
+      }
+      function rngNibbles(seed, n) {
+        const rng = makeRng(seed);
+        const out = new Uint8Array(n);
+        for (let i = 0; i < n; i++) out[i] = Math.floor((rng() + 1) * 0.5 * 16) & 0xf;
+        return out;
+      }
 
       // Each entry produces a complete dispatch description: name,
       // uniform buffer, input bindings, output binding, dispatch (x,y,z).
@@ -159,7 +201,6 @@
           name: "rope_apply",
           build() {
             const T = 4, H = 4, head_dim = 32;
-            const qkBytes = T * H * head_dim * 2; // f16
             return {
               uniform: { binding: 0, bytes: dimsBuf([{tag:"u32",value:T},{tag:"u32",value:H},{tag:"u32",value:head_dim},{tag:"u32",value:0}]) },
               inputs: [
@@ -175,6 +216,56 @@
               },
               outputInitial: rngF16(10, T * H * head_dim, 1.0),
               dispatch: [Math.ceil(T * H * (head_dim / 2) / 64), 1, 1],
+            };
+          },
+        },
+        {
+          name: "matmul_int4_fp16_f16",
+          build() {
+            const T = 4, N = 64, K = 128;
+            const n_blocks = K / 32;
+            const x = rngF16(20, T * K, 0.5);
+            const wNib = rngNibbles(21, N * K);
+            const w_int4 = packNibbles(wNib);
+            const scales = rngF16(22, N * n_blocks, 1.0);
+            const w_zp = packZp(N, n_blocks, 23);
+            const bias = rngF16(24, N, 0.1);
+            return {
+              uniform: { binding: 0, bytes: dimsBuf([{tag:"u32",value:T},{tag:"u32",value:N},{tag:"u32",value:K},{tag:"u32",value:0}]) },
+              inputs: [
+                { binding: 1, name: "x", bytes: x },
+                { binding: 2, name: "w_int4", bytes: w_int4 },
+                { binding: 3, name: "w_scales", bytes: scales },
+                { binding: 4, name: "w_zp", bytes: w_zp },
+                { binding: 5, name: "bias", bytes: bias },
+              ],
+              output: { binding: 6, elements: T * N, dtype: "f16" },
+              dispatch: [Math.ceil(N / 64), Math.ceil(T / 4), 1],
+            };
+          },
+        },
+        {
+          name: "matmul_int4_f32_f32",
+          build() {
+            const T = 4, N = 64, K = 128;
+            const n_blocks = K / 32;
+            const x = new Uint8Array(rngF32(30, T * K, 0.5).buffer);
+            const wNib = rngNibbles(31, N * K);
+            const w_int4 = packNibbles(wNib);
+            const scales = rngF16(32, N * n_blocks, 1.0);
+            const w_zp = packZp(N, n_blocks, 33);
+            const bias = rngF16(34, N, 0.1);
+            return {
+              uniform: { binding: 0, bytes: dimsBuf([{tag:"u32",value:T},{tag:"u32",value:N},{tag:"u32",value:K},{tag:"u32",value:0}]) },
+              inputs: [
+                { binding: 1, name: "x", bytes: x },
+                { binding: 2, name: "w_int4", bytes: w_int4 },
+                { binding: 3, name: "w_scales", bytes: scales },
+                { binding: 4, name: "w_zp", bytes: w_zp },
+                { binding: 5, name: "bias", bytes: bias },
+              ],
+              output: { binding: 6, elements: T * N, dtype: "f32" },
+              dispatch: [Math.ceil(N / 64), Math.ceil(T / 4), 1],
             };
           },
         },

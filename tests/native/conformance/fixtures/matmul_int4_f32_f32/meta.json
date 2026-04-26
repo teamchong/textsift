@@ -1,0 +1,46 @@
+{
+  "shader": "matmul_int4_f32_f32",
+  "uniform": {
+    "binding": 0,
+    "byteLength": 16
+  },
+  "extraUniforms": [],
+  "inputs": [
+    {
+      "binding": 1,
+      "name": "x",
+      "byteLength": 2048
+    },
+    {
+      "binding": 2,
+      "name": "w_int4",
+      "byteLength": 4096
+    },
+    {
+      "binding": 3,
+      "name": "w_scales",
+      "byteLength": 512
+    },
+    {
+      "binding": 4,
+      "name": "w_zp",
+      "byteLength": 128
+    },
+    {
+      "binding": 5,
+      "name": "bias",
+      "byteLength": 128
+    }
+  ],
+  "output": {
+    "binding": 6,
+    "dtype": "f32",
+    "byteLength": 1024,
+    "hasInitial": false
+  },
+  "dispatch": [
+    1,
+    1,
+    1
+  ]
+}

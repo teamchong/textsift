@@ -26,17 +26,7 @@ const WG: u32 = 64u;
 var<workgroup> glu_tile: array<f32, D_MAX>;
 
 
-fn load_byte(arr: ptr<storage, array<u32>, read>, byte_idx: u32) -> u32 {
-    let word = (*arr)[byte_idx >> 2u];
-    let shift = (byte_idx & 3u) * 8u;
-    return (word >> shift) & 0xFFu;
-}
-
-fn load_nibble(arr: ptr<storage, array<u32>, read>, nibble_idx: u32) -> u32 {
-    let byte_val = load_byte(arr, nibble_idx >> 1u);
-    let hi = (nibble_idx & 1u) == 1u;
-    return select(byte_val & 0xFu, (byte_val >> 4u) & 0xFu, hi);
-}
+// Inlined int4-access (Naga rejects ptr<storage, ...> as fn args).
 
 
 fn atomic_add_f32(slot: u32, val: f32) {
@@ -93,7 +83,8 @@ fn main(
     var acc_local: f32 = 0.0;
     for (var b: u32 = 0u; b < n_blocks; b = b + 1u) {
         let scale: f32 = f32(w_scales[expert_scale_base + b]);
-        let zp_byte = load_byte(&w_zp, expert_zp_base + (b >> 1u));
+        let zp_byte_idx = expert_zp_base + (b >> 1u);
+        let zp_byte = (w_zp[zp_byte_idx >> 2u] >> ((zp_byte_idx & 3u) * 8u)) & 0xFFu;
         let zp_nib = select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (b & 1u) == 1u);
         let zp_f: f32 = f32(zp_nib);
 

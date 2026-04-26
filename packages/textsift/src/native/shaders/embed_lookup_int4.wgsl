@@ -12,17 +12,11 @@ struct Dims { T: u32, V: u32, D: u32, _pad: u32 };
 const EMBED_BLOCK: u32 = 32u;
 
 
-fn load_byte(arr: ptr<storage, array<u32>, read>, byte_idx: u32) -> u32 {
-    let word = (*arr)[byte_idx >> 2u];
-    let shift = (byte_idx & 3u) * 8u;
-    return (word >> shift) & 0xFFu;
-}
-
-fn load_nibble(arr: ptr<storage, array<u32>, read>, nibble_idx: u32) -> u32 {
-    let byte_val = load_byte(arr, nibble_idx >> 1u);
-    let hi = (nibble_idx & 1u) == 1u;
-    return select(byte_val & 0xFu, (byte_val >> 4u) & 0xFu, hi);
-}
+// Inlined int4-access primitives: Naga (wgpu-native) rejects
+// ptr<storage, ...> as a function argument, so the helpers from
+// int4_access.wgsl are inlined here as direct array reads.
+//   nibble at index n: (arr[n >> 3] >> ((n & 7) * 4)) & 0xF
+//   byte at index   b: (arr[b >> 2] >> ((b & 3) * 8)) & 0xFF
 
 
 @compute @workgroup_size(64, 1, 1)
@@ -45,10 +39,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let b = d / EMBED_BLOCK;
     let scale = f32(embed_scales[row * n_blocks + b]);
-    let zp_byte = load_byte(&embed_zp, row * zp_per_row + (b >> 1u));
+    let zp_byte_idx = row * zp_per_row + (b >> 1u);
+    let zp_byte = (embed_zp[zp_byte_idx >> 2u] >> ((zp_byte_idx & 3u) * 8u)) & 0xFFu;
     let zp_nib: u32 = select(zp_byte & 0xFu, (zp_byte >> 4u) & 0xFu, (b & 1u) == 1u);
     let nib_idx = row * D + d;
-    let nib = load_nibble(&embed_int4, nib_idx);
+    let nib = (embed_int4[nib_idx >> 3u] >> ((nib_idx & 7u) * 4u)) & 0xFu;
     let q = f32(nib) - f32(zp_nib);
     out[td] = f16(q * scale);
 }

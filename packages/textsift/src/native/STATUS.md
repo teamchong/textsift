@@ -45,16 +45,25 @@ qmoe_down_scatter         within 8e-7 relative drift   (atomicCAS commit order)
 Reproduce: `npx playwright test conformance/dump-fixtures.spec.ts && node tests/native/conformance/all.test.js`
 
 ### Per-dispatch microbench
-Native vs browser, same WGSL, same fixture, same warmup+iters protocol:
 
+Two regimes — per-call latency (`chain=1`) and per-100-dispatch chunk (`chain=100`, closer to a real forward pass that issues ~133 dispatches per submit):
+
+| Regime | Geomean native / browser | Interpretation |
+|---|---|---|
+| `chain=1` | 0.84× | native is **1.20× faster** per dispatch (low overhead wins) |
+| `chain=100` | 1.25× | native is **1.25× slower** per 100-dispatch chunk |
+
+Why the divergence: at `chain=1`, native wins by skipping `wgpuDevicePoll(wait=true)` (which adds ~1.27 ms unconditional latency). At `chain=100`, the per-call overhead amortizes and Naga's MSL codegen vs Tint's MSL codegen starts to matter — Naga produces slower MSL for some simple kernels (rms_norm 1.66×, basic casts ~1.5×) while matching or beating Tint on the heavy ones (qmoe pair 0.97×, embed_lookup 0.87×).
+
+**End-to-end projection:** real forward has ~133 dispatches per submit but with *different* shaders (each `setPipeline` may add cost). Realistic estimate: native is **roughly even** with browser end-to-end. Combined with browser textsift WebGPU being 2.6–3.7× faster than transformers.js, native projects to **~2–3× faster than tjs end-to-end** (down from my earlier 3× extrapolation that was based on the misleading `chain=1` win).
+
+Reproduce:
+```sh
+npx playwright test conformance/bench-shaders.spec.ts                              # chain=1
+node tests/native/bench/shaders-bench.js                                            # chain=1
+CHAIN=100 npx playwright test conformance/bench-shaders.spec.ts && \
+  CHAIN=100 node tests/native/bench/shaders-bench.js                                # chain=100
 ```
-geomean native/browser across 15 shaders: 0.84x
-→ native is 1.20× faster than browser per dispatch
-```
-
-Win came from skipping `wgpuDevicePoll(wait=true)` between submit and `mapAsync` (added ~1.27 ms unconditional latency). The mapAsync callback already implies GPU completion; `processEvents` just dispatches it.
-
-Reproduce: `npx playwright test conformance/bench-shaders.spec.ts && node tests/native/bench/shaders-bench.js`
 
 ## Architecture
 

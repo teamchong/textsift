@@ -56,6 +56,10 @@
 
       const WARMUP = 5;
       const ITERS = 50;
+      // chain_len approximates a real forward pass: encode N
+      // dispatches per submit, single readback. Forward pass does
+      // ~133 dispatches per submit; we pick 100 as representative.
+      const CHAIN_LEN = parseInt(new URL(location.href).searchParams.get("chain") || "1", 10);
 
       try {
         if (!navigator.gpu) throw new Error("no navigator.gpu");
@@ -107,7 +111,9 @@
             const pass = enc.beginComputePass();
             pass.setPipeline(pipeline);
             pass.setBindGroup(0, bg);
-            pass.dispatchWorkgroups(...f.meta.dispatch);
+            for (let c = 0; c < CHAIN_LEN; c++) {
+              pass.dispatchWorkgroups(...f.meta.dispatch);
+            }
             pass.end();
             enc.copyBufferToBuffer(outBuf, 0, readback, 0, outBytes);
             device.queue.submit([enc.finish()]);

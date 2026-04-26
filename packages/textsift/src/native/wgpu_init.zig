@@ -719,7 +719,15 @@ pub fn dispatchMatmulF32(
 }
 
 pub const StorageInput = struct { binding: u32, bytes: []const u8 };
-pub const KernelOutput = struct { binding: u32, bytes: []u8 };
+pub const KernelOutput = struct {
+    binding: u32,
+    bytes: []u8,
+    /// How many dispatches to encode per submit/readback in
+    /// `benchDispatch`. `1` (default) is per-call latency; larger
+    /// values approximate a forward pass that amortizes encode +
+    /// submit + map cost across many kernel invocations.
+    chain_len: u32 = 1,
+};
 
 /// Generic kernel dispatcher. Every shader port becomes a thin
 /// wrapper over this — pass the WGSL source, the uniform buffer
@@ -1300,11 +1308,12 @@ pub fn benchDispatch(
     defer c.wgpuBindGroupRelease(bg);
 
     // ── TIMED LOOP ──
+    // chain_len controls how many dispatches per submit. chain_len=1
+    // is the per-call latency case; chain_len=N approximates a forward
+    // pass (one submit + one readback amortized over N kernel calls).
     var i: usize = 0;
+    const chain_len = output.chain_len;
     while (i < samples.len) : (i += 1) {
-        // Reset output buffer when the kernel needs an initial value
-        // (e.g. qmoe_down_scatter atomic acc) — otherwise it accumulates
-        // across iters.
         if (output_initial) |init_bytes| {
             c.wgpuQueueWriteBuffer(queue, y_buf, 0, init_bytes.ptr, init_bytes.len);
         }
@@ -1313,7 +1322,10 @@ pub fn benchDispatch(
         const pass = c.wgpuCommandEncoderBeginComputePass(encoder, null);
         c.wgpuComputePassEncoderSetPipeline(pass, pipeline);
         c.wgpuComputePassEncoderSetBindGroup(pass, 0, bg, 0, null);
-        c.wgpuComputePassEncoderDispatchWorkgroups(pass, dispatch[0], dispatch[1], dispatch[2]);
+        var ci: u32 = 0;
+        while (ci < chain_len) : (ci += 1) {
+            c.wgpuComputePassEncoderDispatchWorkgroups(pass, dispatch[0], dispatch[1], dispatch[2]);
+        }
         c.wgpuComputePassEncoderEnd(pass);
         c.wgpuComputePassEncoderRelease(pass);
         c.wgpuCommandEncoderCopyBufferToBuffer(encoder, y_buf, 0, readback, 0, output.bytes.len);

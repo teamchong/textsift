@@ -741,6 +741,19 @@ fn napiBenchDispatch(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c
         }
     }
 
+    // Optional output.chainLen (defaults to 1).
+    var chain_len: u32 = 1;
+    {
+        var v: c.napi_value = undefined;
+        if (c.napi_get_named_property(env, out_obj, "chainLen", &v) == c.napi_ok) {
+            var t: c.napi_valuetype = undefined;
+            if (c.napi_typeof(env, v, &t) == c.napi_ok and t == c.napi_number) {
+                chain_len = napiGetU32(env, v, "output.chainLen must be u32") orelse return null;
+                if (chain_len == 0) chain_len = 1;
+            }
+        }
+    }
+
     const dx = napiGetU32(env, napiArrayGet(env, argv[6], 0) orelse return napiThrow(env, "dispatch[0]"), "dispatch[0]") orelse return null;
     const dy = napiGetU32(env, napiArrayGet(env, argv[6], 1) orelse return napiThrow(env, "dispatch[1]"), "dispatch[1]") orelse return null;
     const dz = napiGetU32(env, napiArrayGet(env, argv[6], 2) orelse return napiThrow(env, "dispatch[2]"), "dispatch[2]") orelse return null;
@@ -774,7 +787,7 @@ fn napiBenchDispatch(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c
         uniform_bytes,
         0,
         in_storage[0..in_n],
-        .{ .binding = out_binding, .bytes = out_dummy },
+        .{ .binding = out_binding, .bytes = out_dummy, .chain_len = chain_len },
         out_initial,
         extra_storage[0..extra_n],
         .{ dx, dy, dz },

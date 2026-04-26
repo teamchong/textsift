@@ -12,12 +12,14 @@ import { fileURLToPath } from "node:url";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OUT = resolve(HERE, "../native/conformance/fixtures/_browser-bench.json");
 
-test("browser shader microbench", async ({ page }) => {
+const CHAIN_LEN = process.env.CHAIN ?? "1";
+
+test(`browser shader microbench (chain=${CHAIN_LEN})`, async ({ page }) => {
   test.setTimeout(2 * 60_000);
 
   page.on("pageerror", (err) => console.error("page error:", err.message));
 
-  await page.goto("/tests/conformance/bench-shaders.html");
+  await page.goto(`/tests/conformance/bench-shaders.html?chain=${CHAIN_LEN}`);
   await page.waitForFunction(() => (window as any).__bench !== undefined, null, {
     timeout: 90_000,
   });

@@ -51,10 +51,13 @@ function loadFixture(name) {
   };
 }
 
+const CHAIN_LEN = parseInt(process.env.CHAIN ?? "1", 10);
+
 function bench(name, backend, f) {
   const out = {
     binding: f.meta.output.binding,
     byteLength: f.meta.output.byteLength,
+    chainLen: CHAIN_LEN,
   };
   if (f.outputInitial) out.initial = f.outputInitial;
   const dispatch = f.meta.dispatch;

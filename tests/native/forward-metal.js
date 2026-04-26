@@ -401,7 +401,7 @@ export class MetalForward {
           { index: 5, bufPtr: wbuf(tag("router.bias")) },
           { index: 6, bufPtr: s.routerLogits },
         ],
-        [Math.ceil(E / 64), Math.ceil(T / 4), 1], [64, 1, 1],
+        [Math.ceil(T * E / 64), 1, 1], [64, 1, 1],
       );
 
       // router_topk
@@ -531,7 +531,7 @@ export class MetalForward {
         { index: 5, bufPtr: wbuf("score.bias") },
         { index: 6, bufPtr: s.logitsOut },
       ],
-      [Math.ceil(cfg.numClasses / 64), Math.ceil(T / 4), 1], [64, 1, 1],
+      [Math.ceil(T * cfg.numClasses / 64), 1, 1], [64, 1, 1],
     );
 
     const tEncEnd = performance.now();

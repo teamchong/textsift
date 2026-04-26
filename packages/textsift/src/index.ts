@@ -1,93 +1,86 @@
 /**
  * textsift — Node native binding entry point.
  *
- * Loads a Zig-compiled `.node` shared library. On macOS the fast
- * path is Metal-direct (hand-written MSL kernels via an Obj-C
- * bridge); a wgpu-native fallback ships for adapter probing and
- * non-Metal hosts. All 15 kernels are byte-equal vs the browser
- * WGSL fixtures and at T=32 the Metal-direct forward runs in
- * ~11.6 ms (vs ~22 ms browser).
+ * Loads a Zig-compiled `.node` shared library. Each platform ships its
+ * own hand-tuned fast path (comptime-selected in src/native/napi.zig):
  *
- *   import { PrivacyFilter } from "textsift/browser"; // works today
- *   import { PrivacyFilter } from "textsift";         // requires GPU
+ *   macOS  → Metal-direct (hand-written MSL via Obj-C bridge)
+ *   Linux  → Vulkan-direct (hand-written GLSL → SPIR-V via glslangValidator)
+ *   Windows → Dawn-direct (Tint → D3D12 via Dawn's backend selection)
  *
- * The high-level `PrivacyFilter` wiring on the native entry is not
- * yet finished (see issue #79) — `create()` still throws while the
- * tokenizer + weight-loader + Viterbi pieces are ported on top of
- * the kernel layer. The kernel layer itself is validated by
- * `tests/native/forward-metal.js` (Metal-direct end-to-end forward).
+ *   import { PrivacyFilter } from "textsift";
+ *   const filter = await PrivacyFilter.create();
+ *   const { redactedText } = await filter.redact("Hi Alice, my email is alice@example.com");
  */
 
-import { createRequire } from "node:module";
-import { fileURLToPath } from "node:url";
-import { dirname, resolve } from "node:path";
+import {
+  PrivacyFilter as BrowserPrivacyFilter,
+  type BackendResolver,
+} from "./browser/privacy-filter.js";
+import type { CreateOptions } from "./browser/types.js";
+import { NodeBackend } from "./native/backend.js";
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const NATIVE_PATH = resolve(HERE, "./textsift-native.node");
-
-interface NativeBinding {
-  getAdapterInfo(): {
-    vendor: string;
-    architecture: string;
-    device: string;
-    description: string;
-    backendType: number;
-    adapterType: number;
-  };
-}
-
-let cached: NativeBinding | null = null;
-function loadNative(): NativeBinding {
-  if (cached) return cached;
-  try {
-    cached = createRequire(import.meta.url)(NATIVE_PATH) as NativeBinding;
-    return cached;
-  } catch (err) {
-    throw new Error(
-      `textsift native binding failed to load from ${NATIVE_PATH}. ` +
-        `Run \`npm run build:native\` in packages/textsift, or import ` +
-        `from "textsift/browser" for the WASM/WebGPU path. ` +
-        `Underlying error: ${(err as Error).message}`,
-    );
-  }
-}
-
-/** Information about the GPU adapter the native binding selected. */
-export interface AdapterInfo {
-  vendor: string;
-  architecture: string;
-  device: string;
-  description: string;
-  backendType: number;
-  adapterType: number;
-}
+export type {
+  CreateOptions,
+  DetectResult,
+  DetectedSpan,
+  RedactOptions,
+  RedactResult,
+  Rule,
+  SpanLabel,
+} from "./browser/types.js";
 
 /**
- * Probe the GPU adapter available to the native binding. Throws if
- * no adapter is found — the caller should catch that and route to
- * `textsift/browser` (the WASM path), since this entry runs WebGPU
- * only and has no CPU fallback.
+ * `PrivacyFilter` for Node — wraps the browser implementation but
+ * injects a `NodeBackend` that talks to the platform-native NAPI
+ * surface (`metal*` / `vulkan*` / `dawn*`) instead of `navigator.gpu`.
+ *
+ * All other stages (BPE tokenizer, Viterbi CRF decoder, regex rule
+ * engine, span/redaction logic) come straight from `src/browser/` —
+ * pure TS with no DOM deps.
+ *
+ * Graceful fallback: if the native fast path fails to initialise
+ * (no Vulkan loader on Linux, no Metal on a non-Apple-Silicon Mac,
+ * no Dawn-compatible adapter on Windows, or the per-platform .node
+ * binary is missing because optionalDependencies didn't install for
+ * this triple), `create()` falls back to the WASM/CPU backend so
+ * `import { PrivacyFilter } from "textsift"` still works — just
+ * slower (~5–10× slower than the native path; still faster than ORT
+ * Node CPU because the WASM kernels are Zig SIMD-optimized).
  */
-export function getAdapterInfo(): AdapterInfo {
-  return loadNative().getAdapterInfo();
-}
-
-export class PrivacyFilter {
-  private constructor() {}
-
-  static async create(): Promise<PrivacyFilter> {
-    // Surface the adapter check synchronously so callers can catch
-    // "no GPU" cleanly. Once the inference port lands, this becomes
-    // the device-creation step instead of throwing.
-    getAdapterInfo();
-    throw new Error(
-      "textsift native PrivacyFilter wiring is under construction " +
-        '(see issue #79). Import from "textsift/browser" until it ' +
-        "lands. The kernel layer is done (Metal-direct on macOS, " +
-        "all 15 kernels byte-equal vs browser, ~1.9× faster " +
-        "end-to-end at T=32 — see tests/native/forward-metal.js); " +
-        "the missing piece is the JS-side tokenizer + weight loader " +
-        "+ Viterbi wired through the new metal* / wgpu* NAPI surface.",
-    );
+export class PrivacyFilter extends BrowserPrivacyFilter {
+  static override async create(opts: CreateOptions = {}): Promise<PrivacyFilter> {
+    // Try the native fast path first. If it fails (no GPU, missing
+    // platform binary, etc.), fall back to the WASM CPU path so
+    // PrivacyFilter still works — same API, slower runtime.
+    const resolver: BackendResolver = {
+      async resolveAuto({ bundle, quantization }) {
+        try {
+          const backend = new NodeBackend({
+            bundle,
+            quantization,
+            device: "webgpu",
+          });
+          await backend.warmup();
+          return backend;
+        } catch (e) {
+          const reason = (e as Error).message;
+          // eslint-disable-next-line no-console
+          console.warn(
+            `textsift: native GPU backend unavailable (${reason}). ` +
+              `Falling back to WASM CPU path. Install Vulkan drivers and rebuild ` +
+              `for the fast path on Linux. See packages/textsift/src/native/HANDOFF.md.`,
+          );
+          // Returning null tells the base class to fall through to the
+          // built-in selectBackend(), which picks WASM in Node since
+          // navigator.gpu is undefined.
+          return null;
+        }
+      },
+    };
+    return BrowserPrivacyFilter.createWithResolver(
+      { ...opts, backend: opts.backend ?? "auto" },
+      resolver,
+    ) as Promise<PrivacyFilter>;
   }
 }

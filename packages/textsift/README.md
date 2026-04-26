@@ -11,12 +11,11 @@ npm install textsift
 Two entry points so browsers never bundle native code:
 
 ```ts
-// Browser / Node-via-WASM (today)
+// Browser / Node-via-WASM
 import { PrivacyFilter } from "textsift/browser";
 
-// Node native NAPI binding (issue #79 — PrivacyFilter throws today;
-// kernels done, Metal-direct on macOS is ~1.9× faster than browser
-// at T=32).
+// Node — auto-picks the platform-native fast path (Metal on macOS,
+// Vulkan on Linux, Dawn on Windows) and falls back to WASM if no GPU.
 import { PrivacyFilter } from "textsift";
 ```
 
@@ -26,6 +25,50 @@ const { redactedText } = await filter.redact(
   "Hi John Smith, your email john@example.com is on file.",
 );
 ```
+
+## Why this matters on Linux
+
+If you're on Linux and want GPU-accelerated PII filtering in Node, the realistic options today are bad:
+
+| Path | Setup | T=32 latency on a typical iGPU box |
+|---|---|---:|
+| ONNX Runtime Node CPU | `npm i onnxruntime-node`, write your own inference loop | ~600–800 ms |
+| transformers.js (Node) | `npm i @xenova/transformers`, no GPU on Node so WASM | ~80–100 ms |
+| PyTorch CPU | `pip install torch transformers safetensors`, write inference | ~150–500 ms |
+| PyTorch CUDA | NVIDIA GPU + driver + cuda-toolkit + matched torch wheel | n/a (no NVIDIA on most laptops) |
+| **textsift native** | **`npm install textsift`** | **~28 ms** |
+
+On the same Linux box (Intel Iris Xe, Mesa Vulkan), textsift native is **22–28× faster** than ORT Node CPU because it talks Vulkan directly with hand-written GLSL→SPIR-V kernels — no CUDA, no driver dance, no model conversion.
+
+End-to-end on a 122-character input with 4 PII spans: `redact()` returns in ~50–75 ms.
+
+## Per-platform fast paths
+
+| Platform | Backend | What it uses |
+|---|---|---|
+| macOS arm64/x64 | Metal-direct | Hand-written MSL kernels via Obj-C bridge |
+| Linux x86_64/arm64 | Vulkan-direct | Hand-written GLSL → SPIR-V via glslangValidator |
+| Windows x86_64 | Dawn-direct | Tint → D3D12 via statically-linked Google Dawn |
+| (any platform, no GPU) | WASM fallback | Zig + SIMD128 in WebAssembly |
+
+Each platform's `.node` binary is built with comptime-gated Zig code so it only contains the relevant backend — Mac binaries don't ship Vulkan code, Windows binaries don't ship Obj-C, etc. npm picks the right `optionalDependencies` subpackage at install time (`@textsift/native-{linux-x64,linux-arm64,darwin-x64,darwin-arm64,win32-x64}`).
+
+## Linux prereqs (one-time)
+
+For the GPU fast path on Linux, you need a Vulkan loader. Most distros ship one in their default packages:
+
+```sh
+# Ubuntu/Debian
+sudo apt install -y libvulkan1 mesa-vulkan-drivers
+
+# Fedora/RHEL
+sudo dnf install -y vulkan-loader mesa-vulkan-drivers
+
+# Arch
+sudo pacman -S vulkan-icd-loader vulkan-mesa-layers
+```
+
+If Vulkan isn't available, `import { PrivacyFilter } from "textsift"` automatically falls back to the WASM CPU path — same API, slower runtime (still faster than ORT Node CPU thanks to Zig SIMD128 kernels).
 
 ## Why two entry points
 

@@ -1,19 +1,17 @@
-// Metal-direct backend. Bypasses wgpu-native + Naga entirely on
-// macOS — uses the Metal Obj-C API via a thin C bridge (see
-// metal/bridge.h, metal/bridge.m). Hand-tuned MSL kernels live in
-// metal/shaders.metal and are compiled into a single MTLLibrary
-// at backend creation time.
+// Metal-direct backend (macOS). Hand-tuned MSL kernels via a thin
+// Obj-C bridge (see metal/bridge.h, metal/bridge.m). Kernels live in
+// metal/shaders.metal and compile into a single MTLLibrary at backend
+// creation time.
 //
-// Why bother: Naga's WGSL→MSL output is measurably slower than
-// browser Tint's. With hand-written MSL we control loop unrolling,
-// threadgroup memory layout, and (on M3+) simdgroup matrix ops.
-// Realistic target: match-or-beat browser textsift WebGPU on the
-// same hardware.
+// Why hand-tuned: we control loop unrolling, threadgroup memory layout,
+// and (on M3+) simdgroup matrix ops. Beats Tint's WGSL→MSL codegen by
+// ~1.9× at T=32 on M2 Pro — beats browser textsift WebGPU on the same
+// hardware.
 
 const std = @import("std");
 
 pub const cb = @cImport({
-    @cInclude("bridge.h");
+    @cInclude("metal/bridge.h");
 });
 
 const std_c = @cImport({
@@ -175,7 +173,8 @@ pub fn dispatchOneShot(
 
 /// Encoder-batched dispatch handle. One Metal command buffer + one
 /// shared compute encoder accumulate every kernel call until submit.
-/// Equivalent to the wgpu-native `beginEncoder` API but Metal-direct.
+/// One Metal command buffer + one shared compute encoder accumulate
+/// every kernel call until submit.
 pub const Encoder = struct {
     backend: *Backend,
     cmd: cb.TsMetalCommandBuffer,

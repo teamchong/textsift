@@ -19,3 +19,5 @@ __pycache__/
 data/
 measurements/
 tests/fixtures/pii-weights-full.bin
+# SPIR-V artifacts — compiled at build time from src/native/vulkan/shaders/*.comp.glsl
+packages/textsift/src/native/vulkan/shaders/*.spv

@@ -5,13 +5,12 @@
 // dispatch shapes, same shared scratch buffers — the only difference
 // is which API actually compiles and dispatches the kernels.
 //
-// Use this to bench Metal-direct vs wgpu-native vs the browser path
-// without any other variables changing.
+// Use this to bench Metal-direct end-to-end at any T.
 
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
-import { PF } from "./forward.js";
+import { PF } from "./pf-config.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const NATIVE_PATH = resolve(HERE, "../../packages/textsift/dist/textsift-native.node");

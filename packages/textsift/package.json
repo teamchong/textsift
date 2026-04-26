@@ -38,7 +38,7 @@
   "scripts": {
     "build": "npm run build:browser && npm run build:native",
     "build:browser": "mkdir -p dist/browser && npm run build:zig && npm run build:opt && node scripts/inline-wasm.mjs && bun build src/browser/index.ts --outdir dist/browser --target browser --format esm --sourcemap=external && bun x tsc --emitDeclarationOnly",
-    "build:native": "bash scripts/fetch-wgpu-native.sh && bash scripts/build-native.sh && bun build src/index.ts --outdir dist --target node --format esm --sourcemap=external",
+    "build:native": "bash scripts/build-native.sh && bun build src/index.ts --outdir dist --target node --format esm --sourcemap=external",
     "build:zig": "npm run build:zig-st && npm run build:zig-mt",
     "build:zig-st": "mise exec -- zig build-exe -target wasm32-freestanding -mcpu=generic+simd128+relaxed_simd -O ReleaseFast -fstrip -flto src/zig/wasm_exports.zig -cflags -O3 -mrelaxed-simd -flto -- src/c/fma.c --name textsift -fno-entry -rdynamic && mv textsift.wasm dist/browser/",
     "build:zig-mt": "mise exec -- zig build-exe -target wasm32-freestanding -mcpu=generic+simd128+relaxed_simd+atomics+bulk_memory -O ReleaseFast -fstrip -flto src/zig/wasm_exports.zig -cflags -O3 -mrelaxed-simd -flto -- src/c/fma.c --shared-memory --import-memory --initial-memory=4194304 --max-memory=2147483648 --export=__stack_pointer --name textsift-mt -fno-entry -rdynamic && mv textsift-mt.wasm dist/browser/",

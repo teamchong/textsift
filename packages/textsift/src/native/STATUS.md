@@ -128,6 +128,32 @@ Iteration history:
 
 Reproduce: `T=80 node tests/native/forward.js` (or any T).
 
+### Where the 43.9 ms goes
+
+Profiled with `PROFILE=1 T=80 node tests/native/forward.js`:
+
+```
+encode (140 enqueueDispatch):       2.0 ms
+submit + GPU compute + readback:   40.6 ms
+```
+
+95% of the forward time is on the GPU. The encode loop (140 calls
+into native) is essentially free. The wall is the **MSL Naga
+generates from our WGSL** — slower per-kernel than Tint's MSL by
+~1.4× on matmul (the dominant kernel) per the chain bench. wgpu-
+native v29 (latest) doesn't expose raw MTLDevice access, so we
+can't bypass Naga without a separate Metal-direct backend.
+
+What it would take to be faster than browser:
+- Write hand-tuned MSL for the 4 dominant kernels (matmul, attention,
+  qmoe pair) using Apple's metal-cpp via Obj-C bridge
+- Build a parallel MetalBackend (separate from wgpu) that owns its
+  own MTLBuffers + pipelines
+- Realistic improvement: native faster than browser by 20-50%
+
+That's a multi-day port. With it, native could plausibly hit 18-25 ms
+at T=80 (vs browser 22 ms). Without it, native sits at 43.9 ms.
+
 ### Original forward pass
 The 15 shaders work in isolation. They are not yet wired into a `forward(tokenIds, attentionMask) → logits` entry point. Doing that requires replicating the orchestration in `packages/textsift/src/browser/backends/webgpu.ts:460` (the ~3000-line `WebGpuBackend.forward()`):
 

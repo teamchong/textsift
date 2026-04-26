@@ -275,6 +275,7 @@ export class NativeForward {
     let useMask = 0;
     for (let i = 0; i < T; i++) { if (attentionMask[i] !== 1) { useMask = 1; break; } }
 
+    this._tEncStart = performance.now();
     const enc = native.beginEncoder(this.backend);
     const enq = (name, uniform, extras, inputs, outBuf, outBinding, outBytes, dispatch, initial) => {
       const out = { binding: outBinding, bufPtr: outBuf, byteLen: outBytes };
@@ -577,7 +578,13 @@ export class NativeForward {
     );
 
     // Submit + readback final logits.
+    const tEncEnd = performance.now();
     const out = native.submitAndReadback(enc, s.logitsOut, 0, T * cfg.numClasses * 4);
+    const tSubEnd = performance.now();
+    if (process.env.PROFILE) {
+      this._lastEncodeMs = tEncEnd - this._tEncStart;
+      this._lastSubmitMs = tSubEnd - tEncEnd;
+    }
     return new Float32Array(out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength));
   }
 
@@ -603,10 +610,15 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 
   const N = 10;
   const samples = [];
+  const encs = [], subs = [];
   for (let i = 0; i < N; i++) {
     const t0 = performance.now();
     const logits = fwd.forward(ids, mask);
     samples.push(performance.now() - t0);
+    if (process.env.PROFILE) {
+      encs.push(fwd._lastEncodeMs);
+      subs.push(fwd._lastSubmitMs);
+    }
     if (i === 0) console.log(`[NativeForward] logits shape=(${T}, ${PF.numClasses}) len=${logits.length}`);
   }
   samples.sort((a, b) => a - b);
@@ -616,6 +628,14 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       `min=${samples[0].toFixed(1)}ms, ` +
       `over ${N} iters`,
   );
+  if (process.env.PROFILE) {
+    encs.sort((a, b) => a - b);
+    subs.sort((a, b) => a - b);
+    console.log(
+      `  phase breakdown: encode median=${encs[Math.floor(N/2)].toFixed(1)}ms, ` +
+        `submit+readback median=${subs[Math.floor(N/2)].toFixed(1)}ms`,
+    );
+  }
   fwd.dispose();
   console.log("[NativeForward] disposed cleanly");
 }

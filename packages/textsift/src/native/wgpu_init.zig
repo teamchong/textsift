@@ -999,7 +999,41 @@ pub const Backend = struct {
     /// enqueueDispatch for a name compiles + caches; subsequent
     /// dispatches reuse.
     pipelines: std.StringHashMap(PipelineEntry),
+    /// Bind-group cache: keyed by a hash of (pipeline, ordered list
+    /// of binding pointers + sizes). After a forward warms up the
+    /// cache, subsequent forwards skip wgpuDeviceCreateBindGroup
+    /// entirely (140 → 0 calls/forward) since the binding set is
+    /// identical across calls — same scratch + weight buffers.
+    bg_cache: std.AutoHashMap(u64, c.WGPUBindGroup),
 };
+
+/// FNV-1a 64-bit hash of the binding "shape": pipeline ptr + each
+/// (binding, buf_ptr, offset, size) tuple.
+fn hashBindingShape(
+    pipeline: c.WGPUComputePipeline,
+    entries: []const c.WGPUBindGroupEntry,
+    entry_count: usize,
+) u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    const fnv = struct {
+        fn step(s: u64, bytes: []const u8) u64 {
+            var ss = s;
+            for (bytes) |byte| {
+                ss = (ss ^ byte) *% 0x100000001b3;
+            }
+            return ss;
+        }
+    };
+    h = fnv.step(h, std.mem.asBytes(&pipeline));
+    var i: usize = 0;
+    while (i < entry_count) : (i += 1) {
+        h = fnv.step(h, std.mem.asBytes(&entries[i].binding));
+        h = fnv.step(h, std.mem.asBytes(&entries[i].buffer));
+        h = fnv.step(h, std.mem.asBytes(&entries[i].offset));
+        h = fnv.step(h, std.mem.asBytes(&entries[i].size));
+    }
+    return h;
+}
 
 fn getOrCompilePipeline(b: *Backend, name: []const u8) WgpuError!PipelineEntry {
     if (b.pipelines.get(name)) |entry| return entry;
@@ -1063,11 +1097,16 @@ pub fn createBackend() WgpuError!*Backend {
         .device = device,
         .queue = queue,
         .pipelines = std.StringHashMap(PipelineEntry).init(std.heap.c_allocator),
+        .bg_cache = std.AutoHashMap(u64, c.WGPUBindGroup).init(std.heap.c_allocator),
     };
     return b;
 }
 
 pub fn destroyBackend(b: *Backend) void {
+    var bg_it = b.bg_cache.iterator();
+    while (bg_it.next()) |entry| c.wgpuBindGroupRelease(entry.value_ptr.*);
+    b.bg_cache.deinit();
+
     var it = b.pipelines.iterator();
     while (it.next()) |entry| {
         c.wgpuBindGroupLayoutRelease(entry.value_ptr.bgl);
@@ -1130,10 +1169,9 @@ pub const Encoder = struct {
     backend: *Backend,
     encoder: c.WGPUCommandEncoder,
     pass: c.WGPUComputePassEncoder,
-    // Resources owned by this encoder; released on submit.
-    // Pipeline + module + bgl are cached on the backend and reused;
-    // bind groups and transient buffers are per-dispatch and tracked here.
-    bgs: std.ArrayList(c.WGPUBindGroup),
+    // Pipelines, modules, bgls, and bind groups are cached on the
+    // backend across forwards. Only transient per-call buffers
+    // (uniform writes, inline-bytes inputs) are tracked here.
     transient_bufs: std.ArrayList(c.WGPUBuffer),
 };
 
@@ -1154,7 +1192,6 @@ pub fn beginEncoder(b: *Backend) WgpuError!*Encoder {
         .backend = b,
         .encoder = enc,
         .pass = pass,
-        .bgs = .empty,
         .transient_bufs = .empty,
     };
     return e;
@@ -1255,13 +1292,23 @@ pub fn enqueueOnEncoder(
     entries[entry_count] = .{ .nextInChain = null, .binding = output_binding, .buffer = output_buf, .offset = 0, .size = output_byte_len, .sampler = null, .textureView = null };
     entry_count += 1;
 
-    var bg_desc: c.WGPUBindGroupDescriptor = std.mem.zeroes(c.WGPUBindGroupDescriptor);
-    bg_desc.layout = bgl;
-    bg_desc.entryCount = entry_count;
-    bg_desc.entries = &entries;
-    const bg = c.wgpuDeviceCreateBindGroup(device, &bg_desc);
-    if (bg == null) return WgpuError.BindGroupFailed;
-    e.bgs.append(std.heap.c_allocator, bg) catch return WgpuError.BufferCreateFailed;
+    // Look up cached bind group; create + cache on first miss.
+    const bg_key = hashBindingShape(pipeline, &entries, entry_count);
+    var bg: c.WGPUBindGroup = undefined;
+    if (e.backend.bg_cache.get(bg_key)) |cached_bg| {
+        bg = cached_bg;
+    } else {
+        var bg_desc: c.WGPUBindGroupDescriptor = std.mem.zeroes(c.WGPUBindGroupDescriptor);
+        bg_desc.layout = bgl;
+        bg_desc.entryCount = entry_count;
+        bg_desc.entries = &entries;
+        bg = c.wgpuDeviceCreateBindGroup(device, &bg_desc);
+        if (bg == null) return WgpuError.BindGroupFailed;
+        e.backend.bg_cache.put(bg_key, bg) catch {
+            c.wgpuBindGroupRelease(bg);
+            return WgpuError.BindGroupFailed;
+        };
+    }
 
     c.wgpuComputePassEncoderSetPipeline(e.pass, pipeline);
     c.wgpuComputePassEncoderSetBindGroup(e.pass, 0, bg, 0, null);
@@ -1300,10 +1347,8 @@ pub fn submitAndReadback(
     // and the spin-loop processEvents alone won't complete it.
     _ = c.wgpuDevicePoll(b.device, 1, null);
 
-    // Release per-encoder resources after submit. Pipelines, modules,
-    // and bgls are cached on the backend and outlive the encoder.
-    for (e.bgs.items) |x| c.wgpuBindGroupRelease(x);
-    e.bgs.deinit(std.heap.c_allocator);
+    // Release per-encoder transient buffers. Pipelines / bgls /
+    // bind groups stay cached on the backend.
     for (e.transient_bufs.items) |x| c.wgpuBufferRelease(x);
     e.transient_bufs.deinit(std.heap.c_allocator);
 

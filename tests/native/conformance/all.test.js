@@ -14,6 +14,9 @@ const SHADERS = [
   "rope_apply",
   "matmul_int4_fp16_f16",
   "matmul_int4_f32_f32",
+  "embed_lookup_int4",
+  "add_rmsnorm_fp16_to_f32",
+  "router_topk",
 ];
 
 let failed = 0;

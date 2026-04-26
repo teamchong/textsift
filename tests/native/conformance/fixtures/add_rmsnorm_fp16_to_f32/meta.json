@@ -1,0 +1,41 @@
+{
+  "shader": "add_rmsnorm_fp16_to_f32",
+  "uniform": {
+    "binding": 0,
+    "byteLength": 16
+  },
+  "extraUniforms": [],
+  "inputs": [
+    {
+      "binding": 1,
+      "name": "a",
+      "byteLength": 1024
+    },
+    {
+      "binding": 2,
+      "name": "b",
+      "byteLength": 1024
+    },
+    {
+      "binding": 3,
+      "name": "gamma",
+      "byteLength": 256
+    },
+    {
+      "binding": 4,
+      "name": "_sum_out_init",
+      "byteLength": 1024
+    }
+  ],
+  "output": {
+    "binding": 5,
+    "dtype": "f32",
+    "byteLength": 2048,
+    "hasInitial": false
+  },
+  "dispatch": [
+    4,
+    1,
+    1
+  ]
+}

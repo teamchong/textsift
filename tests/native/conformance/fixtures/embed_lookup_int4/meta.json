@@ -1,0 +1,41 @@
+{
+  "shader": "embed_lookup_int4",
+  "uniform": {
+    "binding": 0,
+    "byteLength": 16
+  },
+  "extraUniforms": [],
+  "inputs": [
+    {
+      "binding": 1,
+      "name": "embed_int4",
+      "byteLength": 2048
+    },
+    {
+      "binding": 2,
+      "name": "embed_scales",
+      "byteLength": 256
+    },
+    {
+      "binding": 3,
+      "name": "embed_zp",
+      "byteLength": 64
+    },
+    {
+      "binding": 4,
+      "name": "ids",
+      "byteLength": 16
+    }
+  ],
+  "output": {
+    "binding": 5,
+    "dtype": "f16",
+    "byteLength": 1024,
+    "hasInitial": false
+  },
+  "dispatch": [
+    8,
+    1,
+    1
+  ]
+}

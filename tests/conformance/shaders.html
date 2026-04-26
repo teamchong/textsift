@@ -245,6 +245,68 @@
           },
         },
         {
+          name: "embed_lookup_int4",
+          build() {
+            const T = 4, V = 32, D = 128;
+            const n_blocks = D / 32;
+            const ids = new Int32Array(T);
+            const idsRng = makeRng(40);
+            for (let i = 0; i < T; i++) ids[i] = Math.floor((idsRng() + 1) * 0.5 * V);
+            const wNib = rngNibbles(41, V * D);
+            const w_int4 = packNibbles(wNib);
+            const scales = rngF16(42, V * n_blocks, 1.0);
+            const w_zp = packZp(V, n_blocks, 43);
+            return {
+              uniform: { binding: 0, bytes: dimsBuf([{tag:"u32",value:T},{tag:"u32",value:V},{tag:"u32",value:D},{tag:"u32",value:0}]) },
+              inputs: [
+                { binding: 1, name: "embed_int4", bytes: w_int4 },
+                { binding: 2, name: "embed_scales", bytes: scales },
+                { binding: 3, name: "embed_zp", bytes: w_zp },
+                { binding: 4, name: "ids", bytes: new Uint8Array(ids.buffer) },
+              ],
+              output: { binding: 5, elements: T * D, dtype: "f16" },
+              dispatch: [Math.ceil(T * D / 64), 1, 1],
+            };
+          },
+        },
+        {
+          name: "add_rmsnorm_fp16_to_f32",
+          build() {
+            const T = 4, D = 128, eps = 1e-6;
+            return {
+              uniform: { binding: 0, bytes: dimsBuf([{tag:"u32",value:T},{tag:"u32",value:D},{tag:"f32",value:eps},{tag:"u32",value:0}]) },
+              inputs: [
+                { binding: 1, name: "a", bytes: rngF16(50, T*D, 0.5) },
+                { binding: 2, name: "b", bytes: rngF16(51, T*D, 0.5) },
+                { binding: 3, name: "gamma", bytes: rngF16(52, D, 1.0) },
+                // sum_out (binding 4) is a secondary writable output;
+                // hand it a zero-filled buffer so the shader can write
+                // to it. We don't read it back — primary output is
+                // norm_out at binding 5.
+                { binding: 4, name: "_sum_out_init", bytes: new Uint8Array(T * D * 2) },
+              ],
+              output: { binding: 5, elements: T * D, dtype: "f32" },
+              dispatch: [T, 1, 1],
+            };
+          },
+        },
+        {
+          name: "router_topk",
+          build() {
+            const T = 4, E = 16, K = 4;
+            return {
+              uniform: { binding: 0, bytes: dimsBuf([{tag:"u32",value:T},{tag:"u32",value:E},{tag:"u32",value:K},{tag:"u32",value:0}]) },
+              inputs: [
+                { binding: 1, name: "logits", bytes: new Uint8Array(rngF32(60, T * E, 2.0).buffer) },
+                // out_idx is the secondary output (i32), zero-filled.
+                { binding: 2, name: "_out_idx_init", bytes: new Uint8Array(T * K * 4) },
+              ],
+              output: { binding: 3, elements: T * K, dtype: "f32" },
+              dispatch: [Math.ceil(T / 64), 1, 1],
+            };
+          },
+        },
+        {
           name: "matmul_int4_f32_f32",
           build() {
             const T = 4, N = 64, K = 128;

@@ -1,0 +1,31 @@
+{
+  "shader": "router_topk",
+  "uniform": {
+    "binding": 0,
+    "byteLength": 16
+  },
+  "extraUniforms": [],
+  "inputs": [
+    {
+      "binding": 1,
+      "name": "logits",
+      "byteLength": 256
+    },
+    {
+      "binding": 2,
+      "name": "_out_idx_init",
+      "byteLength": 64
+    }
+  ],
+  "output": {
+    "binding": 3,
+    "dtype": "f32",
+    "byteLength": 64,
+    "hasInitial": false
+  },
+  "dispatch": [
+    1,
+    1,
+    1
+  ]
+}

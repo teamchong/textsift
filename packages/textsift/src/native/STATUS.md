@@ -87,6 +87,17 @@ WGSL files are loaded via `@embedFile` at compile time (native) and via the gene
 
 Affected shaders: `embed_lookup_int4`, `matmul_int4_fp16_f16`, `matmul_int4_f32_f32`, `qmoe_gate_up`, `qmoe_down_scatter`. Browser path verified still byte-equal — same math, no helper indirection.
 
+## Foundation laid for next session
+
+`wgpu_init.zig` now exports:
+- `createPersistentBuffer(backend, bytes)` → `c.WGPUBuffer` — uploads via staged copy, returns the buffer handle. Use for model weights at warmup.
+- `releasePersistentBuffer(buf)` — release on dispose.
+- `dispatchOnBackendMixed(...)` — accepts a tagged-union `StorageBinding` per input, so the caller can pass either inline bytes (transient activations) OR a persistent buffer handle (weights). Same function-call shape as `dispatchOnBackend`, just doesn't re-upload weights every dispatch.
+
+What's missing to make this usable from JS:
+- NAPI bindings: `napiCreateBuffer(handle, bytes) → BigInt`, `napiReleaseBuffer(handle, ptr)`, `napiDispatchByBuffers(handle, name, uniform, extras, mixed_inputs[], output, dispatch)`. Each input entry in `mixed_inputs` is either `{binding, bytes}` (uploaded fresh) or `{binding, bufPtr, byteLen}` (persistent).
+- JS orchestration that calls these.
+
 ## Not done — next session
 
 ### End-to-end forward pass

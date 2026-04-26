@@ -1020,6 +1020,220 @@ pub fn destroyBackend(b: *Backend) void {
     std.heap.c_allocator.destroy(b);
 }
 
+/// Allocate a persistent storage buffer on the backend's device,
+/// upload `bytes` via a staged copy, return the raw buffer handle.
+/// Caller owns release via `releaseBuffer`. Used for model weights
+/// that get uploaded once at warmup and reused across many forward
+/// passes.
+pub fn createPersistentBuffer(b: *Backend, bytes: []const u8) WgpuError!c.WGPUBuffer {
+    var stage_desc: c.WGPUBufferDescriptor = std.mem.zeroes(c.WGPUBufferDescriptor);
+    stage_desc.usage = c.WGPUBufferUsage_CopySrc;
+    stage_desc.size = bytes.len;
+    stage_desc.mappedAtCreation = 1;
+    const stage = c.wgpuDeviceCreateBuffer(b.device, &stage_desc);
+    if (stage == null) return WgpuError.BufferCreateFailed;
+    defer c.wgpuBufferRelease(stage);
+    const stage_ptr = c.wgpuBufferGetMappedRange(stage, 0, bytes.len);
+    if (stage_ptr == null) return WgpuError.BufferRangeFailed;
+    @memcpy(@as([*]u8, @ptrCast(stage_ptr))[0..bytes.len], bytes);
+    c.wgpuBufferUnmap(stage);
+
+    var dst_desc: c.WGPUBufferDescriptor = std.mem.zeroes(c.WGPUBufferDescriptor);
+    dst_desc.usage = c.WGPUBufferUsage_Storage | c.WGPUBufferUsage_CopyDst | c.WGPUBufferUsage_CopySrc;
+    dst_desc.size = bytes.len;
+    const dst = c.wgpuDeviceCreateBuffer(b.device, &dst_desc);
+    if (dst == null) return WgpuError.BufferCreateFailed;
+
+    const encoder = c.wgpuDeviceCreateCommandEncoder(b.device, null);
+    defer c.wgpuCommandEncoderRelease(encoder);
+    c.wgpuCommandEncoderCopyBufferToBuffer(encoder, stage, 0, dst, 0, bytes.len);
+    const cmd = c.wgpuCommandEncoderFinish(encoder, null);
+    defer c.wgpuCommandBufferRelease(cmd);
+    var cmds = [_]c.WGPUCommandBuffer{cmd};
+    c.wgpuQueueSubmit(b.queue, cmds.len, &cmds);
+    return dst;
+}
+
+pub fn releasePersistentBuffer(buf: c.WGPUBuffer) void {
+    c.wgpuBufferRelease(buf);
+}
+
+pub const StorageBinding = union(enum) {
+    bytes: StorageInput,
+    buffer: struct { binding: u32, buf: c.WGPUBuffer, byte_len: u64 },
+};
+
+/// Like `dispatchOnBackend` but inputs may be either inline bytes
+/// (uploaded fresh per call) or persistent buffer handles (no copy).
+/// Used by the forward orchestration where weights are persistent
+/// and activations are transient.
+pub fn dispatchOnBackendMixed(
+    b: *Backend,
+    wgsl_src: []const u8,
+    uniform_bytes: []const u8,
+    uniform_binding: u32,
+    inputs: []const StorageBinding,
+    output: KernelOutput,
+    output_initial: ?[]const u8,
+    extra_uniforms: []const StorageInput,
+    dispatch: [3]u32,
+) WgpuError!void {
+    const device = b.device;
+    const queue = b.queue;
+
+    var wgsl_chain: c.WGPUShaderSourceWGSL = std.mem.zeroes(c.WGPUShaderSourceWGSL);
+    wgsl_chain.chain.next = null;
+    wgsl_chain.chain.sType = c.WGPUSType_ShaderSourceWGSL;
+    wgsl_chain.code.data = wgsl_src.ptr;
+    wgsl_chain.code.length = wgsl_src.len;
+    var module_desc: c.WGPUShaderModuleDescriptor = std.mem.zeroes(c.WGPUShaderModuleDescriptor);
+    module_desc.nextInChain = @ptrCast(&wgsl_chain.chain);
+    module_desc.label = .{ .data = null, .length = std.math.maxInt(usize) };
+    const module = c.wgpuDeviceCreateShaderModule(device, &module_desc);
+    if (module == null) return WgpuError.ShaderModuleFailed;
+    defer c.wgpuShaderModuleRelease(module);
+
+    var pipeline_desc: c.WGPUComputePipelineDescriptor = std.mem.zeroes(c.WGPUComputePipelineDescriptor);
+    pipeline_desc.layout = null;
+    pipeline_desc.compute.module = module;
+    pipeline_desc.compute.entryPoint = .{ .data = "main", .length = 4 };
+    const pipeline = c.wgpuDeviceCreateComputePipeline(device, &pipeline_desc);
+    if (pipeline == null) return WgpuError.ComputePipelineFailed;
+    defer c.wgpuComputePipelineRelease(pipeline);
+
+    var u_buf: c.WGPUBuffer = null;
+    if (uniform_bytes.len > 0) {
+        var u_desc: c.WGPUBufferDescriptor = std.mem.zeroes(c.WGPUBufferDescriptor);
+        u_desc.usage = c.WGPUBufferUsage_Uniform | c.WGPUBufferUsage_CopyDst;
+        u_desc.size = uniform_bytes.len;
+        u_buf = c.wgpuDeviceCreateBuffer(device, &u_desc);
+        if (u_buf == null) return WgpuError.BufferCreateFailed;
+        c.wgpuQueueWriteBuffer(queue, u_buf, 0, uniform_bytes.ptr, uniform_bytes.len);
+    }
+    defer if (u_buf != null) c.wgpuBufferRelease(u_buf);
+
+    // Mixed inputs: track which bufs we own (for release) vs borrowed.
+    var owned_bufs: [16]c.WGPUBuffer = undefined;
+    var owned_count: usize = 0;
+    var input_bufs: [16]c.WGPUBuffer = undefined;
+    var input_lens: [16]u64 = undefined;
+    if (inputs.len > 16) return WgpuError.BufferRangeFailed;
+    for (inputs, 0..) |inp, i| {
+        switch (inp) {
+            .bytes => |sb| {
+                const buf = try uploadStorageBuffer(device, sb.bytes);
+                input_bufs[i] = buf;
+                input_lens[i] = sb.bytes.len;
+                owned_bufs[owned_count] = buf;
+                owned_count += 1;
+            },
+            .buffer => |bb| {
+                input_bufs[i] = bb.buf;
+                input_lens[i] = bb.byte_len;
+            },
+        }
+    }
+    defer for (owned_bufs[0..owned_count]) |buf| c.wgpuBufferRelease(buf);
+
+    var extra_uniform_bufs: [8]c.WGPUBuffer = undefined;
+    if (extra_uniforms.len > 8) return WgpuError.BufferRangeFailed;
+    for (extra_uniforms, 0..) |eu, i| {
+        var ed: c.WGPUBufferDescriptor = std.mem.zeroes(c.WGPUBufferDescriptor);
+        ed.usage = c.WGPUBufferUsage_Uniform | c.WGPUBufferUsage_CopyDst;
+        ed.size = eu.bytes.len;
+        const eb = c.wgpuDeviceCreateBuffer(device, &ed);
+        if (eb == null) return WgpuError.BufferCreateFailed;
+        c.wgpuQueueWriteBuffer(queue, eb, 0, eu.bytes.ptr, eu.bytes.len);
+        extra_uniform_bufs[i] = eb;
+    }
+    defer for (extra_uniform_bufs[0..extra_uniforms.len]) |buf| c.wgpuBufferRelease(buf);
+
+    var y_desc: c.WGPUBufferDescriptor = std.mem.zeroes(c.WGPUBufferDescriptor);
+    y_desc.usage = c.WGPUBufferUsage_Storage | c.WGPUBufferUsage_CopySrc | c.WGPUBufferUsage_CopyDst;
+    y_desc.size = output.bytes.len;
+    const y_buf = c.wgpuDeviceCreateBuffer(device, &y_desc);
+    if (y_buf == null) return WgpuError.BufferCreateFailed;
+    defer c.wgpuBufferRelease(y_buf);
+    if (output_initial) |init_bytes| {
+        c.wgpuQueueWriteBuffer(queue, y_buf, 0, init_bytes.ptr, init_bytes.len);
+    }
+
+    var read_desc: c.WGPUBufferDescriptor = std.mem.zeroes(c.WGPUBufferDescriptor);
+    read_desc.usage = c.WGPUBufferUsage_MapRead | c.WGPUBufferUsage_CopyDst;
+    read_desc.size = output.bytes.len;
+    const readback = c.wgpuDeviceCreateBuffer(device, &read_desc);
+    if (readback == null) return WgpuError.BufferCreateFailed;
+    defer c.wgpuBufferRelease(readback);
+
+    var entries: [32]c.WGPUBindGroupEntry = undefined;
+    var entry_count: usize = 0;
+    if (uniform_bytes.len > 0) {
+        entries[entry_count] = .{ .nextInChain = null, .binding = uniform_binding, .buffer = u_buf, .offset = 0, .size = uniform_bytes.len, .sampler = null, .textureView = null };
+        entry_count += 1;
+    }
+    for (extra_uniforms, 0..) |eu, i| {
+        entries[entry_count] = .{ .nextInChain = null, .binding = eu.binding, .buffer = extra_uniform_bufs[i], .offset = 0, .size = eu.bytes.len, .sampler = null, .textureView = null };
+        entry_count += 1;
+    }
+    for (inputs, 0..) |inp, i| {
+        const binding = switch (inp) {
+            .bytes => |sb| sb.binding,
+            .buffer => |bb| bb.binding,
+        };
+        entries[entry_count] = .{ .nextInChain = null, .binding = binding, .buffer = input_bufs[i], .offset = 0, .size = input_lens[i], .sampler = null, .textureView = null };
+        entry_count += 1;
+    }
+    entries[entry_count] = .{ .nextInChain = null, .binding = output.binding, .buffer = y_buf, .offset = 0, .size = output.bytes.len, .sampler = null, .textureView = null };
+    entry_count += 1;
+
+    const bgl = c.wgpuComputePipelineGetBindGroupLayout(pipeline, 0);
+    defer c.wgpuBindGroupLayoutRelease(bgl);
+    var bg_desc: c.WGPUBindGroupDescriptor = std.mem.zeroes(c.WGPUBindGroupDescriptor);
+    bg_desc.layout = bgl;
+    bg_desc.entryCount = entry_count;
+    bg_desc.entries = &entries;
+    const bg = c.wgpuDeviceCreateBindGroup(device, &bg_desc);
+    if (bg == null) return WgpuError.BindGroupFailed;
+    defer c.wgpuBindGroupRelease(bg);
+
+    const encoder = c.wgpuDeviceCreateCommandEncoder(device, null);
+    defer c.wgpuCommandEncoderRelease(encoder);
+    const pass = c.wgpuCommandEncoderBeginComputePass(encoder, null);
+    c.wgpuComputePassEncoderSetPipeline(pass, pipeline);
+    c.wgpuComputePassEncoderSetBindGroup(pass, 0, bg, 0, null);
+    c.wgpuComputePassEncoderDispatchWorkgroups(pass, dispatch[0], dispatch[1], dispatch[2]);
+    c.wgpuComputePassEncoderEnd(pass);
+    c.wgpuComputePassEncoderRelease(pass);
+    c.wgpuCommandEncoderCopyBufferToBuffer(encoder, y_buf, 0, readback, 0, output.bytes.len);
+    const cmd = c.wgpuCommandEncoderFinish(encoder, null);
+    defer c.wgpuCommandBufferRelease(cmd);
+    var cmds = [_]c.WGPUCommandBuffer{cmd};
+    c.wgpuQueueSubmit(queue, cmds.len, &cmds);
+
+    var map_state = MapState{};
+    const map_cb = c.WGPUBufferMapCallbackInfo{
+        .nextInChain = null,
+        .mode = c.WGPUCallbackMode_AllowProcessEvents,
+        .callback = onBufferMap,
+        .userdata1 = &map_state,
+        .userdata2 = null,
+    };
+    _ = c.wgpuBufferMapAsync(readback, c.WGPUMapMode_Read, 0, output.bytes.len, map_cb);
+    var spins: u32 = 0;
+    while (!map_state.fired and spins < 1_000_000) : (spins += 1) {
+        _ = c.wgpuDevicePoll(device, 0, null);
+        c.wgpuInstanceProcessEvents(b.instance);
+    }
+    if (!map_state.fired or map_state.status != c.WGPUMapAsyncStatus_Success) return WgpuError.BufferMapFailed;
+    const mapped = c.wgpuBufferGetMappedRange(readback, 0, output.bytes.len);
+    if (mapped == null) {
+        c.wgpuBufferUnmap(readback);
+        return WgpuError.BufferRangeFailed;
+    }
+    @memcpy(output.bytes, @as([*]const u8, @ptrCast(mapped))[0..output.bytes.len]);
+    c.wgpuBufferUnmap(readback);
+}
+
 /// Same as dispatchKernel but uses an existing Backend (no per-call
 /// instance/adapter/device init). Buffers + pipeline are still
 /// per-call — the next milestone caches pipelines too.

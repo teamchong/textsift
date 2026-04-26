@@ -10,6 +10,8 @@ const SHADERS = [
   "cast_fp16_to_f32",
   "cast_f32_to_fp16_scaled",
   "add_fp16",
+  "swiglu_clamp",
+  "rope_apply",
 ];
 
 let failed = 0;

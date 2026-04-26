@@ -1,0 +1,26 @@
+{
+  "shader": "swiglu_clamp",
+  "uniform": {
+    "binding": 0,
+    "byteLength": 16
+  },
+  "extraUniforms": [],
+  "inputs": [
+    {
+      "binding": 1,
+      "name": "gate_up",
+      "byteLength": 4096
+    }
+  ],
+  "output": {
+    "binding": 2,
+    "dtype": "f32",
+    "byteLength": 2048,
+    "hasInitial": false
+  },
+  "dispatch": [
+    8,
+    1,
+    1
+  ]
+}

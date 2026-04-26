@@ -1,0 +1,31 @@
+{
+  "shader": "rope_apply",
+  "uniform": {
+    "binding": 0,
+    "byteLength": 16
+  },
+  "extraUniforms": [],
+  "inputs": [
+    {
+      "binding": 2,
+      "name": "cos_tab",
+      "byteLength": 128
+    },
+    {
+      "binding": 3,
+      "name": "sin_tab",
+      "byteLength": 128
+    }
+  ],
+  "output": {
+    "binding": 1,
+    "dtype": "f16",
+    "byteLength": 1024,
+    "hasInitial": true
+  },
+  "dispatch": [
+    4,
+    1,
+    1
+  ]
+}

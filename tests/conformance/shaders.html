@@ -140,6 +140,44 @@
             };
           },
         },
+        {
+          name: "swiglu_clamp",
+          build() {
+            const rows = 4, dff = 128;
+            return {
+              uniform: { binding: 0, bytes: dimsBuf([{tag:"u32",value:rows},{tag:"u32",value:dff},{tag:"u32",value:0},{tag:"u32",value:0}]) },
+              inputs: [
+                // gate_up has 2*dff entries per row (gate, up interleaved).
+                { binding: 1, name: "gate_up", bytes: new Uint8Array(rngF32(7, rows * 2 * dff, 3.0).buffer) },
+              ],
+              output: { binding: 2, elements: rows * dff, dtype: "f32" },
+              dispatch: [Math.ceil(rows * dff / 64), 1, 1],
+            };
+          },
+        },
+        {
+          name: "rope_apply",
+          build() {
+            const T = 4, H = 4, head_dim = 32;
+            const qkBytes = T * H * head_dim * 2; // f16
+            return {
+              uniform: { binding: 0, bytes: dimsBuf([{tag:"u32",value:T},{tag:"u32",value:H},{tag:"u32",value:head_dim},{tag:"u32",value:0}]) },
+              inputs: [
+                { binding: 2, name: "cos_tab", bytes: rngF16(8, T * head_dim / 2, 1.0) },
+                { binding: 3, name: "sin_tab", bytes: rngF16(9, T * head_dim / 2, 1.0) },
+              ],
+              // qk is read+write, so it lives at the output binding with
+              // an initial value uploaded before dispatch.
+              output: {
+                binding: 1,
+                elements: T * H * head_dim,
+                dtype: "f16",
+              },
+              outputInitial: rngF16(10, T * H * head_dim, 1.0),
+              dispatch: [Math.ceil(T * H * (head_dim / 2) / 64), 1, 1],
+            };
+          },
+        },
       ];
 
       try {

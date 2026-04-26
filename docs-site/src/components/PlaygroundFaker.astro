@@ -1,0 +1,269 @@
+---
+// Faker-mode playground: focused demo for `markerPresets.faker()`.
+// Loads the same model as the main playground but pre-wires the
+// faker MarkerStrategy so the output is realistic-looking fakes
+// instead of `[private_email]` markers. Three preset example
+// inputs to make the use case (test data / demos / vendor sharing)
+// concrete on first visit.
+
+const PRESET_SUPPORT = `Hi support team,
+
+My name is Alice Carter and I'm writing about my account (4242-4242-4242-4242). I tried to call you yesterday at +1-617-555-0199 but got disconnected — can you reach me at alice.carter@example.com instead? My address on file is 123 Maple Street, Boston, MA 02134.
+
+Alice signed up on March 12, 2018 and has been a customer ever since. Please let me know.
+
+Thanks,
+Alice`;
+
+const PRESET_EMAIL = `Subject: Welcome to Acme, John Smith!
+
+Hi John,
+
+Welcome to Acme. Your account is ready. Here's your information:
+
+  Name:    John Smith
+  Email:   john.smith@example.com
+  Phone:   +1-415-555-0188
+  Account: 4111-1111-1111-9876
+
+Please confirm your details. If anything looks wrong, reply to this email or call John at +1-415-555-0188.
+
+— The Acme Team`;
+
+const PRESET_CSV = `id,name,email,phone,joined
+1,Maria Lopez,maria.lopez@example.com,+1-212-555-0144,2024-08-15
+2,James Chen,james.chen@example.org,+1-415-555-0177,2024-09-02
+3,Maria Lopez,m.lopez@example.com,+1-212-555-0144,2024-09-12
+4,Olivia Patel,olivia.patel@example.io,+1-617-555-0123,2024-10-01`;
+---
+
+<div class="ts-playground">
+  <p class="ts-intro">
+    <strong>Faker mode</strong> swaps the default <code>[private_email]</code>-style
+    markers for realistic-but-fake values that downstream code can still
+    parse. Same input text always maps to the same fake within the filter's
+    lifetime, so relationships across mentions are preserved.
+  </p>
+
+  <div class="ts-row">
+    <label for="ts-preset"><strong>1. Pick an example</strong> <span class="ts-hint">— or paste your own below</span></label>
+    <select id="ts-preset">
+      <option value="support">Customer support transcript</option>
+      <option value="email">Welcome email template</option>
+      <option value="csv">CSV row export</option>
+      <option value="custom">Custom (paste below)</option>
+    </select>
+  </div>
+
+  <div class="ts-row">
+    <label for="ts-input"><strong>2. Input text</strong></label>
+    <textarea id="ts-input" rows="14" spellcheck="false" set:html={PRESET_SUPPORT}></textarea>
+  </div>
+
+  <div class="ts-row ts-controls">
+    <button id="ts-run" type="button">Run faker</button>
+    <span id="ts-status" class="ts-status">idle</span>
+  </div>
+
+  <div id="ts-download-warning" class="ts-download-warning" hidden>
+    <strong>⚠ First click will download ~770 MB</strong> of model weights from
+    HuggingFace and cache them on this device (OPFS). Subsequent visits load
+    from the local cache.
+  </div>
+
+  <div class="ts-row">
+    <label><strong>3. Side-by-side</strong></label>
+    <div class="ts-sidebyside">
+      <div>
+        <h4>Original</h4>
+        <pre id="ts-original" class="ts-output"></pre>
+      </div>
+      <div>
+        <h4>Faker output</h4>
+        <pre id="ts-faked" class="ts-output"></pre>
+      </div>
+    </div>
+  </div>
+
+  <div class="ts-row">
+    <label><strong>4. Mappings</strong> <span class="ts-hint">— original text → fake replacement (per detected span). Repeated rows highlight the consistency: same input gets the same fake.</span></label>
+    <div id="ts-mappings" class="ts-mappings">
+      <em class="ts-hint">Run the faker to see the mappings.</em>
+    </div>
+  </div>
+
+  <details class="ts-row ts-details">
+    <summary>Equivalent code <span class="ts-hint">— same call you'd make from your own JS/TS project</span></summary>
+    <pre id="ts-code" class="ts-code"></pre>
+  </details>
+
+  <p class="ts-note">
+    Note: <code>secret</code> spans (API keys, JWTs, credentials) are
+    deliberately <em>not</em> faked — emitting another credible-looking
+    secret is a security footgun. They render as <code>[secret]</code>.
+  </p>
+</div>
+
+<style>
+  .ts-playground {
+    display: flex;
+    flex-direction: column;
+    gap: 0.85rem;
+    margin: 1rem 0;
+  }
+  .ts-intro {
+    background: var(--sl-color-bg-sidebar, #f6f7f9);
+    border-left: 3px solid var(--sl-color-accent, #6366f1);
+    padding: 0.75rem 1rem;
+    border-radius: 4px;
+    margin: 0;
+    line-height: 1.5;
+  }
+  .ts-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+  }
+  .ts-row label { font-size: 0.95rem; }
+  .ts-controls {
+    flex-direction: row;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.6rem;
+  }
+  .ts-hint {
+    font-size: 0.85em;
+    color: var(--sl-color-text-accent, #888);
+  }
+  textarea, select {
+    width: 100%;
+    box-sizing: border-box;
+    font-family: var(--sl-font-system-mono, ui-monospace, monospace);
+    font-size: 0.9rem;
+    padding: 0.5rem;
+    border: 1px solid var(--sl-color-hairline, #d4d4d8);
+    border-radius: 4px;
+    background: var(--sl-color-bg, #fff);
+    color: var(--sl-color-text, #222);
+  }
+  button {
+    padding: 0.5rem 1rem;
+    border: 1px solid var(--sl-color-hairline, #d4d4d8);
+    border-radius: 4px;
+    background: var(--sl-color-accent, #6366f1);
+    color: white;
+    cursor: pointer;
+    font-weight: 500;
+  }
+  button:hover:not(:disabled) { opacity: 0.9; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .ts-status { font-size: 0.9rem; color: var(--sl-color-text-accent, #888); }
+  .ts-sidebyside {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.75rem;
+  }
+  .ts-sidebyside h4 {
+    margin: 0 0 0.4rem 0;
+    font-size: 0.95rem;
+    color: var(--sl-color-text-accent, #666);
+  }
+  .ts-output {
+    background: var(--sl-color-bg-sidebar, #f6f7f9);
+    border: 1px solid var(--sl-color-hairline, #d4d4d8);
+    border-radius: 4px;
+    padding: 0.75rem;
+    margin: 0;
+    font-family: var(--sl-font-system-mono, ui-monospace, monospace);
+    font-size: 0.85rem;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    min-height: 8rem;
+    max-height: 24rem;
+    overflow-y: auto;
+  }
+  .ts-output mark.ts-fake {
+    background: rgba(99, 102, 241, 0.15);
+    color: inherit;
+    padding: 1px 3px;
+    border-radius: 3px;
+    font-weight: 500;
+  }
+  .ts-mappings {
+    border: 1px solid var(--sl-color-hairline, #d4d4d8);
+    border-radius: 4px;
+    padding: 0.5rem;
+    background: var(--sl-color-bg-sidebar, #f6f7f9);
+    max-height: 18rem;
+    overflow-y: auto;
+  }
+  .ts-mappings table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+  }
+  .ts-mappings th, .ts-mappings td {
+    text-align: left;
+    padding: 0.3rem 0.5rem;
+    border-bottom: 1px solid var(--sl-color-hairline, #d4d4d8);
+  }
+  .ts-mappings th {
+    background: var(--sl-color-bg, #fff);
+    font-weight: 600;
+  }
+  .ts-mappings tr.ts-repeat {
+    background: rgba(34, 197, 94, 0.08);
+  }
+  .ts-mappings tr.ts-repeat td:first-child::after {
+    content: " ↻";
+    color: rgb(34, 197, 94);
+    font-weight: bold;
+  }
+  .ts-mappings .ts-label {
+    font-family: var(--sl-font-system-mono, ui-monospace, monospace);
+    font-size: 0.8rem;
+    color: var(--sl-color-text-accent, #888);
+  }
+  .ts-mappings .ts-orig, .ts-mappings .ts-fake-cell {
+    font-family: var(--sl-font-system-mono, ui-monospace, monospace);
+  }
+  .ts-mappings .ts-fake-cell { color: var(--sl-color-accent, #6366f1); font-weight: 500; }
+  .ts-code {
+    background: var(--sl-color-bg-sidebar, #f6f7f9);
+    border: 1px solid var(--sl-color-hairline, #d4d4d8);
+    border-radius: 4px;
+    padding: 0.75rem;
+    margin: 0;
+    font-family: var(--sl-font-system-mono, ui-monospace, monospace);
+    font-size: 0.85rem;
+    overflow-x: auto;
+  }
+  .ts-details summary { cursor: pointer; font-weight: 500; }
+  .ts-note {
+    background: var(--sl-color-bg-sidebar, #f6f7f9);
+    border-left: 3px solid #b8761a;
+    padding: 0.6rem 1rem;
+    border-radius: 4px;
+    margin: 0;
+    font-size: 0.9rem;
+    line-height: 1.5;
+  }
+  .ts-download-warning {
+    background: #fff7e6;
+    color: #5a3d00;
+    border: 1px solid #f0b25e;
+    border-radius: 4px;
+    padding: 0.5rem 0.7rem;
+    font-size: 0.88rem;
+    line-height: 1.5;
+  }
+  .ts-download-warning strong { color: #b8761a; }
+</style>
+
+<script type="application/json" id="ts-presets" set:html={JSON.stringify({
+  support: PRESET_SUPPORT,
+  email: PRESET_EMAIL,
+  csv: PRESET_CSV,
+})}></script>
+
+<script>import "../scripts/playground-faker.ts";</script>

@@ -1,0 +1,92 @@
+---
+title: Faker mode playground
+description: Interactive demo of markerPresets.faker — redact PII to realistic-but-fake values that downstream code can still parse.
+---
+
+import PlaygroundFaker from "../../components/PlaygroundFaker.astro";
+
+Pick an example or paste your own text. Click **Run faker** to redact
+PII to realistic-looking fake values instead of the default
+`[private_email]`-style markers.
+
+Everything runs in your browser — the text never leaves the page.
+
+<PlaygroundFaker />
+
+## When to use this
+
+Faker mode is for cases where the redacted output still needs to **look
+like real data** so downstream code keeps working:
+
+- **Test fixtures from prod data** — anonymise a customer record but
+  keep the schema valid for your API tests.
+- **Sales demos** — show a populated UI without leaking real names /
+  emails / phone numbers.
+- **Customer support transcripts shared with vendors** — preserve the
+  conversation flow when [REDACTED] tags would break readability.
+- **Marketing email template QA** — render a real-looking email
+  without using actual customer PII.
+
+For pure scrubbing where you don't care about realism (compliance
+audits, log scrubbing, AI-proxy filtering before an LLM call), use the
+default `[label]` markers instead — see the
+[main playground](/textsift/playground/).
+
+## How consistency works
+
+Within a single filter's lifetime, the same input text always maps to
+the same fake. So if `Alice Carter` appears five times in a customer
+record, all five mentions become the same fake name — you don't lose
+the relationship between mentions, which matters for downstream
+processing (joining tables, checking referential integrity, etc.).
+
+The mapping table above flags repeats with a green ↻ icon so you can
+see the consistency in action.
+
+```ts
+import { PrivacyFilter, markerPresets } from "textsift";
+
+// Each call to faker() returns a fresh stateful instance.
+// Reusing one instance across multiple redact() calls preserves
+// consistency across documents.
+const filter = await PrivacyFilter.create({
+  markers: markerPresets.faker(),
+});
+
+await filter.redact("Hi Alice, your email is alice@example.com");
+// → "Hi Alice Anderson, your email is alice.anderson@example.com"
+
+await filter.redact("Alice signed up on 2024-12-01");
+// → "Alice Anderson signed up on 2026-01-01"
+//   ↑ same fake name comes back — relationship preserved
+```
+
+## What's not faked
+
+`secret` spans (API keys, JWTs, AWS credentials, PEM private-key
+headers, etc.) deliberately render as `[secret]` instead of being
+faked. Emitting another credible-looking secret is a security footgun:
+downstream code might treat it as real, or attackers can pattern-mine
+the leaked-but-fake format to learn what shape your real secrets take.
+
+If you need fake-but-typed secrets for tests, generate them yourself
+with explicit per-format generators rather than relying on a generic
+PII fakery layer.
+
+## Custom marker logic
+
+If `markerPresets.faker()` doesn't fit your use case (need
+locale-specific phone formats, want to derive fakes from a hash, etc.),
+the `markers` option also accepts your own function:
+
+```ts
+const filter = await PrivacyFilter.create({
+  markers: (span, index) => {
+    if (span.label === "private_email") return `user${index}@example.com`;
+    return null; // null → leave original text unchanged
+  },
+});
+```
+
+See the [API reference](/textsift/api/) for the full `MarkerStrategy`
+contract.

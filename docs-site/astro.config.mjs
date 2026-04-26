@@ -36,6 +36,7 @@ export default defineConfig({
         { label: "Overview", slug: "index" },
         { label: "Quickstart", slug: "quickstart" },
         { label: "Playground", slug: "playground" },
+        { label: "Faker mode playground", slug: "playground-faker" },
         { label: "API Reference", slug: "api" },
         { label: "Backends", slug: "backends" },
         { label: "Benchmarks", slug: "benchmarks" },

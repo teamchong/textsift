@@ -98,16 +98,30 @@ function nativeApi(platform: Platform, native: any): NativeApi {
         createBackend:     () => native.metalCreateBackend(),
         destroyBackend:    (h) => native.metalDestroyBackend(h),
         deviceName:        (h) => native.metalDeviceName(h),
-        createBuffer:      (_h, b) => native.metalCreateBuffer(b),
-        createEmptyBuffer: (_h, n) => native.metalCreateEmptyBuffer(n),
+        createBuffer:      (h, b) => native.metalCreateBuffer(h, b),
+        createEmptyBuffer: (h, n) => native.metalCreateEmptyBuffer(h, n),
         releaseBuffer:     (_h, b) => native.metalReleaseBuffer(b),
         writeBuffer:       (_h, b, o, by) => native.metalWriteBuffer(b, o, by),
         readBuffer:        (_h, b, o, n) => native.metalReadBuffer(b, o, n),
         beginEncoder:      (h) => native.metalBeginEncoder(h),
         enqueueDispatch:   (e, name, bs, u, g) => {
-          const bindings: any[] = [{ index: 0, bytes: u }];
+          // `cast_f32_to_fp16_scaled` is the only kernel with two
+          // uniform bindings (dims at [[buffer(0)]], scale at
+          // [[buffer(1)]]). The unified API concatenates them into
+          // one 32-byte blob (Vulkan/Dawn use push constants and
+          // don't care). Split for Metal so each lands at the right
+          // binding slot.
+          const bindings: any[] = [];
+          let storageStart = 1;
+          if (name === "cast_f32_to_fp16_scaled" && u.byteLength === 32) {
+            bindings.push({ index: 0, bytes: u.subarray(0, 16) });
+            bindings.push({ index: 1, bytes: u.subarray(16, 32) });
+            storageStart = 2;
+          } else {
+            bindings.push({ index: 0, bytes: u });
+          }
           for (let i = 0; i < bs.length; i++) {
-            bindings.push({ index: i + 1, bufPtr: bs[i] });
+            bindings.push({ index: storageStart + i, bufPtr: bs[i] });
           }
           native.metalEnqueueDispatch(e, name, bindings, g, [64, 1, 1]);
         },

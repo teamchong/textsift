@@ -509,6 +509,203 @@ pub fn dispatchDouble(input: []const f32, output: []f32) WgpuError!void {
     c.wgpuBufferUnmap(readback);
 }
 
+/// fp32 matmul: C[M,N] = A[M,K] · B[K,N]. Row-major. Validates the
+/// multi-input compute path (two storage reads + one storage write
+/// + uniform-style dimensions baked into a uniform buffer). The
+/// shader is the "hello world" of GPU matmul — one workgroup per
+/// output element. Real workhorse matmuls (int4-fp16) port next.
+pub fn dispatchMatmulF32(
+    a: []const f32,
+    b: []const f32,
+    out: []f32,
+    m: u32,
+    n: u32,
+    k: u32,
+) WgpuError!void {
+    if (a.len < @as(usize, m) * @as(usize, k)) return WgpuError.BufferRangeFailed;
+    if (b.len < @as(usize, k) * @as(usize, n)) return WgpuError.BufferRangeFailed;
+    if (out.len < @as(usize, m) * @as(usize, n)) return WgpuError.BufferRangeFailed;
+
+    const a_bytes: u64 = @as(u64, m) * @as(u64, k) * @sizeOf(f32);
+    const b_bytes: u64 = @as(u64, k) * @as(u64, n) * @sizeOf(f32);
+    const c_bytes: u64 = @as(u64, m) * @as(u64, n) * @sizeOf(f32);
+
+    const handles = try createInstanceAndAdapter();
+    defer c.wgpuInstanceRelease(handles.instance);
+    defer c.wgpuAdapterRelease(handles.adapter);
+
+    try requireShaderF16(handles.adapter);
+    const device = try createDevice(handles.instance, handles.adapter);
+    defer c.wgpuDeviceRelease(device);
+    const queue = c.wgpuDeviceGetQueue(device);
+    defer c.wgpuQueueRelease(queue);
+
+    // ── shader ──
+    const wgsl_src =
+        \\struct Dims { m: u32, n: u32, k: u32, _pad: u32 };
+        \\@group(0) @binding(0) var<uniform> dims: Dims;
+        \\@group(0) @binding(1) var<storage, read>       a: array<f32>;
+        \\@group(0) @binding(2) var<storage, read>       b: array<f32>;
+        \\@group(0) @binding(3) var<storage, read_write> c: array<f32>;
+        \\@compute @workgroup_size(8, 8) fn main(
+        \\  @builtin(global_invocation_id) gid: vec3<u32>
+        \\) {
+        \\  let row = gid.x;
+        \\  let col = gid.y;
+        \\  if row >= dims.m || col >= dims.n { return; }
+        \\  var acc: f32 = 0.0;
+        \\  for (var i: u32 = 0u; i < dims.k; i = i + 1u) {
+        \\    acc = acc + a[row * dims.k + i] * b[i * dims.n + col];
+        \\  }
+        \\  c[row * dims.n + col] = acc;
+        \\}
+    ;
+    var wgsl_chain: c.WGPUShaderSourceWGSL = std.mem.zeroes(c.WGPUShaderSourceWGSL);
+    wgsl_chain.chain.next = null;
+    wgsl_chain.chain.sType = c.WGPUSType_ShaderSourceWGSL;
+    wgsl_chain.code.data = wgsl_src.ptr;
+    wgsl_chain.code.length = wgsl_src.len;
+    var module_desc: c.WGPUShaderModuleDescriptor = std.mem.zeroes(c.WGPUShaderModuleDescriptor);
+    module_desc.nextInChain = @ptrCast(&wgsl_chain.chain);
+    module_desc.label = .{ .data = null, .length = std.math.maxInt(usize) };
+    const module = c.wgpuDeviceCreateShaderModule(device, &module_desc);
+    if (module == null) return WgpuError.ShaderModuleFailed;
+    defer c.wgpuShaderModuleRelease(module);
+
+    var pipeline_desc: c.WGPUComputePipelineDescriptor = std.mem.zeroes(c.WGPUComputePipelineDescriptor);
+    pipeline_desc.layout = null;
+    pipeline_desc.compute.module = module;
+    pipeline_desc.compute.entryPoint = .{ .data = "main", .length = 4 };
+    pipeline_desc.label = .{ .data = null, .length = std.math.maxInt(usize) };
+    const pipeline = c.wgpuDeviceCreateComputePipeline(device, &pipeline_desc);
+    if (pipeline == null) return WgpuError.ComputePipelineFailed;
+    defer c.wgpuComputePipelineRelease(pipeline);
+
+    // ── buffers ──
+    const a_buf = try uploadStorageBuffer(device, std.mem.sliceAsBytes(a[0 .. m * k]));
+    defer c.wgpuBufferRelease(a_buf);
+    const b_buf = try uploadStorageBuffer(device, std.mem.sliceAsBytes(b[0 .. k * n]));
+    defer c.wgpuBufferRelease(b_buf);
+
+    var c_desc: c.WGPUBufferDescriptor = std.mem.zeroes(c.WGPUBufferDescriptor);
+    c_desc.usage = c.WGPUBufferUsage_Storage | c.WGPUBufferUsage_CopySrc;
+    c_desc.size = c_bytes;
+    const c_buf = c.wgpuDeviceCreateBuffer(device, &c_desc);
+    if (c_buf == null) return WgpuError.BufferCreateFailed;
+    defer c.wgpuBufferRelease(c_buf);
+
+    // Uniform buffer: dims (m, n, k, pad)
+    const dims = [_]u32{ m, n, k, 0 };
+    var u_desc: c.WGPUBufferDescriptor = std.mem.zeroes(c.WGPUBufferDescriptor);
+    u_desc.usage = c.WGPUBufferUsage_Uniform | c.WGPUBufferUsage_CopyDst;
+    u_desc.size = @sizeOf(@TypeOf(dims));
+    const u_buf = c.wgpuDeviceCreateBuffer(device, &u_desc);
+    if (u_buf == null) return WgpuError.BufferCreateFailed;
+    defer c.wgpuBufferRelease(u_buf);
+    c.wgpuQueueWriteBuffer(queue, u_buf, 0, &dims, @sizeOf(@TypeOf(dims)));
+
+    var read_desc: c.WGPUBufferDescriptor = std.mem.zeroes(c.WGPUBufferDescriptor);
+    read_desc.usage = c.WGPUBufferUsage_MapRead | c.WGPUBufferUsage_CopyDst;
+    read_desc.size = c_bytes;
+    const readback = c.wgpuDeviceCreateBuffer(device, &read_desc);
+    if (readback == null) return WgpuError.BufferCreateFailed;
+    defer c.wgpuBufferRelease(readback);
+
+    // ── bind group ──
+    const bgl = c.wgpuComputePipelineGetBindGroupLayout(pipeline, 0);
+    defer c.wgpuBindGroupLayoutRelease(bgl);
+    var entries = [_]c.WGPUBindGroupEntry{
+        .{ .nextInChain = null, .binding = 0, .buffer = u_buf, .offset = 0, .size = @sizeOf(@TypeOf(dims)), .sampler = null, .textureView = null },
+        .{ .nextInChain = null, .binding = 1, .buffer = a_buf, .offset = 0, .size = a_bytes, .sampler = null, .textureView = null },
+        .{ .nextInChain = null, .binding = 2, .buffer = b_buf, .offset = 0, .size = b_bytes, .sampler = null, .textureView = null },
+        .{ .nextInChain = null, .binding = 3, .buffer = c_buf, .offset = 0, .size = c_bytes, .sampler = null, .textureView = null },
+    };
+    var bg_desc: c.WGPUBindGroupDescriptor = std.mem.zeroes(c.WGPUBindGroupDescriptor);
+    bg_desc.layout = bgl;
+    bg_desc.entryCount = entries.len;
+    bg_desc.entries = &entries;
+    const bg = c.wgpuDeviceCreateBindGroup(device, &bg_desc);
+    if (bg == null) return WgpuError.BindGroupFailed;
+    defer c.wgpuBindGroupRelease(bg);
+
+    // ── dispatch ──
+    const encoder = c.wgpuDeviceCreateCommandEncoder(device, null);
+    defer c.wgpuCommandEncoderRelease(encoder);
+    const pass = c.wgpuCommandEncoderBeginComputePass(encoder, null);
+    c.wgpuComputePassEncoderSetPipeline(pass, pipeline);
+    c.wgpuComputePassEncoderSetBindGroup(pass, 0, bg, 0, null);
+    const wg_x: u32 = (m + 7) / 8;
+    const wg_y: u32 = (n + 7) / 8;
+    c.wgpuComputePassEncoderDispatchWorkgroups(pass, wg_x, wg_y, 1);
+    c.wgpuComputePassEncoderEnd(pass);
+    c.wgpuComputePassEncoderRelease(pass);
+    c.wgpuCommandEncoderCopyBufferToBuffer(encoder, c_buf, 0, readback, 0, c_bytes);
+    const cmd = c.wgpuCommandEncoderFinish(encoder, null);
+    defer c.wgpuCommandBufferRelease(cmd);
+    var cmds = [_]c.WGPUCommandBuffer{cmd};
+    c.wgpuQueueSubmit(queue, cmds.len, &cmds);
+    _ = c.wgpuDevicePoll(device, 1, null);
+
+    // ── readback ──
+    var map_state = MapState{};
+    const map_cb = c.WGPUBufferMapCallbackInfo{
+        .nextInChain = null,
+        .mode = c.WGPUCallbackMode_AllowProcessEvents,
+        .callback = onBufferMap,
+        .userdata1 = &map_state,
+        .userdata2 = null,
+    };
+    _ = c.wgpuBufferMapAsync(readback, c.WGPUMapMode_Read, 0, c_bytes, map_cb);
+    var spins: u32 = 0;
+    while (!map_state.fired and spins < 1_000_000) : (spins += 1) {
+        _ = c.wgpuDevicePoll(device, 0, null);
+        c.wgpuInstanceProcessEvents(handles.instance);
+    }
+    if (!map_state.fired or map_state.status != c.WGPUMapAsyncStatus_Success) {
+        return WgpuError.BufferMapFailed;
+    }
+    const mapped = c.wgpuBufferGetMappedRange(readback, 0, c_bytes);
+    if (mapped == null) {
+        c.wgpuBufferUnmap(readback);
+        return WgpuError.BufferRangeFailed;
+    }
+    @memcpy(std.mem.sliceAsBytes(out[0 .. m * n]), @as([*]const u8, @ptrCast(mapped))[0..c_bytes]);
+    c.wgpuBufferUnmap(readback);
+}
+
+/// Helper: create a Storage|CopyDst buffer, upload `bytes` via a
+/// staged copy, return the buffer handle.
+fn uploadStorageBuffer(device: c.WGPUDevice, bytes: []const u8) WgpuError!c.WGPUBuffer {
+    var stage_desc: c.WGPUBufferDescriptor = std.mem.zeroes(c.WGPUBufferDescriptor);
+    stage_desc.usage = c.WGPUBufferUsage_CopySrc;
+    stage_desc.size = bytes.len;
+    stage_desc.mappedAtCreation = 1;
+    const stage = c.wgpuDeviceCreateBuffer(device, &stage_desc);
+    if (stage == null) return WgpuError.BufferCreateFailed;
+    defer c.wgpuBufferRelease(stage);
+    const stage_ptr = c.wgpuBufferGetMappedRange(stage, 0, bytes.len);
+    if (stage_ptr == null) return WgpuError.BufferRangeFailed;
+    @memcpy(@as([*]u8, @ptrCast(stage_ptr))[0..bytes.len], bytes);
+    c.wgpuBufferUnmap(stage);
+
+    var dst_desc: c.WGPUBufferDescriptor = std.mem.zeroes(c.WGPUBufferDescriptor);
+    dst_desc.usage = c.WGPUBufferUsage_Storage | c.WGPUBufferUsage_CopyDst;
+    dst_desc.size = bytes.len;
+    const dst = c.wgpuDeviceCreateBuffer(device, &dst_desc);
+    if (dst == null) return WgpuError.BufferCreateFailed;
+
+    const queue = c.wgpuDeviceGetQueue(device);
+    defer c.wgpuQueueRelease(queue);
+    const encoder = c.wgpuDeviceCreateCommandEncoder(device, null);
+    defer c.wgpuCommandEncoderRelease(encoder);
+    c.wgpuCommandEncoderCopyBufferToBuffer(encoder, stage, 0, dst, 0, bytes.len);
+    const cmd = c.wgpuCommandEncoderFinish(encoder, null);
+    defer c.wgpuCommandBufferRelease(cmd);
+    var cmds = [_]c.WGPUCommandBuffer{cmd};
+    c.wgpuQueueSubmit(queue, cmds.len, &cmds);
+    return dst;
+}
+
 /// Bring up the full instance + adapter + device chain, return both
 /// the adapter info and the limits the device was granted, then
 /// release everything. Used by `getDeviceInfo()` to give callers a

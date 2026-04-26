@@ -6,33 +6,24 @@
   </head>
   <body>
     <pre id="out">starting</pre>
-    <!-- The umbrella `textsift` package externalizes its deps so a
-         consumer's bundler (Vite/Webpack/etc) can resolve them. The
-         bench page loads ESM directly with no bundler, so we wire the
-         bare-name imports via an import map. -->
+    <!-- transformers.js is loaded externally via esm.sh — it is not
+         a dependency of the textsift package. The TransformersJsBackend
+         lives only as a bench helper (tests/browser/helpers/) so the
+         shipped library has zero tjs surface. -->
     <script type="importmap">
       {
         "imports": {
-          "textsift-core": "/packages/textsift-core/dist/index.js",
           "@huggingface/transformers": "https://esm.sh/@huggingface/transformers@4.2.0"
         }
       }
     </script>
     <script type="module">
-      // Run all three backends in a real browser and report:
-      //   - first-visit cold start (model download dominates the first
-      //     backend; subsequent backends benefit from browser HTTP cache
-      //     or our OPFS cache, so order matters — we run tjs first to
-      //     give it the worst-case position)
-      //   - second-visit cold start (caches populated; only parse +
-      //     compile + GPU upload remains)
-      //   - steady-state inference median across several text lengths
-      //
-      // Original/baseline = `transformers.js` running the same
-      // openai/privacy-filter ONNX. Forced via createWithResolver so the
-      // umbrella's auto-WebGPU short-circuit doesn't replace tjs with
-      // our WebGPU backend on machines that have one.
-      import { PrivacyFilter, TransformersJsBackend } from "/packages/textsift/dist/index.js";
+      // Compares transformers.js (baseline) vs textsift's WASM and
+      // WebGPU backends on steady-state per-forward latency and
+      // sustained throughput. Forces tjs via createWithResolver so
+      // the comparison stays honest on WebGPU-capable machines.
+      import { PrivacyFilter } from "/packages/textsift/dist/browser/index.js";
+      import { TransformersJsBackend } from "/tests/browser/helpers/transformers-js-backend.js";
 
       const FORCE_TJS_RESOLVER = {
         async resolveAuto({ bundle, quantization }) {

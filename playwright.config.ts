@@ -19,10 +19,8 @@ export default defineConfig({
     // Custom server adds Cross-Origin-Opener-Policy: same-origin and
     // Cross-Origin-Embedder-Policy: require-corp so SharedArrayBuffer
     // is available — required for the multi-threaded WASM backend.
-    // Lives under packages/textsift-core/scripts after the monorepo
-    // restructure.
-    command: "python3 packages/textsift-core/scripts/serve-coi.py 8123",
-    url: "http://localhost:8123/packages/textsift-core/dist/textsift.wasm",
+    command: "python3 packages/textsift/scripts/serve-coi.py 8123",
+    url: "http://localhost:8123/packages/textsift/dist/browser/textsift.wasm",
     reuseExistingServer: !process.env.CI,
     cwd: ".",
     timeout: 15_000,

@@ -2,50 +2,42 @@
 
 > **Personal learning project.** Treat as such — no SLA, no roadmap commitment. See the [main README](https://github.com/teamchong/textsift) for context.
 
-Wraps [`textsift-core`](https://www.npmjs.com/package/textsift-core) and adds a transformers.js fallback backend for runtimes that can't run WebGPU or SIMD-capable WASM. 226 KB gzipped (vs 76 KB for the lean `textsift-core`).
+PII detection + redaction running [openai/privacy-filter](https://huggingface.co/openai/privacy-filter) on the user's device. Custom WGSL kernels for WebGPU and Zig+SIMD128 WASM kernels for everywhere else. **No transformers.js dependency.**
 
 ```sh
 npm install textsift
 ```
 
-```ts
-import { PrivacyFilter } from "textsift";
+Two entry points so browsers never bundle native code:
 
+```ts
+// Browser / Node-via-WASM (today)
+import { PrivacyFilter } from "textsift/browser";
+
+// Node native NAPI binding (issue #79 — throws today)
+import { PrivacyFilter } from "textsift";
+```
+
+```ts
 const filter = await PrivacyFilter.create();
-const result = await filter.redact(
+const { redactedText } = await filter.redact(
   "Hi John Smith, your email john@example.com is on file.",
 );
 ```
 
-Same `PrivacyFilter` API as `textsift-core` — every export from core is re-exported here, plus `TransformersJsBackend` for callers who want to instantiate the fallback directly.
+## Why two entry points
 
-## When `textsift` vs `textsift-core`
-
-| Scenario | Pick |
-|---|---|
-| Browser that may not have WebGPU or COOP/COEP cross-origin-isolation | `textsift` |
-| Already using transformers.js elsewhere, want a drop-in replacement | `textsift` |
-| Browser app on modern Chromium / Safari 18+ where WebGPU is available | [`textsift-core`](https://www.npmjs.com/package/textsift-core) (3× smaller) |
-| Node 20+ server-side | [`textsift-core`](https://www.npmjs.com/package/textsift-core) |
-
-## How auto-fallback works
-
-`PrivacyFilter.create()` with no `backend` option picks:
-
-1. WebGPU (custom WGSL kernels) if a WebGPU adapter with `shader-f16` is available, OR
-2. WASM (custom Zig + SIMD128) if SharedArrayBuffer is available (cross-origin isolation), OR
-3. transformers.js — this package's contribution — as the final fallback.
-
-Force a specific path with `{ backend: "webgpu" | "wasm" }`.
+Bundlers (Vite/Webpack/esbuild/etc.) resolve `textsift/browser` and pull in only the WASM/WebGPU code path. The native NAPI binding lives at the bare `textsift` import, so a Node CLI / server can use it without forcing browser code into anything else's bundle.
 
 ## Public API
 
-Identical to `textsift-core` plus:
+See the [API reference](https://teamchong.github.io/textsift/api/). Highlights:
 
-```ts
-import { TransformersJsBackend } from "textsift";
-// for callers who want to instantiate the fallback directly
-```
+- `PrivacyFilter.create({ backend, modelSource, markers, enabledCategories, rules, presets })`
+- `filter.detect(text | AsyncIterable<string>)` — batch returns a Promise; streaming returns a sync handle with `spanStream` + `result`
+- `filter.redact(text | AsyncIterable<string>)` — same shape; streaming surfaces `textStream` of safe-to-emit pieces
+- `presets: ["secrets"]` enables JWT, GitHub PAT, AWS, Slack, OpenAI/Anthropic/Google/Stripe keys, and PEM private-key headers (all severity `"block"`)
+- Custom `rules` (regex or function) merge with model spans
 
 ## License
 

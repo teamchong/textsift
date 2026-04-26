@@ -1,7 +1,7 @@
 /**
  * Native tokenizer conformance vs transformers.js AutoTokenizer.
  *
- * The native textsift-core tokenizer must produce byte-for-byte
+ * The native textsift/browser tokenizer must produce byte-for-byte
  * identical token-id sequences to AutoTokenizer across a varied
  * corpus (English, Unicode, code, edge whitespace, special tokens).
  * Any divergence is a tokenizer bug — fail the build.
@@ -9,7 +9,7 @@
 
 import { test, expect } from "@playwright/test";
 
-test("textsift-core tokenizer matches AutoTokenizer byte-for-byte", async ({ page }) => {
+test("textsift/browser tokenizer matches AutoTokenizer byte-for-byte", async ({ page }) => {
   test.setTimeout(5 * 60_000);
 
   const consoleErrors: string[] = [];

@@ -1,18 +1,17 @@
 /**
- * `PrivacyFilter` — the clean API surface textsift-core exports.
+ * `PrivacyFilter` — the clean API surface textsift/browser exports.
  *
  * All internal machinery lives behind this class:
  *   - Model weights: downloaded + cached by ModelLoader / OPFS.
- *   - Tokenizer: native o200k-style BPE, no transformers.js dependency.
- *   - Backend: WebGPU or WASM (textsift-core); the umbrella `textsift`
- *     package can inject a transformers.js backend via the `backend`
- *     option when `"auto"` falls through.
+ *   - Tokenizer: native o200k-style BPE, no third-party runtime dep.
+ *   - Backend: WebGPU (custom WGSL) or WASM (custom Zig + SIMD128).
  *   - Viterbi CRF decoder: constructed from the calibration artifact
  *     shipped alongside the weights.
  *   - Chunking: inputs over `maxChunkTokens` are split with a sliding
  *     window and re-merged at span level.
  *   - Redaction applicator: character-level placement with marker
  *     strategy resolution.
+ *   - Rule engine: regex / match-fn rules merged with model spans.
  */
 
 import {
@@ -59,18 +58,18 @@ type FilterState =
   | { kind: "disposed" };
 
 /**
- * Per-create extension hook used by the umbrella `textsift` package to
- * resolve the `"auto"` backend to a transformers.js implementation
- * when WebGPU and SIMD-capable WASM are both unavailable. Most callers
- * never set this — they let textsift-core's defaults pick.
+ * Per-create extension hook for callers that want to override the
+ * `"auto"` backend decision (e.g., the bench injects a custom
+ * transformers.js comparator). Most callers never set this — they
+ * let `PrivacyFilter.create()` pick WebGPU when available, WASM
+ * otherwise.
  */
 export interface BackendResolver {
   /**
    * Called when `opts.backend === "auto"`. Receives the loaded bundle
-   * and the runtime capability flags textsift-core has already
-   * detected. Return:
+   * and the runtime capability flags. Return:
    *   - an `InferenceBackend` instance to use it directly, OR
-   *   - `null` to let textsift-core fall back to its built-in choice
+   *   - `null` to fall back to the built-in choice
    *     (`"webgpu"` if `hasWebGPU`, else `"wasm"`).
    */
   resolveAuto(args: {
@@ -105,10 +104,9 @@ export class PrivacyFilter {
   }
 
   /**
-   * Advanced factory used by the umbrella `textsift` package to inject
-   * a transformers.js fallback into the `"auto"` decision. Public-ish
-   * but documented as advanced — the umbrella is the only intended
-   * caller.
+   * Advanced factory: injects a custom backend resolver (see
+   * `BackendResolver`). Used by the bench to force a comparator
+   * backend; not part of the everyday API.
    */
   static async createWithResolver(
     opts: CreateOptions,

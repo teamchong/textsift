@@ -1,16 +1,15 @@
 {
   "name": "textsift",
   "version": "0.1.0",
-  "description": "PII detection + redaction with auto backend selection. Wraps textsift-core and adds a transformers.js-based fallback path so PrivacyFilter.create() works on any browser or Node runtime out of the box.",
+  "description": "PII detection + redaction. Browser entry (textsift/browser): WebGPU + WASM, no native binary. Native entry (textsift): NAPI binding for Node — coming with issue #79.",
   "type": "module",
-  "main": "dist/index.js",
-  "module": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "default": "./dist/index.js"
-    }
+    ".": "./dist/index.js",
+    "./browser": "./dist/browser/index.js",
+    "./package.json": "./package.json"
   },
   "files": [
     "dist/",
@@ -30,17 +29,23 @@
     "browser",
     "openai",
     "privacy-filter",
-    "transformers.js",
-    "auto-fallback"
+    "token-classification",
+    "ner",
+    "tokenizer",
+    "bpe"
   ],
   "license": "Apache-2.0",
   "scripts": {
-    "build": "bun build src/index.ts --outdir dist --target browser --format esm --sourcemap=external --external textsift-core --external @huggingface/transformers && bun x tsc --emitDeclarationOnly",
+    "build": "npm run build:browser && npm run build:native",
+    "build:browser": "mkdir -p dist/browser && npm run build:zig && npm run build:opt && node scripts/inline-wasm.mjs && bun build src/browser/index.ts --outdir dist/browser --target browser --format esm --sourcemap=external && bun x tsc --emitDeclarationOnly",
+    "build:native": "bun build src/index.ts --outdir dist --target node --format esm --sourcemap=external",
+    "build:zig": "npm run build:zig-st && npm run build:zig-mt",
+    "build:zig-st": "mise exec -- zig build-exe -target wasm32-freestanding -mcpu=generic+simd128+relaxed_simd -O ReleaseFast -fstrip -flto src/zig/wasm_exports.zig -cflags -O3 -mrelaxed-simd -flto -- src/c/fma.c --name textsift -fno-entry -rdynamic && mv textsift.wasm dist/browser/",
+    "build:zig-mt": "mise exec -- zig build-exe -target wasm32-freestanding -mcpu=generic+simd128+relaxed_simd+atomics+bulk_memory -O ReleaseFast -fstrip -flto src/zig/wasm_exports.zig -cflags -O3 -mrelaxed-simd -flto -- src/c/fma.c --shared-memory --import-memory --initial-memory=4194304 --max-memory=2147483648 --export=__stack_pointer --name textsift-mt -fno-entry -rdynamic && mv textsift-mt.wasm dist/browser/",
+    "build:opt": "npm run build:opt-st && npm run build:opt-mt",
+    "build:opt-st": "wasm-opt -O3 --strip-producers --strip-target-features dist/browser/textsift.wasm -o dist/browser/textsift.wasm --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals --enable-relaxed-simd --inlining-optimizing --always-inline-max-function-size 256 --flexible-inline-max-function-size 512 --inline-functions-with-loops",
+    "build:opt-mt": "wasm-opt -O3 --strip-producers --strip-target-features dist/browser/textsift-mt.wasm -o dist/browser/textsift-mt.wasm --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals --enable-relaxed-simd --enable-threads --inlining-optimizing --always-inline-max-function-size 256 --flexible-inline-max-function-size 512 --inline-functions-with-loops",
     "typecheck": "bun x tsc --noEmit"
-  },
-  "dependencies": {
-    "textsift-core": "0.1.0",
-    "@huggingface/transformers": "^4.2.0"
   },
   "publishConfig": {
     "access": "public"

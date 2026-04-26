@@ -1,117 +1,28 @@
 /**
- * textsift — umbrella package.
+ * textsift — Node native binding entry point.
  *
- * Re-exports everything from textsift-core and adds a transformers.js
- * fallback backend so `PrivacyFilter.create()` with no arguments works
- * even on browsers without WebGPU and Node runtimes that don't have
- * WASM SIMD.
+ * This entry is reserved for the native NAPI binding (Zig-compiled
+ * shared library, exposed via Node-API). It is **not yet built** —
+ * see issue #79.
  *
- *   const filter = await PrivacyFilter.create();
+ * Today, importing `textsift` from Node throws. Browser bundlers
+ * resolve the `./browser` subpath instead (via the `exports` field
+ * in package.json) and never load this module.
  *
- * In textsift-core that picks `webgpu` (browser) or `wasm` (everywhere
- * else). Here, the same call additionally falls through to
- * transformers.js when neither path is viable — matching the behaviour
- * of the pre-split package for backwards compat.
+ *   import { PrivacyFilter } from "textsift/browser"; // works today
+ *   import { PrivacyFilter } from "textsift";         // throws (until #79)
  *
- * Bundles ~228 KB gzipped (vs ~76 KB for textsift-core alone).
- * If you don't need the auto fallback, depend on `textsift-core`
- * directly.
+ * Once the native binding lands, the API surface here will mirror
+ * the browser entry exactly: same `PrivacyFilter` class, same
+ * `detect()` / `redact()` shapes, same `Rule` types. The only
+ * difference is the backend — native CPU/GPU instead of WASM/WebGPU.
  */
 
-import {
-  PrivacyFilter as CorePrivacyFilter,
-  type CreateOptions,
-  type BackendResolver,
-} from "textsift-core";
-import type { InferenceBackend } from "textsift-core";
-import { TransformersJsBackend } from "./transformers-js-backend.js";
-
-/**
- * Wrapper class that injects a transformers.js fallback into the
- * `"auto"` decision. All public methods (redact, detect, redactBatch,
- * dispose) come from the core class via prototype delegation —
- * `PrivacyFilter` inherits from `CorePrivacyFilter`.
- */
-export class PrivacyFilter extends CorePrivacyFilter {
-  /**
-   * Factory: same signature as `textsift-core`'s, but the `"auto"`
-   * backend resolves through transformers.js when WebGPU is
-   * unavailable. Backwards-compatible with the pre-split package.
-   */
-  static override async create(opts: CreateOptions = {}): Promise<PrivacyFilter> {
-    const resolver: BackendResolver = {
-      async resolveAuto({ bundle, hasWebGPU, isNode, quantization }) {
-        // In browsers with WebGPU, let core pick its native backend
-        // (faster than transformers.js). In Node, also let core pick
-        // (the custom WASM backend has SIMD, transformers.js doesn't).
-        // We only kick in when neither works — typically browsers
-        // without WebGPU, where the core would otherwise fall back to
-        // single-thread WASM. transformers.js + ORT Web is roughly
-        // comparable there and provides one less runtime surface.
-        if (hasWebGPU) return null;
-        if (isNode) return null;
-        const backend = new TransformersJsBackend({
-          bundle,
-          quantization,
-          device: "auto",
-        });
-        return backend as InferenceBackend;
-      },
-    };
-    const instance = await CorePrivacyFilter.createWithResolver(opts, resolver);
-    // Cast through unknown — we know the runtime instance is fine
-    // because `createWithResolver` returns a CorePrivacyFilter that
-    // we're presenting under the umbrella's class identity.
-    return instance as unknown as PrivacyFilter;
+export class PrivacyFilter {
+  static async create(): Promise<PrivacyFilter> {
+    throw new Error(
+      "textsift native binding is not built yet (see issue #79). " +
+        'For browser/Node-via-WASM use, import from "textsift/browser".',
+    );
   }
 }
-
-export { TransformersJsBackend } from "./transformers-js-backend.js";
-
-// Re-exports from textsift-core. Same surface as if the consumer had
-// installed textsift-core directly.
-export {
-  WasmBackend,
-  WebGpuBackend,
-  ModelLoader,
-  Tokenizer,
-  ALL_SPAN_LABELS,
-  PrivacyFilterError,
-  sharedMemorySupported,
-  loadTextsift,
-  loadTextsiftShared,
-  getCachedModelInfo,
-  clearCachedModel,
-  secretRules,
-  RULE_PRESETS,
-} from "textsift-core";
-
-export type {
-  CreateOptions,
-  RedactOptions,
-  RedactResult,
-  DetectResult,
-  DetectedSpan,
-  SpanLabel,
-  Label,
-  ProgressEvent,
-  MarkerStrategy,
-  Rule,
-  RuleSeverity,
-  RulePresetName,
-  PrivacyFilterErrorCode,
-  InferenceBackend,
-  Logits,
-  BackendConstructionOptions,
-  LoadedModelBundle,
-  ModelConfig,
-  ModelLoaderOptions,
-  EncodeResult,
-  TokenizerLoadOptions,
-  CachedModelInfo,
-  BackendResolver,
-  DetectStreamHandle,
-  DetectStreamOptions,
-  RedactStreamHandle,
-  RedactStreamOptions,
-} from "textsift-core";

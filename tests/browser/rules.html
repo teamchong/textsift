@@ -2,7 +2,7 @@
 <html>
   <head>
     <meta charset="utf-8" />
-    <title>textsift-core — custom rules</title>
+    <title>textsift — custom rules</title>
   </head>
   <body>
     <pre id="out">starting</pre>
@@ -15,7 +15,7 @@
       //   - rule spans use the rule's marker by default
       //   - streaming output equals batch output
 
-      import { PrivacyFilter } from "/packages/textsift-core/dist/index.js";
+      import { PrivacyFilter } from "/packages/textsift/dist/browser/index.js";
 
       const $out = document.getElementById("out");
       const log = (m) => { $out.textContent += "\n" + m; };

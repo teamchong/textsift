@@ -26,29 +26,37 @@ This is a self-education project. I built it to teach myself WebGPU compute shad
 
 ## What this is
 
-A npm package that runs [openai/privacy-filter](https://huggingface.co/openai/privacy-filter) — a 1.5B / 50M-active MoE bidirectional token classifier for PII detection — entirely on the user's device. WebGPU when available, WASM (Zig + SIMD128) otherwise. Apache 2.0.
+A npm package that runs [openai/privacy-filter](https://huggingface.co/openai/privacy-filter) — a 1.5B / 50M-active MoE bidirectional token classifier for PII detection — entirely on the user's device. WebGPU when available, WASM (Zig + SIMD128) otherwise. Apache 2.0. **No transformers.js dependency.**
 
 The model is OpenAI's; the value of this package is packaging:
 
-- A native o200k-style BPE tokenizer in pure TypeScript (no `@huggingface/transformers` dep on the lean install).
-- Two custom backends — WGSL kernels for WebGPU and Zig-compiled SIMD WASM — that produce the same logits as transformers.js's WebGPU path on the same input.
+- A native o200k-style BPE tokenizer in pure TypeScript (no `@huggingface/transformers` runtime dependency).
+- Two custom backends — WGSL kernels for WebGPU and Zig-compiled SIMD WASM — that produce byte-identical span output.
 - A WebAssembly path that works at all on this model: ORT-Web's WASM EP (which transformers.js uses under the hood) is missing the `MatMulNBits` and `GatherBlockQuantized` kernels the int4 export needs, so `transformers.js` with `device: "wasm"` fails session creation. textsift's WASM backend is a from-scratch implementation that doesn't go through ORT-Web.
-- Persistent OPFS caching of the 770 MB model weights, configured by default. Same data the model needs anyway, just stored on the user's disk so the second visit doesn't re-download. transformers.js can be configured to do this too — by default it uses the Cache API which silently rejects payloads this big.
+- Persistent OPFS caching of the 770 MB model weights, configured by default.
 - Streaming overloads of `detect()` and `redact()` — pass an `AsyncIterable<string>` (LLM token stream, ReadableStream-derived iterable, etc.) instead of a `string`. `detect(stream)` yields spans as they become detectable; `redact(stream)` yields safe-to-emit redacted text fragments. O(N) total work over a stream of N tokens, vs O(N²) for the naive "call detect after every chunk" pattern.
+- Custom rule engine + built-in `"secrets"` preset (JWT, GitHub PAT, AWS, Slack, OpenAI/Anthropic/Google/Stripe keys, PEM private-key headers).
 
-## Two packages
+## Install
 
 ```bash
-npm install textsift-core   # 76 KB gzipped, no runtime deps
-npm install textsift        # 226 KB gzipped, adds a transformers.js fallback backend
+npm install textsift
 ```
 
-Both expose the same `PrivacyFilter` API. Pick the umbrella `textsift` if you need the transformers.js fallback (typically: browsers without WebGPU and without cross-origin-isolation for SIMD-WASM). Pick `textsift-core` if you don't.
+One package, two entry points so browsers never bundle native code:
+
+```ts
+// Browser / Node-via-WASM (today)
+import { PrivacyFilter } from "textsift/browser";
+
+// Node native NAPI binding (issue #79 — throws today)
+import { PrivacyFilter } from "textsift";
+```
 
 ## 30-second example
 
 ```ts
-import { PrivacyFilter } from "textsift-core";
+import { PrivacyFilter } from "textsift/browser";
 
 const filter = await PrivacyFilter.create();
 const result = await filter.redact(
@@ -63,16 +71,15 @@ console.log(result.redactedText);
 
 M3 Pro MacBook, Chromium 147, median of 5 forward passes after 2 warmups. Reproduce with `npx playwright test bench.spec.ts`.
 
-| Input length | textsift (WebGPU) | textsift (WASM ST) | tjs (WebGPU default) |
+| Input length | textsift (WebGPU) | textsift (WASM MT) | tjs (WebGPU default) |
 |---|---:|---:|---:|
-| ~12 tokens | 7 ms | 66 ms | 29 ms |
-| ~25 tokens | 12 ms | 158 ms | 39 ms |
-| ~80 tokens | 25 ms | 342 ms | 57 ms |
-| Second-visit warmup ¹ | 1.1 s | 1.8 s | 11.2 s |
+| ~7 tokens | **8.9 ms** | 29.0 ms | 32.7 ms |
+| ~25 tokens | **11.8 ms** | 44.6 ms | 38.5 ms |
+| ~80 tokens | **22.0 ms** | 95.9 ms | 56.4 ms |
 
-¹ With OPFS caching configured (textsift default). transformers.js's default Cache API rejects 770 MB; if you wire OPFS into transformers.js manually, its second-visit warmup is comparable to textsift's.
+WebGPU is 2.6–3.7× faster than transformers.js's WebGPU path on every input length. textsift WASM is the only working CPU path for this q4f16 model.
 
-The forward-pass numbers reflect kernel-level differences (custom int4 WGSL vs ORT-Web's int4 WGSL via WebGPU contrib ops). They don't depend on caching configuration.
+We don't claim a cold-start speedup over transformers.js. The OPFS-vs-Cache-API gap is a storage decision, not an inference-engine one. See [benchmarks](/textsift/benchmarks/) for the full breakdown.
 
 ## CPU-only environments
 

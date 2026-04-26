@@ -1,16 +1,14 @@
 /**
- * Model loader — Stage 0 (minimal).
+ * Model loader.
  *
  * Fetches the two small JSON artifacts textsift owns (parsing + decoding):
  *   - `config.json` — architecture, `id2label`, context length.
  *   - `viterbi_calibration.json` — the 6 CRF transition biases.
  *
- * Model weights and tokenizer artifacts (`tokenizer.json`, ONNX graph +
- * external data files) are loaded and cached by `@huggingface/transformers`
- * inside `TransformersJsBackend` / `Tokenizer`. That lets us ship without
- * duplicating HF Hub caching. OPFS ownership of model bytes is a Stage 1
- * concern, introduced with the Zig+WASM backend's own weight format (see
- * `docs/roadmap.md`).
+ * Tokenizer artifact (`tokenizer.json`) and ONNX graph + external data
+ * files are loaded by the WASM and WebGPU backends directly via
+ * `fetchBytesCached`, which writes them to OPFS for second-visit
+ * cache hits. No `@huggingface/transformers` dependency.
  */
 
 import { PrivacyFilterError, type ProgressEvent } from "../types.js";
@@ -25,7 +23,7 @@ export interface ModelConfig {
 }
 
 export interface LoadedModelBundle {
-  /** HF Hub repo id (e.g. "openai/privacy-filter") for transformers.js `from_pretrained`. */
+  /** HF Hub repo id (e.g. "openai/privacy-filter"). */
   readonly modelId: string;
   /** Resolved URL base (always ending in `/`). */
   readonly modelSource: string;

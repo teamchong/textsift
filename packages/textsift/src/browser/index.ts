@@ -1,6 +1,6 @@
 /**
- * textsift-core — PII detection + redaction for browser, Node, and edge
- * runtimes. Lean (~30 KB gzipped, no transformers.js dependency).
+ * textsift/browser — PII detection + redaction for browser, Node, and edge
+ * runtimes. ~76 KB gzipped, zero runtime dependencies.
  *
  * Public API surface:
  *
@@ -10,9 +10,7 @@
  *   const batch  = await filter.redactBatch([a,b,c]);
  *   filter.dispose();
  *
- * Backends bundled here: WebGPU (custom WGSL kernels) + WASM (custom
- * Zig + SIMD). The umbrella `textsift` package adds an auto fallback
- * to transformers.js via `BackendResolver`.
+ * Backends: WebGPU (custom WGSL kernels) + WASM (custom Zig + SIMD).
  */
 
 export { PrivacyFilter, type BackendResolver } from "./privacy-filter.js";
@@ -40,8 +38,8 @@ export type { LoadedModelBundle, ModelConfig, ModelLoaderOptions } from "./model
 
 // Tokenizer — public so callers can count tokens, build their own
 // chunking strategies, or run text encoding without going through the
-// full PrivacyFilter pipeline. textsift-core's only tokenizer is the
-// native o200k-style BPE; no transformers.js dependency.
+// full PrivacyFilter pipeline. The only tokenizer is the native
+// o200k-style BPE built into this package.
 export { Tokenizer } from "./model/tokenizer.js";
 export type { EncodeResult, TokenizerLoadOptions } from "./model/tokenizer.js";
 

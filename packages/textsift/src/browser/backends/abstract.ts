@@ -1,5 +1,7 @@
 /**
- * Backend contract shared by WebGPU, WASM, and transformers.js paths.
+ * Backend contract shared by the WebGPU and WASM paths (and any
+ * caller-supplied custom backend, e.g. the bench's transformers.js
+ * comparator — not shipped with the package).
  *
  * Each backend implementation owns:
  *   - Per-backend model loading (uploading weights to GPU buffers or
@@ -12,8 +14,8 @@
  *   - Viterbi decoding (done in JS downstream of backends).
  *   - BIOES merging / redaction application (also JS downstream).
  *
- * This separation means all three backends produce identical logits
- * for identical inputs. That invariant is verified by the cross-backend
+ * This separation means every backend produces identical logits for
+ * identical inputs. That invariant is verified by the cross-backend
  * conformance test suite.
  */
 
@@ -33,9 +35,9 @@ export interface Logits {
 
 export interface InferenceBackend {
   /**
-   * A debug name used in progress events + error messages. The umbrella
-   * `textsift` package adds backends with names outside this union (e.g.
-   * `"transformers-js"`); `string` keeps the contract open.
+   * A debug name used in progress events + error messages. Built-in
+   * backends use `"webgpu"` / `"wasm"`; caller-supplied custom
+   * backends (bench comparators, etc.) are free to use any string.
    */
   readonly name: string;
 
@@ -57,6 +59,6 @@ export interface InferenceBackend {
 export interface BackendConstructionOptions {
   bundle: LoadedModelBundle;
   quantization: "int4" | "int8" | "fp16";
-  /** Execution device forwarded to ORT Web. "auto" lets transformers.js pick. */
+  /** Execution device hint. Custom backends may interpret this however they need; built-in backends ignore it. */
   device: "auto" | "wasm" | "webgpu";
 }

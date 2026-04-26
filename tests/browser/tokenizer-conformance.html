@@ -9,7 +9,7 @@
     <script type="module">
       // Load both tokenizers from the same model source and compare
       // their `encode()` output token-for-token across a varied
-      // corpus. The native tokenizer (textsift-core) must match
+      // corpus. The native tokenizer (textsift) must match
       // AutoTokenizer (@huggingface/transformers) exactly.
       //
       // Failure modes we care about:
@@ -19,7 +19,7 @@
       //   - Special-token handling
       //   - Character offset alignment
 
-      import { ModelLoader, Tokenizer as NativeTokenizer } from "/packages/textsift-core/dist/index.js";
+      import { ModelLoader, Tokenizer as NativeTokenizer } from "/packages/textsift/dist/browser/index.js";
       const tjs = await import("https://esm.sh/@huggingface/transformers@4.2.0");
 
       const $out = document.getElementById("out");

@@ -3,7 +3,7 @@
  * alongside the model. Their output is merged into the same
  * `DetectedSpan[]` the model produces.
  *
- * Why this lives in textsift-core: rules are pure JS, no model
+ * Why this lives in textsift/browser: rules are pure JS, no model
  * inference, no GPU/WASM. They run on the same input string the
  * model sees and emit spans in the same `start/end/label` shape, so
  * the rest of the pipeline (BIOES merge, redaction applicator,

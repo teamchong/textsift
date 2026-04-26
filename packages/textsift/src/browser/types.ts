@@ -171,7 +171,7 @@ export interface CreateOptions {
   modelSource?: string;
 
   /**
-   * Backend selection in `textsift-core`.
+   * Backend selection.
    *   - `"auto"` (default): WebGPU in browsers when an adapter with
    *     `shader-f16` is available, falling back to the WASM backend
    *     everywhere else (Node, edge runtimes, browsers without WebGPU).
@@ -180,10 +180,6 @@ export interface CreateOptions {
    *     otherwise.
    *   - `"webgpu"`: custom WGSL backend. Requires `shader-f16`; throws
    *     if the adapter can't enable it.
-   *
-   * The umbrella `textsift` package (which depends on textsift-core and
-   * `@huggingface/transformers`) extends `"auto"` with a transformers.js
-   * fallback when neither WebGPU nor SIMD-capable WASM is available.
    */
   backend?: "auto" | "wasm" | "webgpu";
 

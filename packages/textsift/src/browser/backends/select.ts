@@ -1,11 +1,11 @@
 /**
- * Backend selection for textsift-core.
+ * Backend selection for textsift/browser.
  *
- * textsift-core ships only the custom backends — WebGPU (WGSL kernels)
- * and WASM (Zig + SIMD). The umbrella `textsift` package layers an
- * additional transformers.js backend on top by injecting its own
- * `InferenceBackend` directly via `PrivacyFilter.create()`'s `backend`
- * option (when set to a backend instance, the selector is bypassed).
+ * Two backends ship: WebGPU (WGSL kernels) and WASM (Zig + SIMD).
+ * Callers can also inject a custom `InferenceBackend` via
+ * `PrivacyFilter.create()`'s `backend` option (when set to an
+ * instance, the selector is bypassed) — used by the bench for the
+ * transformers.js comparator, which is not part of the package.
  */
 
 import type { InferenceBackend } from "./abstract.js";
@@ -17,9 +17,10 @@ export interface SelectOptions {
   device: "auto" | "wasm" | "webgpu";
   bundle: LoadedModelBundle;
   /**
-   * Which backend to instantiate. textsift-core knows `"webgpu"` and
-   * `"wasm"`. The umbrella package handles its own backends before
-   * calling here.
+   * Which backend to instantiate. Caller-supplied custom backends
+   * (e.g., the bench's transformers.js comparator) are wired through
+   * `PrivacyFilter.create({ backend: <instance> })` directly and
+   * never reach this selector.
    */
   backend: "wasm" | "webgpu";
   /** Override for the `textsift.wasm` module URL. Defaults to the bytes inlined into the JS bundle. */

@@ -1,8 +1,10 @@
 #!/usr/bin/env node
-// Read `dist/textsift.wasm` (single-thread) and `dist/textsift-mt.wasm`
-// (shared-memory + atomics, for multi-thread workers) and emit
-// `src/js/backends/textsift-inline.ts` containing both as Uint8Array
-// literals. Called between `build:zig` (+ `build:opt`) and `build`.
+// Read `dist/browser/textsift.wasm` (single-thread) and
+// `dist/browser/textsift-mt.wasm` (shared-memory + atomics, for
+// multi-thread workers) and emit
+// `src/browser/backends/textsift-inline.ts` containing both as
+// Uint8Array literals. Called between `build:zig` (+ `build:opt`)
+// and `build:browser`.
 
 import { readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -10,9 +12,9 @@ import { dirname, join } from "node:path";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, "..");
-const ST = join(REPO, "dist", "textsift.wasm");
-const MT = join(REPO, "dist", "textsift-mt.wasm");
-const OUT = join(REPO, "src", "js", "backends", "textsift-inline.ts");
+const ST = join(REPO, "dist", "browser", "textsift.wasm");
+const MT = join(REPO, "dist", "browser", "textsift-mt.wasm");
+const OUT = join(REPO, "src", "browser", "backends", "textsift-inline.ts");
 
 function emit(name, bytes) {
   const hex = Array.from(bytes).map((b) => `0x${b.toString(16).padStart(2, "0")}`);

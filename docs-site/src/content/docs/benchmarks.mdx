@@ -60,18 +60,17 @@ From `tests/browser/webgpu-coldstart.spec.ts`, second warmup:
 
 ## Accuracy
 
-`openai/privacy-filter` reports F1 96% on PII-Masking-300k in OpenAI's own evaluation. textsift doesn't change the model — all three backends produce byte-identical span output on the same input (`tests/browser/smoke.spec.ts`, `webgpu-smoke.spec.ts`). The detection accuracy is the model's, not ours.
+`openai/privacy-filter` reports F1 96% on PII-Masking-300k in OpenAI's own evaluation. textsift doesn't change the model — both backends produce byte-identical span output on the same input (`tests/browser/smoke.spec.ts`, `webgpu-smoke.spec.ts`). The detection accuracy is the model's, not ours.
 
 The forward-parity test (`tests/browser/webgpu-forward.spec.ts`) confirms argmax agrees on 32/32 tokens of a deterministic input, with logit RMS drift of 0.18 vs the WASM reference — fp16 rounding compounding across 8 transformer layers. Argmax (and downstream Viterbi + span output) is preserved.
 
 ## Bundle size
 
-| Package | Minified | Gzipped (over the wire) |
+| Entry | Minified | Gzipped (over the wire) |
 |---|---:|---:|
-| `textsift-core` | 630 KB | 76 KB |
-| `textsift` (full) | 1.1 MB | 226 KB |
+| `textsift/browser` | 630 KB | 76 KB |
 
-Plus a 90 KB `.wasm` file loaded async (not in the JS bundle).
+Plus a 90 KB `.wasm` file loaded async (not in the JS bundle). The native entry (`textsift` bare import) ships zero bytes for browser bundlers — they only resolve the `./browser` subpath.
 
 ## Reproduce
 

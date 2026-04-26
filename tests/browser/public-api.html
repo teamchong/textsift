@@ -12,7 +12,7 @@
       // Stage-1 WASM backend, wired together through the same entry
       // point consumers use. Reads the same ONNX files as transformers.js
       // from `modelSource`.
-      import { PrivacyFilter } from "/packages/textsift-core/dist/index.js";
+      import { PrivacyFilter } from "/packages/textsift/dist/browser/index.js";
 
       const $out = document.getElementById("out");
       const log = (msg) => { $out.textContent += "\n" + msg; };

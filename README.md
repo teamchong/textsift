@@ -8,25 +8,35 @@ PII detection and redaction that runs [openai/privacy-filter](https://huggingfac
 
 ## What this is
 
-A npm package. Two flavours, same `PrivacyFilter` API:
+One npm package, two entry points so browsers never bundle native code:
 
 ```sh
-npm install textsift-core   # 76 KB gzipped, no runtime deps
-npm install textsift        # 226 KB gzipped, adds a transformers.js fallback backend
+npm install textsift
 ```
+
+```ts
+// Browser / Node-via-WASM — pure WebGPU + WASM, no native binary.
+import { PrivacyFilter } from "textsift/browser";
+
+// Node native — NAPI binding (in progress, see issue #79). Throws today.
+import { PrivacyFilter } from "textsift";
+```
+
+Bundlers (Vite/Webpack/esbuild/etc.) resolve `textsift/browser` and never touch the native entry. Node code that wants the fastest path resolves `textsift` and gets the native binding (once #79 lands).
 
 The model is OpenAI's; the value here is packaging:
 
-- A native o200k-style BPE tokenizer in pure TypeScript (no `@huggingface/transformers` dep on `textsift-core`).
-- Two custom backends — WGSL for WebGPU and Zig-compiled SIMD WASM — that produce byte-identical span output to transformers.js's WebGPU path.
-- A WASM path that loads `model_q4f16.onnx` at all. transformers.js's WASM EP doesn't, because ORT-Web's WASM bundle has no `MatMulNBits` / `GatherBlockQuantized` kernel.
+- A native o200k-style BPE tokenizer in pure TypeScript (no `@huggingface/transformers` runtime dependency).
+- Two custom backends — WGSL for WebGPU and Zig-compiled SIMD WASM — that produce byte-identical span output.
+- A WASM path that loads `model_q4f16.onnx` at all (ORT-Web's WASM EP doesn't, because its WASM bundle has no `MatMulNBits` / `GatherBlockQuantized` kernel).
 - Persistent OPFS caching of the 770 MB model weights, configured by default.
-- A streaming overload of `detect()` for AI-proxy / LLM-output-filtering use cases — pass an `AsyncIterable<string>` instead of a `string`. O(N) over a stream of N tokens, vs O(N²) for the naive "call detect after every chunk" pattern.
+- A streaming overload of `detect()` and `redact()` for AI-proxy / LLM-output-filtering use cases — pass an `AsyncIterable<string>` instead of a `string`. O(N) over a stream of N tokens, vs O(N²) for the naive "call detect after every chunk" pattern.
+- Custom rule engine (regex + match-fn) that merges with model spans. Built-in `"secrets"` preset covers JWT, GitHub PAT, AWS, Slack, OpenAI/Anthropic/Google/Stripe keys, and PEM private-key headers.
 
 ## Use
 
 ```ts
-import { PrivacyFilter } from "textsift-core"; // or "textsift"
+import { PrivacyFilter } from "textsift/browser";
 
 const filter = await PrivacyFilter.create();
 
@@ -64,7 +74,6 @@ for await (const span of det.spanStream) {
 const detFinal = await det.result;
 
 // Redact — pipe redacted text downstream as it becomes safe to emit.
-// textStream lags the input by up to safetyMarginTokens of chars.
 const red = filter.redact(llmStream());
 for await (const piece of red.textStream) {
   await downstreamWriter.write(piece);
@@ -72,53 +81,65 @@ for await (const piece of red.textStream) {
 const redFinal = await red.result;
 ```
 
+Built-in secrets preset:
+
+```ts
+const filter = await PrivacyFilter.create({ presets: ["secrets"] });
+// Detects JWT, GitHub PAT, AWS access keys, Slack tokens + webhooks,
+// OpenAI/Anthropic/Google API keys, Stripe keys + webhook secrets,
+// npm tokens, PEM private-key headers. All severity "block".
+```
+
 Batch inputs, custom markers, per-category enabling — see the [API reference](https://teamchong.github.io/textsift/api/).
 
 ## Measured numbers (M3 Pro, Chromium 147)
 
-Forward-pass latency, median of 5 runs:
+Steady-state per-forward latency, median of 5 runs:
 
-| Input length | textsift (WebGPU) | textsift (WASM ST) | tjs (WebGPU default) |
+| Input length | textsift (WebGPU) | textsift (WASM MT) | tjs (WebGPU) |
 |---|---:|---:|---:|
-| ~12 tokens | 7 ms | 66 ms | 29 ms |
-| ~25 tokens | 12 ms | 158 ms | 39 ms |
-| ~80 tokens | 25 ms | 342 ms | 57 ms |
+| ~7 tokens | **8.9 ms** | 29.0 ms | 32.7 ms |
+| ~25 tokens | **11.8 ms** | 44.6 ms | 38.5 ms |
+| ~80 tokens | **22.0 ms** | 95.9 ms | 56.4 ms |
 
-Cold start (defaults — both packages can be configured otherwise):
+Sustained throughput (30-forward loop, tok/s):
 
-| | First visit | Second visit |
-|---|---:|---:|
-| tjs (Cache API default) | 13.3 s | 11.2 s |
-| textsift (OPFS default) | 14.1 s | 1.1 s |
+| Input length | textsift (WebGPU) | textsift (WASM MT) | tjs (WebGPU) |
+|---|---:|---:|---:|
+| ~7 tokens | **801** | 249 | 249 |
+| ~25 tokens | **2068** | 558 | 644 |
+| ~80 tokens | **3644** | 840 | 1396 |
 
-The second-visit gap is a default-configuration comparison, not an architectural ceiling. transformers.js with a custom OPFS cache plugged in can match textsift on second-visit warmup. The factual claim is "textsift caches large models persistently with no configuration", not "tjs can't cache".
+WebGPU is 2.6–3.7× faster than transformers.js on both metrics across every input size. textsift WASM is the only working CPU option for this q4f16 model — tjs has no working WASM path because ORT-Web's WASM EP lacks the int4 contrib kernels.
 
-These will look different on your hardware. They're a snapshot.
+We don't claim a cold-start speedup. See [benchmarks](https://teamchong.github.io/textsift/benchmarks/) for the rationale; in short, the difference between OPFS (default here) and Cache API (default in tjs) is a storage choice, not an inference-engine one.
+
+These numbers will look different on your hardware.
 
 ## Repo layout (npm workspaces monorepo)
 
 ```
 packages/
-  textsift-core/     ← lean engine: tokenizer + WebGPU + WASM backends
-    src/js/          ← public API, viterbi, chunking, redaction, native BPE tokenizer
-    src/zig/         ← Zig kernels → WASM
-    src/c/           ← FMA shim for relaxed_simd
-  textsift/          ← umbrella: depends on textsift-core + @huggingface/transformers
-    src/             ← thin wrapper, transformers.js fallback backend
-docs-site/           ← Astro + Starlight docs site
-tests/browser/       ← Playwright tests, including tokenizer-conformance + stream
+  textsift/
+    src/
+      browser/         ← public API, viterbi, chunking, redaction, native BPE tokenizer
+      zig/             ← Zig kernels → WASM
+      c/               ← FMA shim for relaxed_simd
+      index.ts         ← Node native entry (NAPI binding for #79)
+    scripts/           ← inline-wasm.mjs, serve-coi.py, etc.
+docs-site/             ← Astro + Starlight docs site
+tests/browser/         ← Playwright tests
+  helpers/             ← bench-only TransformersJsBackend (not shipped)
 ```
 
 ## Development
 
 ```sh
 npm install                # workspace bootstrap
-npm run build              # builds both packages (zig → wasm, bundle, .d.ts)
+npm run build              # zig → wasm, bundle, .d.ts
 npm run typecheck          # strict, noUncheckedIndexedAccess on
 npm run test               # all playwright tests
 ```
-
-The tokenizer-conformance test (`tests/browser/tokenizer-conformance.spec.ts`) verifies the native BPE tokenizer produces token-id sequences identical to AutoTokenizer across 46 cases (English, Unicode, code, edge whitespace, special tokens). The stream test (`tests/browser/stream.spec.ts`) verifies streaming detection yields the same spans as a single batch `detect()` call.
 
 ## Caveats
 

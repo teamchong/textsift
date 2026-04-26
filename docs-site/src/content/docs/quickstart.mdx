@@ -5,25 +5,26 @@ description: Install, detect PII, redact text — in three code blocks.
 
 ## Install
 
-Two packages, same `PrivacyFilter` API. Pick one based on bundle size + auto-fallback need:
-
 ```sh
-# Lean: 76 KB gzipped, native tokenizer, no transformers.js dep.
-# Recommended for browser apps that want the smallest bundle.
-npm install textsift-core
-
-# Full: 228 KB gzipped, adds transformers.js fallback for runtimes
-# without WebGPU and without SIMD-capable WASM. Drop-in for the
-# old single-package install.
 npm install textsift
 ```
 
-The rest of this page uses `textsift-core` — substitute `textsift` if you went that way.
+One package, two entry points so browsers never bundle native code:
+
+```ts
+// Browser / Node-via-WASM. WebGPU + Zig+SIMD128 WASM. No native binary.
+import { PrivacyFilter } from "textsift/browser";
+
+// Node native NAPI binding (issue #79 — throws today).
+import { PrivacyFilter } from "textsift";
+```
+
+The rest of this page uses the browser entry.
 
 ## Redact
 
 ```ts
-import { PrivacyFilter } from "textsift-core";
+import { PrivacyFilter } from "textsift/browser";
 
 const filter = await PrivacyFilter.create();
 
@@ -55,7 +56,7 @@ const results = await filter.redactBatch([
 
 ## Pick a backend
 
-By default `PrivacyFilter.create()` picks WebGPU when available, otherwise the WASM backend. The umbrella `textsift` additionally falls back to transformers.js on browsers without WebGPU. Force a specific path:
+By default `PrivacyFilter.create()` picks WebGPU when available, otherwise the WASM backend. Force a specific path:
 
 ```ts
 // Fastest: WGSL compute shaders, requires WebGPU + shader-f16.

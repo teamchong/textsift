@@ -11,7 +11,7 @@
       // iterations to reach steady state, then ITERS measured passes.
       // JS-build is everything up to queue.submit(); GPU-execute is the
       // wait for mapAsync on the readback buffer.
-      import { WebGpuBackend, ModelLoader } from "/packages/textsift-core/dist/index.js";
+      import { WebGpuBackend, ModelLoader } from "/packages/textsift/dist/browser/index.js";
 
       const $out = document.getElementById("out");
       const log = (m) => { $out.textContent += "\n" + m; };

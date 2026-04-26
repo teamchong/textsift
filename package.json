@@ -2,19 +2,17 @@
   "name": "textsift-monorepo",
   "version": "0.0.0",
   "private": true,
-  "description": "Monorepo for textsift and textsift-core. Run `npm install` here to set up workspaces; per-package scripts live in packages/*/package.json.",
+  "description": "Monorepo for the textsift package (browser + native entry points) and the docs site. Per-package scripts live in packages/*/package.json.",
   "type": "module",
   "workspaces": [
     "packages/*",
     "docs-site"
   ],
   "scripts": {
-    "build": "npm run build -w textsift-core && npm run build -w textsift",
-    "build:core": "npm run build -w textsift-core",
-    "build:umbrella": "npm run build -w textsift",
-    "typecheck": "npm run typecheck -w textsift-core && npm run typecheck -w textsift",
+    "build": "npm run build -w textsift",
+    "typecheck": "npm run typecheck -w textsift",
     "test": "bun x playwright test",
-    "test:zig": "mise exec -- zig test packages/textsift-core/src/zig/math.zig",
+    "test:zig": "mise exec -- zig test packages/textsift/src/zig/math.zig",
     "format": "bun x prettier --write packages/*/src",
     "format:check": "bun x prettier --check packages/*/src"
   },

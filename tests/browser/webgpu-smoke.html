@@ -12,7 +12,7 @@
       // and the custom WGSL backend via the public API, and assert
       // span-for-span agreement. Both read the same ONNX model, so any
       // divergence is a kernel port bug.
-      import { PrivacyFilter } from "/packages/textsift-core/dist/index.js";
+      import { PrivacyFilter } from "/packages/textsift/dist/browser/index.js";
 
       const $out = document.getElementById("out");
       const log = (m) => { $out.textContent += "\n" + m; };

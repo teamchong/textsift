@@ -14,9 +14,10 @@ class COIHandler(http.server.SimpleHTTPRequestHandler):
     def end_headers(self) -> None:
         self.send_header("Cross-Origin-Opener-Policy", "same-origin")
         self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
-        # Same-origin resources don't need CORP, but transformers.js
-        # fetches its own assets from CDN; explicit Resource-Policy
-        # keeps the embedder happy if the CDN response lacks one.
+        # Same-origin resources don't need CORP, but the bench harness
+        # pulls transformers.js (its baseline comparator) from a CDN;
+        # explicit Resource-Policy keeps the embedder happy if the
+        # CDN response lacks one.
         self.send_header("Cross-Origin-Resource-Policy", "cross-origin")
         super().end_headers()
 

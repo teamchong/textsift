@@ -1,15 +1,14 @@
 ---
 title: Backends
-description: Three execution engines behind the same public API.
+description: Two execution engines behind the same public API.
 ---
 
-textsift ships up to three interchangeable backends. The public API (`PrivacyFilter.create`, `redact`, `detect`) is identical across all of them — the backend is an implementation detail picked at construction.
+textsift ships two interchangeable backends. The public API (`PrivacyFilter.create`, `redact`, `detect`) is identical across both — the backend is an implementation detail picked at construction.
 
-| Backend | Where | Compute |
-|---|---|---|
-| `webgpu` | `textsift-core` and `textsift` | Custom WGSL kernels (int4 matmul, banded attention, sparse MoE). Requires `shader-f16`. |
-| `wasm` | `textsift-core` and `textsift` | Custom Zig + SIMD128 → WASM. Multi-thread when COOP/COEP headers set. |
-| `auto` (transformers.js fallback) | `textsift` only | ORT-Web with WebGPU EP. Used by the umbrella's auto path on browsers without WebGPU and without SIMD-WASM. |
+| Backend | Compute |
+|---|---|
+| `webgpu` | Custom WGSL kernels (int4 matmul, banded attention, sparse MoE). Requires `shader-f16`. |
+| `wasm` | Custom Zig + SIMD128 → WASM. Multi-thread when COOP/COEP headers set. |
 
 ## Backend decision tree
 
@@ -30,11 +29,6 @@ textsift ships up to three interchangeable backends. The public API (`PrivacyFil
        yes    │    no
        ▼            ▼
    backend:"webgpu"   backend:"wasm"
-                          ↑
-            in `textsift-core` we stop here
-            in `textsift` (umbrella), if WASM
-            also can't run, fall back to
-            transformers.js
 ```
 
 ## Compatibility
@@ -43,13 +37,14 @@ textsift ships up to three interchangeable backends. The public API (`PrivacyFil
 |---|:-:|:-:|:-:|:-:|
 | `webgpu` | ✅ | ⚠️ `shader-f16` preview | ⚠️ `shader-f16` preview | ❌ |
 | `wasm` | ✅ | ✅ | ✅ | ✅ |
-| `auto` (`textsift` only, falls back to transformers.js) | ✅ | ✅ if `dom.webgpu.enabled=true` | ✅ | ⚠️ via ORT-Node |
 
-`backend: "wasm"` is the only currently-working CPU path for `model_q4f16.onnx`. transformers.js with `device: "wasm"` fails session creation because ORT-Web's WASM bundle has no implementation for the `GatherBlockQuantized` and `MatMulNBits` ONNX contrib ops the int4 export uses.
+`backend: "wasm"` is the only currently-working CPU path for `model_q4f16.onnx` in browsers. transformers.js with `device: "wasm"` fails session creation because ORT-Web's WASM bundle has no implementation for the `GatherBlockQuantized` and `MatMulNBits` ONNX contrib ops the int4 export uses.
+
+For Node-native execution (no WASM, full SIMD width), the `textsift` bare-import path is reserved for the upcoming NAPI binding (issue #79). Today it throws; use `textsift/browser` for Node-via-WASM.
 
 ## Output parity
 
-All backends produce **byte-identical spans** on the same input (`tests/browser/smoke.spec.ts` + `webgpu-smoke.spec.ts`). Logit magnitudes drift by up to ~0.2 RMS due to fp16 rounding differences accumulating across 8 transformer layers, but argmax (and hence Viterbi + span decode) is preserved.
+Both backends produce **byte-identical spans** on the same input (`tests/browser/smoke.spec.ts` + `webgpu-smoke.spec.ts`). Logit magnitudes drift by up to ~0.2 RMS due to fp16 rounding differences accumulating across 8 transformer layers, but argmax (and hence Viterbi + span decode) is preserved.
 
 ## Switching backends at runtime
 
@@ -63,7 +58,7 @@ wasm.dispose();
 const gpu = await PrivacyFilter.create({ backend: "webgpu" });
 ```
 
-Both share the same OPFS cache for the 770 MB model — switching is a ~1.1-second warmup, not a full re-download.
+Both share the same OPFS cache for the 770 MB model — switching is a ~1-second warmup, not a full re-download.
 
 ## Memory footprint
 
@@ -71,6 +66,5 @@ Both share the same OPFS cache for the 770 MB model — switching is a ~1.1-seco
 |---|---|
 | `webgpu` | ~30 MB JS heap + ~800 MB GPU buffers |
 | `wasm` | ~800 MB WASM linear memory |
-| `auto` (transformers.js path) | ~870 MB JS heap + ~1 GB GPU |
 
 `webgpu` is the most memory-efficient since weights live in GPU buffers and JS holds only kernel-dispatch state.

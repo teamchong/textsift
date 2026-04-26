@@ -18,7 +18,7 @@ static create(options?: CreateOptions): Promise<PrivacyFilter>;
 | field | type | default | notes |
 |---|---|---|---|
 | `modelSource` | `string` | HuggingFace Hub URL | Point at your own mirror (R2/S3/on-prem). |
-| `backend` | `"auto" \| "wasm" \| "webgpu"` | `"auto"` | `"auto"` picks transformers.js (WebGPU when available). |
+| `backend` | `"auto" \| "wasm" \| "webgpu"` | `"auto"` | `"auto"` picks WebGPU when available, WASM otherwise. |
 | `quantization` | `"int4" \| "int8" \| "fp16"` | `"int8"` | All three map to `model_q4f16.onnx` today. |
 | `onProgress` | `(ev: ProgressEvent) => void` | — | Fires during download + warmup. |
 | `signal` | `AbortSignal` | — | Cancels a slow first-time load. |

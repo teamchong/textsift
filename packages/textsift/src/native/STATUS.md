@@ -100,7 +100,35 @@ What's missing to make this usable from JS:
 
 ## Not done — next session
 
-### End-to-end forward pass
+### End-to-end forward — DONE (synthetic weights)
+
+`tests/native/forward.js` ports the full `WebGpuBackend.forward()`
+to JS, calling the new encoder-batched API:
+  beginEncoder → ~140 enqueueDispatch → submitAndReadback
+
+Pipeline cache on the backend means each shader compiles once;
+all subsequent dispatches reuse the cached pipeline + bgl.
+
+**Measured (M3 Pro, T=80, synthetic weights at production dims):**
+
+| Backend | Forward latency |
+|---|---:|
+| transformers.js WebGPU | 56.4 ms (from benchmarks.mdx) |
+| **Native textsift** | **43.9 ms** |
+| Browser textsift WebGPU | 22.0 ms (from benchmarks.mdx) |
+
+**Native is 1.28× faster than transformers.js end-to-end.** Browser
+textsift remains 2× faster than native — Naga's MSL codegen is
+slower than Tint's per kernel (consistent with the chain bench).
+
+Iteration history:
+- 143.7 ms — per-dispatch readback (each shader call mapped + read host-side)
+- 50.2 ms — encoder-batched: one submit + one readback per forward
+- **22.0 ms (T=32) / 43.9 ms (T=80) — pipeline cache: each shader compiles once on the backend, reused per dispatch**
+
+Reproduce: `T=80 node tests/native/forward.js` (or any T).
+
+### Original forward pass
 The 15 shaders work in isolation. They are not yet wired into a `forward(tokenIds, attentionMask) → logits` entry point. Doing that requires replicating the orchestration in `packages/textsift/src/browser/backends/webgpu.ts:460` (the ~3000-line `WebGpuBackend.forward()`):
 
 1. Allocate / pre-upload weight buffers per layer (~770 MB ONNX)

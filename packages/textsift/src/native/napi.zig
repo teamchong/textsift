@@ -32,6 +32,10 @@ export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) c.napi
     register(env, exports, "dispatchByBuffers", napiDispatchByBuffers) catch return null;
     register(env, exports, "writeBuffer", napiWriteBuffer) catch return null;
     register(env, exports, "readBuffer", napiReadBuffer) catch return null;
+    register(env, exports, "createEmptyBuffer", napiCreateEmptyBuffer) catch return null;
+    register(env, exports, "beginEncoder", napiBeginEncoder) catch return null;
+    register(env, exports, "enqueueDispatch", napiEnqueueDispatch) catch return null;
+    register(env, exports, "submitAndReadback", napiSubmitAndReadback) catch return null;
     return exports;
 }
 
@@ -955,6 +959,198 @@ fn napiDispatchByBuffers(env: c.napi_env, info: c.napi_callback_info) callconv(.
         };
     };
     return out_typed;
+}
+
+// Convenience: allocate an uninitialized persistent buffer of `size`
+// bytes (zero-filled). Use for transient activation scratch buffers
+// that the forward overwrites every call.
+fn napiCreateEmptyBuffer(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argc: usize = 2;
+    var argv: [2]c.napi_value = undefined;
+    if (c.napi_get_cb_info(env, info, &argc, &argv, null, null) != c.napi_ok) {
+        return napiThrow(env, "napi_get_cb_info failed");
+    }
+    if (argc < 2) return napiThrow(env, "createEmptyBuffer(handle, byteLen) requires 2 args");
+
+    var raw: u64 = 0;
+    var lossless: bool = false;
+    if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok or raw == 0) {
+        return napiThrow(env, "argument 0 must be backend BigInt");
+    }
+    const backend: *wgpu.Backend = @ptrFromInt(@as(usize, @intCast(raw)));
+    const byte_len = napiGetU32(env, argv[1], "argument 1 must be u32 (byteLen)") orelse return null;
+
+    const padded = std.mem.alignForward(usize, byte_len, 4);
+    const zeros = std.heap.c_allocator.alloc(u8, padded) catch
+        return napiThrow(env, "oom for empty buffer init");
+    defer std.heap.c_allocator.free(zeros);
+    @memset(zeros, 0);
+
+    const buf = wgpu.createPersistentBuffer(backend, zeros) catch
+        return napiThrow(env, "wgpu: createPersistentBuffer failed");
+
+    var bn: c.napi_value = undefined;
+    if (c.napi_create_bigint_uint64(env, @intCast(@intFromPtr(buf)), &bn) != c.napi_ok) {
+        wgpu.releasePersistentBuffer(buf);
+        return napiThrow(env, "napi: failed to create buffer handle");
+    }
+    return bn;
+}
+
+fn napiBeginEncoder(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argc: usize = 1;
+    var argv: [1]c.napi_value = undefined;
+    if (c.napi_get_cb_info(env, info, &argc, &argv, null, null) != c.napi_ok) {
+        return napiThrow(env, "napi_get_cb_info failed");
+    }
+    if (argc < 1) return napiThrow(env, "beginEncoder(handle) requires 1 arg");
+
+    var raw: u64 = 0;
+    var lossless: bool = false;
+    if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok or raw == 0) {
+        return napiThrow(env, "argument 0 must be backend BigInt");
+    }
+    const backend: *wgpu.Backend = @ptrFromInt(@as(usize, @intCast(raw)));
+
+    const enc = wgpu.beginEncoder(backend) catch
+        return napiThrow(env, "wgpu: beginEncoder failed");
+
+    var bn: c.napi_value = undefined;
+    if (c.napi_create_bigint_uint64(env, @intCast(@intFromPtr(enc)), &bn) != c.napi_ok) {
+        return napiThrow(env, "napi: failed to create encoder handle");
+    }
+    return bn;
+}
+
+fn napiEnqueueDispatch(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argc: usize = 7;
+    var argv: [7]c.napi_value = undefined;
+    if (c.napi_get_cb_info(env, info, &argc, &argv, null, null) != c.napi_ok) {
+        return napiThrow(env, "napi_get_cb_info failed");
+    }
+    if (argc < 7) {
+        return napiThrow(env, "enqueueDispatch(encoder, name, uniform, extras, inputs, output, dispatch) requires 7 args");
+    }
+
+    var raw: u64 = 0;
+    var lossless: bool = false;
+    if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok or raw == 0) {
+        return napiThrow(env, "argument 0 must be encoder BigInt");
+    }
+    const enc: *wgpu.Encoder = @ptrFromInt(@as(usize, @intCast(raw)));
+
+    const name_buf = napiGetString(env, argv[1], "argument 1 must be string (name)") orelse return null;
+    defer std.heap.c_allocator.free(name_buf);
+    const uniform_bytes = napiGetUint8Array(env, argv[2], "argument 2 must be Uint8Array (uniform)") orelse return null;
+
+    const extra_n = napiArrayLen(env, argv[3]) orelse return napiThrow(env, "argument 3 must be array");
+    if (extra_n > 8) return napiThrow(env, "too many extraUniforms");
+    var extra_storage: [8]wgpu.StorageInput = undefined;
+    var ei: u32 = 0;
+    while (ei < extra_n) : (ei += 1) {
+        const item = napiArrayGet(env, argv[3], ei) orelse return napiThrow(env, "extras[i]");
+        const binding = napiGetU32(env, napiNamedProperty(env, item, "binding") orelse return napiThrow(env, "binding"), "binding") orelse return null;
+        const bytes = napiGetUint8Array(env, napiNamedProperty(env, item, "bytes") orelse return napiThrow(env, "bytes"), "bytes") orelse return null;
+        extra_storage[ei] = .{ .binding = binding, .bytes = bytes };
+    }
+
+    var in_storage: [16]wgpu.StorageBinding = undefined;
+    var in_n: usize = 0;
+    parseStorageBindings(env, argv[4], in_storage[0..], &in_n) orelse return null;
+
+    const out_obj = argv[5];
+    const out_binding = napiGetU32(env, napiNamedProperty(env, out_obj, "binding") orelse return napiThrow(env, "output.binding"), "output.binding") orelse return null;
+    const out_byte_len_v = napiNamedProperty(env, out_obj, "byteLen") orelse return napiThrow(env, "output.byteLen");
+    const out_byte_len = napiGetU32(env, out_byte_len_v, "output.byteLen") orelse return null;
+    const out_buf_ptr_v = napiNamedProperty(env, out_obj, "bufPtr") orelse return napiThrow(env, "output.bufPtr");
+    var out_raw: u64 = 0;
+    if (c.napi_get_value_bigint_uint64(env, out_buf_ptr_v, &out_raw, &lossless) != c.napi_ok or out_raw == 0) {
+        return napiThrow(env, "output.bufPtr must be non-null BigInt");
+    }
+    const out_buf: wgpu.c.WGPUBuffer = @ptrFromInt(@as(usize, @intCast(out_raw)));
+
+    var out_initial: ?[]const u8 = null;
+    {
+        var v: c.napi_value = undefined;
+        if (c.napi_get_named_property(env, out_obj, "initial", &v) == c.napi_ok) {
+            var t: c.napi_valuetype = undefined;
+            if (c.napi_typeof(env, v, &t) == c.napi_ok and t != c.napi_undefined and t != c.napi_null) {
+                const b = napiGetUint8Array(env, v, "output.initial must be Uint8Array") orelse return null;
+                out_initial = b;
+            }
+        }
+    }
+
+    const dx = napiGetU32(env, napiArrayGet(env, argv[6], 0) orelse return napiThrow(env, "dispatch[0]"), "dispatch[0]") orelse return null;
+    const dy = napiGetU32(env, napiArrayGet(env, argv[6], 1) orelse return napiThrow(env, "dispatch[1]"), "dispatch[1]") orelse return null;
+    const dz = napiGetU32(env, napiArrayGet(env, argv[6], 2) orelse return napiThrow(env, "dispatch[2]"), "dispatch[2]") orelse return null;
+
+    wgpu.enqueueOnEncoder(
+        enc,
+        name_buf,
+        uniform_bytes,
+        0,
+        in_storage[0..in_n],
+        out_buf,
+        out_binding,
+        out_byte_len,
+        out_initial,
+        extra_storage[0..extra_n],
+        .{ dx, dy, dz },
+    ) catch |err| {
+        return switch (err) {
+            wgpu.WgpuError.ShaderModuleFailed => napiThrow(env, "wgpu: createShaderModule failed"),
+            wgpu.WgpuError.ComputePipelineFailed => napiThrow(env, "wgpu: createComputePipeline failed"),
+            wgpu.WgpuError.BindGroupFailed => napiThrow(env, "wgpu: createBindGroup failed"),
+            wgpu.WgpuError.BufferCreateFailed => napiThrow(env, "wgpu: createBuffer failed"),
+            wgpu.WgpuError.BufferRangeFailed => napiThrow(env, "wgpu: buffer range failed"),
+            else => napiThrow(env, "wgpu: enqueueDispatch failed"),
+        };
+    };
+    var undef: c.napi_value = undefined;
+    _ = c.napi_get_undefined(env, &undef);
+    return undef;
+}
+
+fn napiSubmitAndReadback(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argc: usize = 4;
+    var argv: [4]c.napi_value = undefined;
+    if (c.napi_get_cb_info(env, info, &argc, &argv, null, null) != c.napi_ok) {
+        return napiThrow(env, "napi_get_cb_info failed");
+    }
+    if (argc < 4) return napiThrow(env, "submitAndReadback(encoder, srcBuf, offset, byteLen) requires 4 args");
+
+    var raw: u64 = 0;
+    var lossless: bool = false;
+    if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok or raw == 0) {
+        return napiThrow(env, "argument 0 must be encoder BigInt");
+    }
+    const enc: *wgpu.Encoder = @ptrFromInt(@as(usize, @intCast(raw)));
+
+    var srcRaw: u64 = 0;
+    if (c.napi_get_value_bigint_uint64(env, argv[1], &srcRaw, &lossless) != c.napi_ok or srcRaw == 0) {
+        return napiThrow(env, "argument 1 must be source buffer BigInt");
+    }
+    const src: wgpu.c.WGPUBuffer = @ptrFromInt(@as(usize, @intCast(srcRaw)));
+
+    const offset = napiGetU32(env, argv[2], "argument 2 must be u32 (offset)") orelse return null;
+    const byte_len = napiGetU32(env, argv[3], "argument 3 must be u32 (byteLen)") orelse return null;
+
+    var ab: c.napi_value = undefined;
+    var data_ptr: ?*anyopaque = null;
+    if (c.napi_create_arraybuffer(env, byte_len, &data_ptr, &ab) != c.napi_ok) {
+        return napiThrow(env, "napi: alloc out ArrayBuffer failed");
+    }
+    var typed: c.napi_value = undefined;
+    if (c.napi_create_typedarray(env, c.napi_uint8_array, byte_len, ab, 0, &typed) != c.napi_ok) {
+        return napiThrow(env, "napi: alloc Uint8Array failed");
+    }
+    const out = @as([*]u8, @ptrCast(data_ptr.?))[0..byte_len];
+
+    wgpu.submitAndReadback(enc, src, offset, out) catch
+        return napiThrow(env, "wgpu: submitAndReadback failed");
+
+    return typed;
 }
 
 fn napiBenchDispatch(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {

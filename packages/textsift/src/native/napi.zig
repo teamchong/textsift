@@ -19,6 +19,7 @@ export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) c.napi
     register(env, exports, "getAdapterInfo", napiGetAdapterInfo) catch return null;
     register(env, exports, "getDeviceInfo", napiGetDeviceInfo) catch return null;
     register(env, exports, "roundtripBuffer", napiRoundtripBuffer) catch return null;
+    register(env, exports, "dispatchDouble", napiDispatchDouble) catch return null;
     return exports;
 }
 
@@ -168,6 +169,62 @@ fn napiRoundtripBuffer(env: c.napi_env, info: c.napi_callback_info) callconv(.c)
             wgpu.WgpuError.ShaderF16Unavailable =>
                 napiThrow(env, "WebGPU adapter lacks shader-f16. Use textsift/browser instead."),
             else => napiThrow(env, "wgpu: roundtripBuffer failed"),
+        };
+    };
+
+    return out_typedarray;
+}
+
+fn napiDispatchDouble(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argc: usize = 1;
+    var argv: [1]c.napi_value = undefined;
+    if (c.napi_get_cb_info(env, info, &argc, &argv, null, null) != c.napi_ok) {
+        return napiThrow(env, "napi_get_cb_info failed");
+    }
+    if (argc < 1) {
+        return napiThrow(env, "dispatchDouble(input: Float32Array) requires one argument");
+    }
+
+    var arr_type: c.napi_typedarray_type = undefined;
+    var data_ptr: ?*anyopaque = null;
+    var elem_count: usize = 0;
+    if (c.napi_get_typedarray_info(env, argv[0], &arr_type, &elem_count, &data_ptr, null, null) != c.napi_ok) {
+        return napiThrow(env, "argument must be a Float32Array");
+    }
+    if (arr_type != c.napi_float32_array) {
+        return napiThrow(env, "argument must be a Float32Array (got different element type)");
+    }
+    if (data_ptr == null or elem_count == 0) {
+        return napiThrow(env, "input Float32Array is empty");
+    }
+
+    const input = @as([*]const f32, @ptrCast(@alignCast(data_ptr.?)))[0..elem_count];
+
+    const byte_len = elem_count * @sizeOf(f32);
+    var out_arraybuffer: c.napi_value = undefined;
+    var out_data_ptr: ?*anyopaque = null;
+    if (c.napi_create_arraybuffer(env, byte_len, &out_data_ptr, &out_arraybuffer) != c.napi_ok) {
+        return napiThrow(env, "napi: failed to allocate output ArrayBuffer");
+    }
+    var out_typedarray: c.napi_value = undefined;
+    if (c.napi_create_typedarray(env, c.napi_float32_array, elem_count, out_arraybuffer, 0, &out_typedarray) != c.napi_ok) {
+        return napiThrow(env, "napi: failed to allocate output Float32Array");
+    }
+    const output = @as([*]f32, @ptrCast(@alignCast(out_data_ptr.?)))[0..elem_count];
+
+    wgpu.dispatchDouble(input, output) catch |err| {
+        return switch (err) {
+            wgpu.WgpuError.BufferCreateFailed => napiThrow(env, "wgpu: device.createBuffer failed"),
+            wgpu.WgpuError.BufferMapFailed => napiThrow(env, "wgpu: buffer.mapAsync failed"),
+            wgpu.WgpuError.BufferRangeFailed => napiThrow(env, "wgpu: buffer.getMappedRange failed"),
+            wgpu.WgpuError.ShaderModuleFailed => napiThrow(env, "wgpu: device.createShaderModule failed"),
+            wgpu.WgpuError.ComputePipelineFailed => napiThrow(env, "wgpu: device.createComputePipeline failed"),
+            wgpu.WgpuError.BindGroupFailed => napiThrow(env, "wgpu: device.createBindGroup failed"),
+            wgpu.WgpuError.AdapterUnavailable =>
+                napiThrow(env, "WebGPU adapter not available on this host. Use textsift/browser instead."),
+            wgpu.WgpuError.ShaderF16Unavailable =>
+                napiThrow(env, "WebGPU adapter lacks shader-f16. Use textsift/browser instead."),
+            else => napiThrow(env, "wgpu: dispatchDouble failed"),
         };
     };
 

@@ -27,6 +27,11 @@ export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) c.napi
     register(env, exports, "backendDispatch", napiBackendDispatch) catch return null;
     register(env, exports, "destroyBackend", napiDestroyBackend) catch return null;
     register(env, exports, "benchDispatch", napiBenchDispatch) catch return null;
+    register(env, exports, "createBuffer", napiCreateBuffer) catch return null;
+    register(env, exports, "releaseBuffer", napiReleaseBuffer) catch return null;
+    register(env, exports, "dispatchByBuffers", napiDispatchByBuffers) catch return null;
+    register(env, exports, "writeBuffer", napiWriteBuffer) catch return null;
+    register(env, exports, "readBuffer", napiReadBuffer) catch return null;
     return exports;
 }
 
@@ -678,6 +683,275 @@ fn napiBackendDispatch(env: c.napi_env, info: c.napi_callback_info) callconv(.c)
             wgpu.WgpuError.BufferMapFailed => napiThrow(env, "wgpu: mapAsync failed"),
             wgpu.WgpuError.BufferRangeFailed => napiThrow(env, "wgpu: buffer range failed"),
             else => napiThrow(env, "wgpu: backendDispatch failed"),
+        };
+    };
+    return out_typed;
+}
+
+// ── persistent buffer management ──
+
+fn napiCreateBuffer(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argc: usize = 2;
+    var argv: [2]c.napi_value = undefined;
+    if (c.napi_get_cb_info(env, info, &argc, &argv, null, null) != c.napi_ok) {
+        return napiThrow(env, "napi_get_cb_info failed");
+    }
+    if (argc < 2) return napiThrow(env, "createBuffer(handle, bytes) requires 2 args");
+
+    var raw: u64 = 0;
+    var lossless: bool = false;
+    if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok or raw == 0) {
+        return napiThrow(env, "argument 0 must be a non-null backend BigInt handle");
+    }
+    const backend: *wgpu.Backend = @ptrFromInt(@as(usize, @intCast(raw)));
+    const bytes = napiGetUint8Array(env, argv[1], "argument 1 must be Uint8Array (bytes)") orelse return null;
+
+    const buf = wgpu.createPersistentBuffer(backend, bytes) catch
+        return napiThrow(env, "wgpu: createPersistentBuffer failed");
+
+    var bn: c.napi_value = undefined;
+    if (c.napi_create_bigint_uint64(env, @intCast(@intFromPtr(buf)), &bn) != c.napi_ok) {
+        wgpu.releasePersistentBuffer(buf);
+        return napiThrow(env, "napi: failed to create buffer handle");
+    }
+    return bn;
+}
+
+fn napiReleaseBuffer(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argc: usize = 1;
+    var argv: [1]c.napi_value = undefined;
+    if (c.napi_get_cb_info(env, info, &argc, &argv, null, null) != c.napi_ok) {
+        return napiThrow(env, "napi_get_cb_info failed");
+    }
+    if (argc < 1) return napiThrow(env, "releaseBuffer(bufPtr) requires 1 arg");
+
+    var raw: u64 = 0;
+    var lossless: bool = false;
+    if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok) {
+        return napiThrow(env, "argument 0 must be BigInt buffer pointer");
+    }
+    if (raw != 0) {
+        const buf: wgpu.c.WGPUBuffer = @ptrFromInt(@as(usize, @intCast(raw)));
+        wgpu.releasePersistentBuffer(buf);
+    }
+    var undef: c.napi_value = undefined;
+    _ = c.napi_get_undefined(env, &undef);
+    return undef;
+}
+
+fn napiWriteBuffer(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argc: usize = 4;
+    var argv: [4]c.napi_value = undefined;
+    if (c.napi_get_cb_info(env, info, &argc, &argv, null, null) != c.napi_ok) {
+        return napiThrow(env, "napi_get_cb_info failed");
+    }
+    if (argc < 4) return napiThrow(env, "writeBuffer(handle, bufPtr, offset, bytes) requires 4 args");
+
+    var raw: u64 = 0;
+    var lossless: bool = false;
+    if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok or raw == 0) {
+        return napiThrow(env, "argument 0 must be backend BigInt");
+    }
+    const backend: *wgpu.Backend = @ptrFromInt(@as(usize, @intCast(raw)));
+
+    var bufRaw: u64 = 0;
+    if (c.napi_get_value_bigint_uint64(env, argv[1], &bufRaw, &lossless) != c.napi_ok or bufRaw == 0) {
+        return napiThrow(env, "argument 1 must be buffer BigInt");
+    }
+    const buf: wgpu.c.WGPUBuffer = @ptrFromInt(@as(usize, @intCast(bufRaw)));
+
+    const offset = napiGetU32(env, argv[2], "argument 2 must be u32 (offset)") orelse return null;
+    const bytes = napiGetUint8Array(env, argv[3], "argument 3 must be Uint8Array (bytes)") orelse return null;
+
+    wgpu.c.wgpuQueueWriteBuffer(backend.queue, buf, offset, bytes.ptr, bytes.len);
+
+    var undef: c.napi_value = undefined;
+    _ = c.napi_get_undefined(env, &undef);
+    return undef;
+}
+
+fn napiReadBuffer(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argc: usize = 4;
+    var argv: [4]c.napi_value = undefined;
+    if (c.napi_get_cb_info(env, info, &argc, &argv, null, null) != c.napi_ok) {
+        return napiThrow(env, "napi_get_cb_info failed");
+    }
+    if (argc < 4) return napiThrow(env, "readBuffer(handle, bufPtr, offset, byteLen) requires 4 args");
+
+    var raw: u64 = 0;
+    var lossless: bool = false;
+    if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok or raw == 0) {
+        return napiThrow(env, "argument 0 must be backend BigInt");
+    }
+    const backend: *wgpu.Backend = @ptrFromInt(@as(usize, @intCast(raw)));
+
+    var bufRaw: u64 = 0;
+    if (c.napi_get_value_bigint_uint64(env, argv[1], &bufRaw, &lossless) != c.napi_ok or bufRaw == 0) {
+        return napiThrow(env, "argument 1 must be buffer BigInt");
+    }
+    const src: wgpu.c.WGPUBuffer = @ptrFromInt(@as(usize, @intCast(bufRaw)));
+
+    const offset = napiGetU32(env, argv[2], "argument 2 must be u32 (offset)") orelse return null;
+    const byte_len = napiGetU32(env, argv[3], "argument 3 must be u32 (byteLen)") orelse return null;
+
+    var ab: c.napi_value = undefined;
+    var data_ptr: ?*anyopaque = null;
+    if (c.napi_create_arraybuffer(env, byte_len, &data_ptr, &ab) != c.napi_ok) {
+        return napiThrow(env, "napi: alloc out ArrayBuffer failed");
+    }
+    var typed: c.napi_value = undefined;
+    if (c.napi_create_typedarray(env, c.napi_uint8_array, byte_len, ab, 0, &typed) != c.napi_ok) {
+        return napiThrow(env, "napi: alloc Uint8Array failed");
+    }
+    const out = @as([*]u8, @ptrCast(data_ptr.?))[0..byte_len];
+
+    wgpu.readPersistentBuffer(backend, src, offset, out) catch
+        return napiThrow(env, "wgpu: readPersistentBuffer failed");
+
+    return typed;
+}
+
+fn parseStorageBindings(
+    env: c.napi_env,
+    arr: c.napi_value,
+    out: []wgpu.StorageBinding,
+    out_n: *usize,
+) ?void {
+    const n = napiArrayLen(env, arr) orelse {
+        _ = c.napi_throw_error(env, null, "inputs must be array");
+        return null;
+    };
+    if (n > out.len) {
+        _ = c.napi_throw_error(env, null, "too many inputs");
+        return null;
+    }
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const item = napiArrayGet(env, arr, i) orelse return null;
+        const binding_v = napiNamedProperty(env, item, "binding") orelse {
+            _ = c.napi_throw_error(env, null, "input[i].binding missing");
+            return null;
+        };
+        const binding = napiGetU32(env, binding_v, "input[i].binding") orelse return null;
+
+        // Either {bytes: Uint8Array} or {bufPtr: BigInt, byteLen: u32}.
+        var bytes_v: c.napi_value = undefined;
+        if (c.napi_get_named_property(env, item, "bytes", &bytes_v) == c.napi_ok) {
+            var t: c.napi_valuetype = undefined;
+            if (c.napi_typeof(env, bytes_v, &t) == c.napi_ok and t != c.napi_undefined and t != c.napi_null) {
+                const bytes = napiGetUint8Array(env, bytes_v, "input[i].bytes must be Uint8Array") orelse return null;
+                out[i] = .{ .bytes = .{ .binding = binding, .bytes = bytes } };
+                continue;
+            }
+        }
+        const ptr_v = napiNamedProperty(env, item, "bufPtr") orelse {
+            _ = c.napi_throw_error(env, null, "input[i] needs bytes or bufPtr");
+            return null;
+        };
+        const len_v = napiNamedProperty(env, item, "byteLen") orelse {
+            _ = c.napi_throw_error(env, null, "input[i].byteLen missing");
+            return null;
+        };
+        var raw: u64 = 0;
+        var lossless: bool = false;
+        if (c.napi_get_value_bigint_uint64(env, ptr_v, &raw, &lossless) != c.napi_ok or raw == 0) {
+            _ = c.napi_throw_error(env, null, "input[i].bufPtr must be non-null BigInt");
+            return null;
+        }
+        const buf: wgpu.c.WGPUBuffer = @ptrFromInt(@as(usize, @intCast(raw)));
+        const byte_len = napiGetU32(env, len_v, "input[i].byteLen") orelse return null;
+        out[i] = .{ .buffer = .{ .binding = binding, .buf = buf, .byte_len = byte_len } };
+    }
+    out_n.* = n;
+}
+
+fn napiDispatchByBuffers(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argc: usize = 7;
+    var argv: [7]c.napi_value = undefined;
+    if (c.napi_get_cb_info(env, info, &argc, &argv, null, null) != c.napi_ok) {
+        return napiThrow(env, "napi_get_cb_info failed");
+    }
+    if (argc < 7) {
+        return napiThrow(env, "dispatchByBuffers(handle, name, uniform, extras, inputs, output, dispatch) requires 7 args");
+    }
+
+    var raw: u64 = 0;
+    var lossless: bool = false;
+    if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok or raw == 0) {
+        return napiThrow(env, "argument 0 must be backend BigInt");
+    }
+    const backend: *wgpu.Backend = @ptrFromInt(@as(usize, @intCast(raw)));
+
+    const name_buf = napiGetString(env, argv[1], "argument 1 must be string (name)") orelse return null;
+    defer std.heap.c_allocator.free(name_buf);
+    const uniform_bytes = napiGetUint8Array(env, argv[2], "argument 2 must be Uint8Array (uniform)") orelse return null;
+
+    const extra_n = napiArrayLen(env, argv[3]) orelse return napiThrow(env, "argument 3 must be array");
+    if (extra_n > 8) return napiThrow(env, "too many extraUniforms");
+    var extra_storage: [8]wgpu.StorageInput = undefined;
+    var ei: u32 = 0;
+    while (ei < extra_n) : (ei += 1) {
+        const item = napiArrayGet(env, argv[3], ei) orelse return napiThrow(env, "extraUniforms[i]");
+        const binding = napiGetU32(env, napiNamedProperty(env, item, "binding") orelse return napiThrow(env, "binding"), "binding") orelse return null;
+        const bytes = napiGetUint8Array(env, napiNamedProperty(env, item, "bytes") orelse return napiThrow(env, "bytes"), "bytes") orelse return null;
+        extra_storage[ei] = .{ .binding = binding, .bytes = bytes };
+    }
+
+    var in_storage: [16]wgpu.StorageBinding = undefined;
+    var in_n: usize = 0;
+    parseStorageBindings(env, argv[4], in_storage[0..], &in_n) orelse return null;
+
+    const out_obj = argv[5];
+    const out_binding = napiGetU32(env, napiNamedProperty(env, out_obj, "binding") orelse return napiThrow(env, "output.binding"), "output.binding") orelse return null;
+    const out_blen = napiGetU32(env, napiNamedProperty(env, out_obj, "byteLength") orelse return napiThrow(env, "output.byteLength"), "output.byteLength") orelse return null;
+    var out_initial: ?[]const u8 = null;
+    {
+        var v: c.napi_value = undefined;
+        if (c.napi_get_named_property(env, out_obj, "initial", &v) == c.napi_ok) {
+            var t: c.napi_valuetype = undefined;
+            if (c.napi_typeof(env, v, &t) == c.napi_ok and t != c.napi_undefined and t != c.napi_null) {
+                const b = napiGetUint8Array(env, v, "output.initial must be Uint8Array") orelse return null;
+                out_initial = b;
+            }
+        }
+    }
+
+    const dx = napiGetU32(env, napiArrayGet(env, argv[6], 0) orelse return napiThrow(env, "dispatch[0]"), "dispatch[0]") orelse return null;
+    const dy = napiGetU32(env, napiArrayGet(env, argv[6], 1) orelse return napiThrow(env, "dispatch[1]"), "dispatch[1]") orelse return null;
+    const dz = napiGetU32(env, napiArrayGet(env, argv[6], 2) orelse return napiThrow(env, "dispatch[2]"), "dispatch[2]") orelse return null;
+
+    var out_ab: c.napi_value = undefined;
+    var out_data_ptr: ?*anyopaque = null;
+    if (c.napi_create_arraybuffer(env, out_blen, &out_data_ptr, &out_ab) != c.napi_ok) {
+        return napiThrow(env, "napi: alloc output ArrayBuffer failed");
+    }
+    var out_typed: c.napi_value = undefined;
+    if (c.napi_create_typedarray(env, c.napi_uint8_array, out_blen, out_ab, 0, &out_typed) != c.napi_ok) {
+        return napiThrow(env, "napi: alloc output Uint8Array failed");
+    }
+    const out_slice = @as([*]u8, @ptrCast(out_data_ptr.?))[0..out_blen];
+
+    const wgsl = wgpu.shaderByName_pub(name_buf) orelse return napiThrow(env, "unknown shader name");
+
+    wgpu.dispatchOnBackendMixed(
+        backend,
+        wgsl,
+        uniform_bytes,
+        0,
+        in_storage[0..in_n],
+        .{ .binding = out_binding, .bytes = out_slice },
+        out_initial,
+        extra_storage[0..extra_n],
+        .{ dx, dy, dz },
+    ) catch |err| {
+        return switch (err) {
+            wgpu.WgpuError.ShaderModuleFailed => napiThrow(env, "wgpu: createShaderModule failed"),
+            wgpu.WgpuError.ComputePipelineFailed => napiThrow(env, "wgpu: createComputePipeline failed"),
+            wgpu.WgpuError.BindGroupFailed => napiThrow(env, "wgpu: createBindGroup failed"),
+            wgpu.WgpuError.BufferCreateFailed => napiThrow(env, "wgpu: createBuffer failed"),
+            wgpu.WgpuError.BufferMapFailed => napiThrow(env, "wgpu: mapAsync failed"),
+            wgpu.WgpuError.BufferRangeFailed => napiThrow(env, "wgpu: buffer range failed"),
+            else => napiThrow(env, "wgpu: dispatchByBuffers failed"),
         };
     };
     return out_typed;

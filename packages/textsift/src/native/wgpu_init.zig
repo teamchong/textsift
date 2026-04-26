@@ -1058,6 +1058,50 @@ pub fn releasePersistentBuffer(buf: c.WGPUBuffer) void {
     c.wgpuBufferRelease(buf);
 }
 
+/// Read `byte_len` bytes from a persistent buffer (typically the
+/// final logits buffer at the end of a forward pass) into `out`.
+/// Allocates a per-call MapRead+CopyDst readback buffer, copies via
+/// command encoder, maps + memcpy + unmap.
+pub fn readPersistentBuffer(b: *Backend, src: c.WGPUBuffer, offset: u32, out: []u8) WgpuError!void {
+    var read_desc: c.WGPUBufferDescriptor = std.mem.zeroes(c.WGPUBufferDescriptor);
+    read_desc.usage = c.WGPUBufferUsage_MapRead | c.WGPUBufferUsage_CopyDst;
+    read_desc.size = out.len;
+    const readback = c.wgpuDeviceCreateBuffer(b.device, &read_desc);
+    if (readback == null) return WgpuError.BufferCreateFailed;
+    defer c.wgpuBufferRelease(readback);
+
+    const enc = c.wgpuDeviceCreateCommandEncoder(b.device, null);
+    defer c.wgpuCommandEncoderRelease(enc);
+    c.wgpuCommandEncoderCopyBufferToBuffer(enc, src, offset, readback, 0, out.len);
+    const cmd = c.wgpuCommandEncoderFinish(enc, null);
+    defer c.wgpuCommandBufferRelease(cmd);
+    var cmds = [_]c.WGPUCommandBuffer{cmd};
+    c.wgpuQueueSubmit(b.queue, cmds.len, &cmds);
+
+    var map_state = MapState{};
+    const map_cb = c.WGPUBufferMapCallbackInfo{
+        .nextInChain = null,
+        .mode = c.WGPUCallbackMode_AllowProcessEvents,
+        .callback = onBufferMap,
+        .userdata1 = &map_state,
+        .userdata2 = null,
+    };
+    _ = c.wgpuBufferMapAsync(readback, c.WGPUMapMode_Read, 0, out.len, map_cb);
+    var spins: u32 = 0;
+    while (!map_state.fired and spins < 1_000_000) : (spins += 1) {
+        _ = c.wgpuDevicePoll(b.device, 0, null);
+        c.wgpuInstanceProcessEvents(b.instance);
+    }
+    if (!map_state.fired or map_state.status != c.WGPUMapAsyncStatus_Success) return WgpuError.BufferMapFailed;
+    const mapped = c.wgpuBufferGetMappedRange(readback, 0, out.len);
+    if (mapped == null) {
+        c.wgpuBufferUnmap(readback);
+        return WgpuError.BufferRangeFailed;
+    }
+    @memcpy(out, @as([*]const u8, @ptrCast(mapped))[0..out.len]);
+    c.wgpuBufferUnmap(readback);
+}
+
 pub const StorageBinding = union(enum) {
     bytes: StorageInput,
     buffer: struct { binding: u32, buf: c.WGPUBuffer, byte_len: u64 },

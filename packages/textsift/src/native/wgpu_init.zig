@@ -30,6 +30,9 @@ pub const WgpuError = error{
     DeviceRequestFailed,
     DeviceUnavailable,
     DeviceLimitsFailed,
+    BufferCreateFailed,
+    BufferMapFailed,
+    BufferRangeFailed,
 };
 
 pub const DeviceInfo = struct {
@@ -56,6 +59,22 @@ const DeviceState = struct {
     device: c.WGPUDevice = null,
     fired: bool = false,
 };
+
+const MapState = struct {
+    status: c.WGPUMapAsyncStatus = 0,
+    fired: bool = false,
+};
+
+fn onBufferMap(
+    status: c.WGPUMapAsyncStatus,
+    _: c.WGPUStringView,
+    userdata1: ?*anyopaque,
+    _: ?*anyopaque,
+) callconv(.c) void {
+    const state: *MapState = @ptrCast(@alignCast(userdata1.?));
+    state.status = status;
+    state.fired = true;
+}
 
 fn onAdapter(
     status: c.WGPURequestAdapterStatus,
@@ -242,6 +261,95 @@ pub fn getDeviceLimits(device: c.WGPUDevice) WgpuError!c.WGPULimits {
         return WgpuError.DeviceLimitsFailed;
     }
     return limits;
+}
+
+/// Round-trip `input` through a wgpu buffer: write to GPU memory via
+/// queue.writeBuffer, then map for read and copy back. Validates the
+/// full buffer pipeline (create → write → submit → map → read) end-
+/// to-end. `output` must have at least `input.len` capacity.
+///
+/// Allocates and releases its own instance + device — every call is
+/// independent. The inference pipeline will hold device resources
+/// long-term; this function exists for the conformance test only.
+pub fn roundtripBuffer(input: []const u8, output: []u8) WgpuError!void {
+    if (output.len < input.len) return WgpuError.BufferRangeFailed;
+
+    const handles = try createInstanceAndAdapter();
+    defer c.wgpuInstanceRelease(handles.instance);
+    defer c.wgpuAdapterRelease(handles.adapter);
+
+    try requireShaderF16(handles.adapter);
+    const device = try createDevice(handles.instance, handles.adapter);
+    defer c.wgpuDeviceRelease(device);
+
+    const queue = c.wgpuDeviceGetQueue(device);
+    defer c.wgpuQueueRelease(queue);
+
+    // Staging buffer: created mapped, host writes the bytes via the
+    // mapped range, then unmap. After unmap the bytes are owned by
+    // the GPU and live in CopySrc-able storage. This is the canonical
+    // host→GPU upload pattern; queue.writeBuffer with our combined
+    // MapRead+CopyDst destination didn't surface the data on
+    // wgpu-native v29.
+    var staging_desc: c.WGPUBufferDescriptor = std.mem.zeroes(c.WGPUBufferDescriptor);
+    staging_desc.usage = c.WGPUBufferUsage_CopySrc;
+    staging_desc.size = input.len;
+    staging_desc.mappedAtCreation = 1;
+    const staging = c.wgpuDeviceCreateBuffer(device, &staging_desc);
+    if (staging == null) return WgpuError.BufferCreateFailed;
+    defer c.wgpuBufferRelease(staging);
+
+    const staging_mapped = c.wgpuBufferGetMappedRange(staging, 0, input.len);
+    if (staging_mapped == null) return WgpuError.BufferRangeFailed;
+    @memcpy(@as([*]u8, @ptrCast(staging_mapped))[0..input.len], input);
+    c.wgpuBufferUnmap(staging);
+
+    var read_desc: c.WGPUBufferDescriptor = std.mem.zeroes(c.WGPUBufferDescriptor);
+    read_desc.usage = c.WGPUBufferUsage_MapRead | c.WGPUBufferUsage_CopyDst;
+    read_desc.size = input.len;
+    const readback = c.wgpuDeviceCreateBuffer(device, &read_desc);
+    if (readback == null) return WgpuError.BufferCreateFailed;
+    defer c.wgpuBufferRelease(readback);
+
+    var encoder_desc: c.WGPUCommandEncoderDescriptor = std.mem.zeroes(c.WGPUCommandEncoderDescriptor);
+    const encoder = c.wgpuDeviceCreateCommandEncoder(device, &encoder_desc);
+    defer c.wgpuCommandEncoderRelease(encoder);
+    c.wgpuCommandEncoderCopyBufferToBuffer(encoder, staging, 0, readback, 0, input.len);
+
+    var cmd_desc: c.WGPUCommandBufferDescriptor = std.mem.zeroes(c.WGPUCommandBufferDescriptor);
+    const cmd = c.wgpuCommandEncoderFinish(encoder, &cmd_desc);
+    defer c.wgpuCommandBufferRelease(cmd);
+
+    var cmds = [_]c.WGPUCommandBuffer{cmd};
+    c.wgpuQueueSubmit(queue, cmds.len, &cmds);
+    _ = c.wgpuDevicePoll(device, 1, null);
+
+    var map_state = MapState{};
+    const map_cb = c.WGPUBufferMapCallbackInfo{
+        .nextInChain = null,
+        .mode = c.WGPUCallbackMode_AllowProcessEvents,
+        .callback = onBufferMap,
+        .userdata1 = &map_state,
+        .userdata2 = null,
+    };
+    _ = c.wgpuBufferMapAsync(readback, c.WGPUMapMode_Read, 0, input.len, map_cb);
+
+    var spins: u32 = 0;
+    while (!map_state.fired and spins < 1_000_000) : (spins += 1) {
+        _ = c.wgpuDevicePoll(device, 0, null);
+        c.wgpuInstanceProcessEvents(handles.instance);
+    }
+    if (!map_state.fired or map_state.status != c.WGPUMapAsyncStatus_Success) {
+        return WgpuError.BufferMapFailed;
+    }
+
+    const mapped = c.wgpuBufferGetMappedRange(readback, 0, input.len);
+    if (mapped == null) {
+        c.wgpuBufferUnmap(readback);
+        return WgpuError.BufferRangeFailed;
+    }
+    @memcpy(output[0..input.len], @as([*]const u8, @ptrCast(mapped))[0..input.len]);
+    c.wgpuBufferUnmap(readback);
 }
 
 /// Bring up the full instance + adapter + device chain, return both

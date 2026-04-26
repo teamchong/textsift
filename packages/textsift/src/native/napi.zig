@@ -18,6 +18,7 @@ const c = @cImport({
 export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) c.napi_value {
     register(env, exports, "getAdapterInfo", napiGetAdapterInfo) catch return null;
     register(env, exports, "getDeviceInfo", napiGetDeviceInfo) catch return null;
+    register(env, exports, "roundtripBuffer", napiRoundtripBuffer) catch return null;
     return exports;
 }
 
@@ -123,6 +124,56 @@ fn buildAdapterObject(env: c.napi_env, info: wgpu.AdapterInfo) !c.napi_value {
     return obj;
 }
 
+fn napiRoundtripBuffer(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argc: usize = 1;
+    var argv: [1]c.napi_value = undefined;
+    if (c.napi_get_cb_info(env, info, &argc, &argv, null, null) != c.napi_ok) {
+        return napiThrow(env, "napi_get_cb_info failed");
+    }
+    if (argc < 1) {
+        return napiThrow(env, "roundtripBuffer(input: Uint8Array) requires one argument");
+    }
+
+    var data_ptr: ?*anyopaque = null;
+    var byte_len: usize = 0;
+    if (c.napi_get_typedarray_info(env, argv[0], null, &byte_len, &data_ptr, null, null) != c.napi_ok) {
+        return napiThrow(env, "argument must be a Uint8Array");
+    }
+    if (data_ptr == null or byte_len == 0) {
+        return napiThrow(env, "input Uint8Array is empty");
+    }
+
+    const input = @as([*]const u8, @ptrCast(data_ptr.?))[0..byte_len];
+
+    // Allocate the output Uint8Array first so wgpu writes into it
+    // directly (avoids a stage-then-copy).
+    var out_arraybuffer: c.napi_value = undefined;
+    var out_data_ptr: ?*anyopaque = null;
+    if (c.napi_create_arraybuffer(env, byte_len, &out_data_ptr, &out_arraybuffer) != c.napi_ok) {
+        return napiThrow(env, "napi: failed to allocate output ArrayBuffer");
+    }
+    var out_typedarray: c.napi_value = undefined;
+    if (c.napi_create_typedarray(env, c.napi_uint8_array, byte_len, out_arraybuffer, 0, &out_typedarray) != c.napi_ok) {
+        return napiThrow(env, "napi: failed to allocate output Uint8Array");
+    }
+    const output = @as([*]u8, @ptrCast(out_data_ptr.?))[0..byte_len];
+
+    wgpu.roundtripBuffer(input, output) catch |err| {
+        return switch (err) {
+            wgpu.WgpuError.BufferCreateFailed => napiThrow(env, "wgpu: device.createBuffer failed"),
+            wgpu.WgpuError.BufferMapFailed => napiThrow(env, "wgpu: buffer.mapAsync failed"),
+            wgpu.WgpuError.BufferRangeFailed => napiThrow(env, "wgpu: buffer.getMappedRange failed"),
+            wgpu.WgpuError.AdapterUnavailable =>
+                napiThrow(env, "WebGPU adapter not available on this host. Use textsift/browser instead."),
+            wgpu.WgpuError.ShaderF16Unavailable =>
+                napiThrow(env, "WebGPU adapter lacks shader-f16. Use textsift/browser instead."),
+            else => napiThrow(env, "wgpu: roundtripBuffer failed"),
+        };
+    };
+
+    return out_typedarray;
+}
+
 fn napiGetDeviceInfo(env: c.napi_env, _: c.napi_callback_info) callconv(.c) c.napi_value {
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
@@ -145,6 +196,7 @@ fn napiGetDeviceInfo(env: c.napi_env, _: c.napi_callback_info) callconv(.c) c.na
                 napiThrow(env, "wgpu: requestDevice returned no device"),
             wgpu.WgpuError.DeviceLimitsFailed =>
                 napiThrow(env, "wgpu: failed to query device limits"),
+            else => napiThrow(env, "wgpu: device init failed"),
         };
     };
 

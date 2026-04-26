@@ -1,0 +1,56 @@
+{
+  "shader": "qmoe_down_scatter",
+  "uniform": {
+    "binding": 0,
+    "byteLength": 32
+  },
+  "extraUniforms": [],
+  "inputs": [
+    {
+      "binding": 1,
+      "name": "glu",
+      "byteLength": 1024
+    },
+    {
+      "binding": 2,
+      "name": "routing_idx",
+      "byteLength": 16
+    },
+    {
+      "binding": 3,
+      "name": "routing_scores",
+      "byteLength": 16
+    },
+    {
+      "binding": 4,
+      "name": "w_int4",
+      "byteLength": 8192
+    },
+    {
+      "binding": 5,
+      "name": "w_scales",
+      "byteLength": 1024
+    },
+    {
+      "binding": 6,
+      "name": "w_zp",
+      "byteLength": 256
+    },
+    {
+      "binding": 7,
+      "name": "bias",
+      "byteLength": 512
+    }
+  ],
+  "output": {
+    "binding": 8,
+    "dtype": "f32",
+    "byteLength": 512,
+    "hasInitial": true
+  },
+  "dispatch": [
+    4,
+    1,
+    1
+  ]
+}

@@ -17,6 +17,9 @@ const SHADERS = [
   "embed_lookup_int4",
   "add_rmsnorm_fp16_to_f32",
   "router_topk",
+  "banded_attention",
+  "qmoe_gate_up",
+  "qmoe_down_scatter",
 ];
 
 let failed = 0;

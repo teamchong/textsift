@@ -1,0 +1,51 @@
+{
+  "shader": "qmoe_gate_up",
+  "uniform": {
+    "binding": 0,
+    "byteLength": 32
+  },
+  "extraUniforms": [],
+  "inputs": [
+    {
+      "binding": 1,
+      "name": "x",
+      "byteLength": 512
+    },
+    {
+      "binding": 2,
+      "name": "routing_idx",
+      "byteLength": 16
+    },
+    {
+      "binding": 3,
+      "name": "w_int4",
+      "byteLength": 8192
+    },
+    {
+      "binding": 4,
+      "name": "w_scales",
+      "byteLength": 1024
+    },
+    {
+      "binding": 5,
+      "name": "w_zp",
+      "byteLength": 256
+    },
+    {
+      "binding": 6,
+      "name": "bias",
+      "byteLength": 512
+    }
+  ],
+  "output": {
+    "binding": 7,
+    "dtype": "f32",
+    "byteLength": 1024,
+    "hasInitial": false
+  },
+  "dispatch": [
+    4,
+    1,
+    1
+  ]
+}

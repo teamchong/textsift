@@ -331,6 +331,93 @@
             };
           },
         },
+        {
+          name: "banded_attention",
+          build() {
+            const T = 4, H_q = 4, H_kv = 2, head_dim = 32, window = 2, use_mask = 0;
+            return {
+              uniform: { binding: 0, bytes: dimsBuf([
+                {tag:"u32",value:T},{tag:"u32",value:H_q},{tag:"u32",value:H_kv},{tag:"u32",value:head_dim},
+                {tag:"u32",value:window},{tag:"u32",value:use_mask},{tag:"u32",value:0},{tag:"u32",value:0},
+              ]) },
+              inputs: [
+                { binding: 1, name: "q", bytes: rngF16(70, T*H_q*head_dim, 0.3) },
+                { binding: 2, name: "k", bytes: rngF16(71, T*H_kv*head_dim, 0.3) },
+                { binding: 3, name: "v", bytes: rngF16(72, T*H_kv*head_dim, 0.3) },
+                { binding: 4, name: "sinks", bytes: new Uint8Array(rngF32(73, H_q, 0.5).buffer) },
+                // mask is unread when use_mask=0 but the binding must
+                // still resolve to a non-empty storage buffer.
+                { binding: 5, name: "mask", bytes: new Uint8Array(4) },
+              ],
+              output: { binding: 6, elements: T*H_q*head_dim, dtype: "f16" },
+              dispatch: [T*H_q, 1, 1],
+            };
+          },
+        },
+        {
+          name: "qmoe_gate_up",
+          build() {
+            const E = 4, T = 2, K = 2, N = 64, D = 64;
+            const n_blocks = D / 32;
+            const wNib = rngNibbles(80, E*N*D);
+            return {
+              uniform: { binding: 0, bytes: dimsBuf([
+                {tag:"u32",value:T},{tag:"u32",value:K},{tag:"u32",value:N},{tag:"u32",value:D},
+                {tag:"u32",value:0},{tag:"u32",value:0},{tag:"u32",value:0},{tag:"u32",value:0},
+              ]) },
+              inputs: [
+                { binding: 1, name: "x", bytes: new Uint8Array(rngF32(81, T*D, 0.3).buffer) },
+                // routing_idx: every (token, k_pick) routes to expert (k_pick % E).
+                { binding: 2, name: "routing_idx", bytes: (() => {
+                  const a = new Int32Array(T*K);
+                  for (let i = 0; i < T*K; i++) a[i] = i % E;
+                  return new Uint8Array(a.buffer);
+                })() },
+                { binding: 3, name: "w_int4", bytes: packNibbles(wNib) },
+                { binding: 4, name: "w_scales", bytes: rngF16(82, E*N*n_blocks, 1.0) },
+                { binding: 5, name: "w_zp", bytes: packZp(E*N, n_blocks, 83) },
+                { binding: 6, name: "bias", bytes: rngF16(84, E*N, 0.1) },
+              ],
+              output: { binding: 7, elements: T*K*N, dtype: "f32" },
+              dispatch: [T*K, Math.ceil(N / 64), 1],
+            };
+          },
+        },
+        {
+          name: "qmoe_down_scatter",
+          build() {
+            const E = 4, T = 2, K = 2, N = 64, D = 64;
+            const n_blocks = N / 32;
+            const wNib = rngNibbles(90, E*D*N);
+            return {
+              uniform: { binding: 0, bytes: dimsBuf([
+                {tag:"u32",value:T},{tag:"u32",value:K},{tag:"u32",value:N},{tag:"u32",value:D},
+                {tag:"u32",value:0},{tag:"u32",value:0},{tag:"u32",value:0},{tag:"u32",value:0},
+              ]) },
+              inputs: [
+                { binding: 1, name: "glu", bytes: new Uint8Array(rngF32(91, T*K*N, 0.3).buffer) },
+                { binding: 2, name: "routing_idx", bytes: (() => {
+                  const a = new Int32Array(T*K);
+                  for (let i = 0; i < T*K; i++) a[i] = i % E;
+                  return new Uint8Array(a.buffer);
+                })() },
+                { binding: 3, name: "routing_scores", bytes: new Uint8Array(rngF32(92, T*K, 0.5).buffer) },
+                { binding: 4, name: "w_int4", bytes: packNibbles(wNib) },
+                { binding: 5, name: "w_scales", bytes: rngF16(93, E*D*n_blocks, 1.0) },
+                { binding: 6, name: "w_zp", bytes: packZp(E*D, n_blocks, 94) },
+                { binding: 7, name: "bias", bytes: rngF16(95, E*D, 0.1) },
+              ],
+              // acc is declared atomic<u32> in WGSL (the shader uses
+              // atomicCAS on f32-bits-as-u32 to scatter-add). The bytes
+              // ARE float values; tag as f32 so the harness compares
+              // with fp tolerance — atomic commit order differs across
+              // drivers and a single-ULP drift is expected.
+              output: { binding: 8, elements: T*D, dtype: "f32" },
+              outputInitial: new Uint8Array(T*D*4),
+              dispatch: [T*K, Math.ceil(D / 64), 1],
+            };
+          },
+        },
       ];
 
       try {

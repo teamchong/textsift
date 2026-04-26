@@ -1,0 +1,46 @@
+{
+  "shader": "banded_attention",
+  "uniform": {
+    "binding": 0,
+    "byteLength": 32
+  },
+  "extraUniforms": [],
+  "inputs": [
+    {
+      "binding": 1,
+      "name": "q",
+      "byteLength": 1024
+    },
+    {
+      "binding": 2,
+      "name": "k",
+      "byteLength": 512
+    },
+    {
+      "binding": 3,
+      "name": "v",
+      "byteLength": 512
+    },
+    {
+      "binding": 4,
+      "name": "sinks",
+      "byteLength": 16
+    },
+    {
+      "binding": 5,
+      "name": "mask",
+      "byteLength": 4
+    }
+  ],
+  "output": {
+    "binding": 6,
+    "dtype": "f16",
+    "byteLength": 1024,
+    "hasInitial": false
+  },
+  "dispatch": [
+    16,
+    1,
+    1
+  ]
+}

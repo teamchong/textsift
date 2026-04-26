@@ -29,6 +29,10 @@ export type {
   Rule,
   SpanLabel,
   MarkerStrategy,
+  ColumnClassification,
+  ClassifyTableOptions,
+  RedactTableOptions,
+  RedactTableMode,
 } from "./browser/types.js";
 
 export { secretRules, RULE_PRESETS, markerPresets } from "./browser/index.js";

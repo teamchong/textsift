@@ -253,6 +253,91 @@ export interface CreateOptions {
   presets?: readonly string[];
 }
 
+/**
+ * Per-column classification result from `classifyColumns()`. One
+ * entry per column in the input table.
+ */
+export interface ColumnClassification {
+  /** Column index in the input rows (0-based). */
+  index: number;
+  /** Header name, populated when `headers` or `headerRow` is provided. */
+  header?: string;
+  /**
+   * Most frequently detected category in the sampled cells, or `null`
+   * if no spans were detected at all. For mixed-content columns this
+   * is a best-effort majority pick; the full distribution is in
+   * `labelCounts`.
+   */
+  label: SpanLabel | string | null;
+  /**
+   * Fraction (0..1) of sampled cells that contained at least one
+   * span of the chosen `label`. A confidence of 0.6 means 60% of
+   * sampled cells matched. `0` when `label === null`.
+   */
+  confidence: number;
+  /** Number of cells sampled (excludes empty / null cells). */
+  samples: number;
+  /** Full distribution of detected labels across the sampled cells. */
+  labelCounts: Readonly<Record<string, number>>;
+}
+
+/** How `redactTable()` handles cells in PII-classified columns. */
+export type RedactTableMode = "redact" | "synth" | "drop_column";
+
+/** Options for `classifyColumns()`. */
+export interface ClassifyTableOptions {
+  /**
+   * Max number of cells to sample per column. Default: 50. Sampling
+   * is deterministic — first N non-empty cells starting from the top
+   * (post-header). For wider audits, raise this; for fast first-pass
+   * checks, lower it.
+   */
+  sampleSize?: number;
+  /**
+   * Set to `true` if the first row of `rows` contains column names.
+   * Headers come back populated and that row is excluded from
+   * sampling. Default: `false`.
+   */
+  headerRow?: boolean;
+  /**
+   * Explicit header names. Takes precedence over `headerRow`. Length
+   * must match the number of columns in the first data row.
+   */
+  headers?: readonly string[];
+  /** Custom-rule list applied to each sampled cell (same as `detect()`). */
+  rules?: readonly Rule[];
+  /** Built-in rule presets to enable for sampling. */
+  presets?: readonly string[];
+  /** AbortSignal for cancelling a long classify run. */
+  signal?: AbortSignal;
+}
+
+/** Options for `redactTable()`. */
+export interface RedactTableOptions extends ClassifyTableOptions {
+  /**
+   * How to handle PII-classified columns:
+   *   - `"redact"` (default) — run `redact()` per cell to replace
+   *     spans with markers. Uses the filter's `markers` strategy.
+   *   - `"synth"` — same as redact but with `markerPresets.faker()`
+   *     applied per-cell, even if the filter wasn't constructed
+   *     with faker markers. Useful when most calls want plain
+   *     redaction but tabular dumps want synthetic-looking data.
+   *   - `"drop_column"` — omit the entire column from the output.
+   *     Output rows have fewer columns than input rows.
+   */
+  mode?: RedactTableMode;
+  /**
+   * Skip the classify step by passing pre-computed classifications.
+   * Useful when you've already classified once (for audit) and want
+   * to redact without re-sampling.
+   */
+  classifications?: readonly ColumnClassification[];
+  /** Per-cell marker strategy override (same shape as `RedactOptions.markers`). */
+  markers?: MarkerStrategy;
+  /** Per-call category allow-list (same as `RedactOptions.enabledCategories`). */
+  enabledCategories?: readonly SpanLabel[];
+}
+
 /** Per-call options passed to `redact()` / `detect()`. */
 export interface RedactOptions {
   /** Override the session's marker strategy for this call only. */

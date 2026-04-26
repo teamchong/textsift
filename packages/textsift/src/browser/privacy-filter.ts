@@ -16,12 +16,15 @@
 
 import {
   ALL_SPAN_LABELS,
+  type ClassifyTableOptions,
+  type ColumnClassification,
   type CreateOptions,
   type DetectResult,
   type DetectedSpan,
   PrivacyFilterError,
   type RedactOptions,
   type RedactResult,
+  type RedactTableOptions,
   type Rule,
   type SpanLabel,
 } from "./types.js";
@@ -35,6 +38,7 @@ import { chunkInput, mergeChunkResults, type Chunk } from "./inference/chunking.
 import { bioesToSpans } from "./inference/spans.js";
 import { applyRedaction } from "./inference/redact.js";
 import { runRules, mergeRuleSpans } from "./inference/rules.js";
+import { classifyColumns as classifyColumnsImpl, redactTable as redactTableImpl } from "./inference/table.js";
 import { resolvePresets } from "./inference/rule-presets.js";
 import {
   streamDetect,
@@ -264,6 +268,75 @@ export class PrivacyFilter {
       results.push(await this.redact(input, opts));
     }
     return results;
+  }
+
+  /**
+   * Classify each column of a tabular dataset by sampling cells and
+   * running per-cell `detect()`. Returns one entry per column with
+   * the most-frequent detected label, a confidence (fraction of
+   * sampled cells matching that label), and the full label
+   * distribution.
+   *
+   * Use case: GDPR right-to-be-forgotten audits, pre-export data
+   * checks, knowing which columns of a 50-column CSV need encryption
+   * before shipping to a vendor.
+   *
+   * ```ts
+   * const cols = await filter.classifyColumns([
+   *   ["alice@example.com", "Alice Carter", "100"],
+   *   ["bob@example.com",   "Bob Davis",    "250"],
+   * ], { sampleSize: 50, headers: ["email", "name", "amount"] });
+   * // → [
+   * //     { index: 0, header: "email",  label: "private_email",  confidence: 1.0, ... },
+   * //     { index: 1, header: "name",   label: "private_person", confidence: 1.0, ... },
+   * //     { index: 2, header: "amount", label: null,             confidence: 0,   ... },
+   * //   ]
+   * ```
+   */
+  async classifyColumns(
+    rows: readonly (readonly string[])[],
+    opts: ClassifyTableOptions = {},
+  ): Promise<ColumnClassification[]> {
+    return classifyColumnsImpl(
+      (text, callOpts) => this.detect(text, callOpts) as Promise<DetectResult>,
+      rows,
+      opts,
+    );
+  }
+
+  /**
+   * Redact a tabular dataset. Classifies columns first (or uses the
+   * `classifications` you pass to skip that step), then per-cell
+   * applies one of three modes to PII columns:
+   *
+   *   - `"redact"` (default) — replace spans with markers using the
+   *     filter's `markers` strategy, per-cell.
+   *   - `"synth"` — same but with `markerPresets.faker()` applied
+   *     across the table (so consistency holds across rows).
+   *   - `"drop_column"` — omit the column entirely from output.
+   *
+   * Output rows are fresh `string[]` arrays. Non-PII columns pass
+   * through unchanged. If `headerRow` was set, the header row is
+   * emitted first in the output.
+   *
+   * ```ts
+   * const clean = await filter.redactTable(rows, {
+   *   headerRow: true,
+   *   mode: "synth",   // realistic fakes for downstream test fixtures
+   * });
+   * ```
+   */
+  async redactTable(
+    rows: readonly (readonly string[])[],
+    opts: RedactTableOptions = {},
+  ): Promise<string[][]> {
+    return redactTableImpl(
+      (text, callOpts) => this.detect(text, callOpts) as Promise<DetectResult>,
+      (text, callOpts) => this.redact(text, callOpts) as Promise<RedactResult>,
+      this.opts.markers,
+      rows,
+      opts,
+    );
   }
 
 

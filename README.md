@@ -103,6 +103,29 @@ await filter.redact("Hi Alice, email alice@example.com, phone +1-555-0123");
 //   (so "Alice" appearing twice yields "Alice Anderson" both times)
 ```
 
+Tabular data — classify which CSV / DB columns contain PII, or redact a whole table in one call:
+
+```ts
+const rows = [
+  ["id", "name",         "email",             "amount"],
+  ["1",  "Alice Carter", "alice@example.com", "100"],
+  ["2",  "Bob Davis",    "bob@example.com",   "250"],
+];
+
+// Audit: which columns have PII?
+const cols = await filter.classifyColumns(rows, { headerRow: true });
+// → [{ index:0, label:null }, { index:1, label:"private_person", confidence:1 },
+//    { index:2, label:"private_email", confidence:1 }, { index:3, label:null }]
+
+// Pipeline: redact in one of three modes
+const safe = await filter.redactTable(rows, {
+  headerRow: true,
+  mode: "synth",   // "redact" | "synth" | "drop_column"
+});
+// mode "synth" gives you Tonic.ai-style fake-but-realistic output;
+// "drop_column" omits PII columns entirely; "redact" uses [label] markers.
+```
+
 Batch inputs, custom markers, per-category enabling — see the [API reference](https://teamchong.github.io/textsift/api/).
 
 ## Measured numbers

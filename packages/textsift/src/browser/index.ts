@@ -61,6 +61,10 @@ export type {
   MarkerStrategy,
   Rule,
   RuleSeverity,
+  ColumnClassification,
+  ClassifyTableOptions,
+  RedactTableOptions,
+  RedactTableMode,
 } from "./types.js";
 
 // Built-in rule presets. `secretRules` is the curated array; the

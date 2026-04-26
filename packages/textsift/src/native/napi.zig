@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const wgpu = @import("wgpu_init.zig");
+const metal = @import("metal_backend.zig");
 
 const c = @cImport({
     @cInclude("node_api.h");
@@ -36,6 +37,13 @@ export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) c.napi
     register(env, exports, "beginEncoder", napiBeginEncoder) catch return null;
     register(env, exports, "enqueueDispatch", napiEnqueueDispatch) catch return null;
     register(env, exports, "submitAndReadback", napiSubmitAndReadback) catch return null;
+    register(env, exports, "metalCreateBackend", napiMetalCreateBackend) catch return null;
+    register(env, exports, "metalDestroyBackend", napiMetalDestroyBackend) catch return null;
+    register(env, exports, "metalDeviceName", napiMetalDeviceName) catch return null;
+    register(env, exports, "metalCreateBuffer", napiMetalCreateBuffer) catch return null;
+    register(env, exports, "metalReleaseBuffer", napiMetalReleaseBuffer) catch return null;
+    register(env, exports, "metalReadBuffer", napiMetalReadBuffer) catch return null;
+    register(env, exports, "metalDispatchOneShot", napiMetalDispatchOneShot) catch return null;
     return exports;
 }
 
@@ -1151,6 +1159,189 @@ fn napiSubmitAndReadback(env: c.napi_env, info: c.napi_callback_info) callconv(.
         return napiThrow(env, "wgpu: submitAndReadback failed");
 
     return typed;
+}
+
+// ── Metal-direct backend ──
+
+fn napiMetalCreateBackend(env: c.napi_env, _: c.napi_callback_info) callconv(.c) c.napi_value {
+    const b = metal.createBackend() catch |err| {
+        return switch (err) {
+            metal.MetalError.DeviceCreateFailed => napiThrow(env, "metal: no MTLDevice (Apple Silicon required)"),
+            metal.MetalError.LibraryCompileFailed => napiThrow(env, "metal: MSL library compile failed (see stderr)"),
+            else => napiThrow(env, "metal: createBackend failed"),
+        };
+    };
+    var bn: c.napi_value = undefined;
+    if (c.napi_create_bigint_uint64(env, @intCast(@intFromPtr(b)), &bn) != c.napi_ok) {
+        metal.destroyBackend(b);
+        return napiThrow(env, "napi: failed to create handle bigint");
+    }
+    return bn;
+}
+
+fn napiMetalDestroyBackend(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argc: usize = 1;
+    var argv: [1]c.napi_value = undefined;
+    _ = c.napi_get_cb_info(env, info, &argc, &argv, null, null);
+    if (argc < 1) return napiThrow(env, "metalDestroyBackend(handle) requires 1 arg");
+    var raw: u64 = 0; var lossless: bool = false;
+    if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok) {
+        return napiThrow(env, "argument 0 must be BigInt handle");
+    }
+    if (raw != 0) {
+        const b: *metal.Backend = @ptrFromInt(@as(usize, @intCast(raw)));
+        metal.destroyBackend(b);
+    }
+    var u: c.napi_value = undefined;
+    _ = c.napi_get_undefined(env, &u);
+    return u;
+}
+
+fn napiMetalDeviceName(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argc: usize = 1; var argv: [1]c.napi_value = undefined;
+    _ = c.napi_get_cb_info(env, info, &argc, &argv, null, null);
+    if (argc < 1) return napiThrow(env, "metalDeviceName(handle) requires 1 arg");
+    var raw: u64 = 0; var lossless: bool = false;
+    if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok or raw == 0) {
+        return napiThrow(env, "argument 0 must be non-null BigInt");
+    }
+    const b: *metal.Backend = @ptrFromInt(@as(usize, @intCast(raw)));
+    const name = metal.deviceName(b);
+    var s: c.napi_value = undefined;
+    if (c.napi_create_string_utf8(env, name, c.NAPI_AUTO_LENGTH, &s) != c.napi_ok) {
+        return napiThrow(env, "napi: failed to create name string");
+    }
+    return s;
+}
+
+fn napiMetalCreateBuffer(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argc: usize = 2; var argv: [2]c.napi_value = undefined;
+    _ = c.napi_get_cb_info(env, info, &argc, &argv, null, null);
+    if (argc < 2) return napiThrow(env, "metalCreateBuffer(handle, bytes) requires 2 args");
+    var raw: u64 = 0; var lossless: bool = false;
+    if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok or raw == 0) {
+        return napiThrow(env, "argument 0 must be backend BigInt");
+    }
+    const b: *metal.Backend = @ptrFromInt(@as(usize, @intCast(raw)));
+    const bytes = napiGetUint8Array(env, argv[1], "argument 1 must be Uint8Array") orelse return null;
+    const buf = metal.createBuffer(b, bytes) catch return napiThrow(env, "metal: createBuffer failed");
+    var bn: c.napi_value = undefined;
+    if (c.napi_create_bigint_uint64(env, @intCast(@intFromPtr(buf)), &bn) != c.napi_ok) {
+        metal.releaseBuffer(buf);
+        return napiThrow(env, "napi: failed to create buffer handle");
+    }
+    return bn;
+}
+
+fn napiMetalReleaseBuffer(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argc: usize = 1; var argv: [1]c.napi_value = undefined;
+    _ = c.napi_get_cb_info(env, info, &argc, &argv, null, null);
+    if (argc < 1) return napiThrow(env, "metalReleaseBuffer(bufPtr) requires 1 arg");
+    var raw: u64 = 0; var lossless: bool = false;
+    _ = c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless);
+    if (raw != 0) {
+        const buf: metal.cb.TsMetalBuffer = @ptrFromInt(@as(usize, @intCast(raw)));
+        metal.releaseBuffer(buf);
+    }
+    var u: c.napi_value = undefined;
+    _ = c.napi_get_undefined(env, &u);
+    return u;
+}
+
+fn napiMetalReadBuffer(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argc: usize = 3; var argv: [3]c.napi_value = undefined;
+    _ = c.napi_get_cb_info(env, info, &argc, &argv, null, null);
+    if (argc < 3) return napiThrow(env, "metalReadBuffer(bufPtr, offset, byteLen) requires 3 args");
+    var raw: u64 = 0; var lossless: bool = false;
+    if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok or raw == 0) {
+        return napiThrow(env, "argument 0 must be non-null buffer BigInt");
+    }
+    const buf: metal.cb.TsMetalBuffer = @ptrFromInt(@as(usize, @intCast(raw)));
+    const offset = napiGetU32(env, argv[1], "argument 1 must be u32 (offset)") orelse return null;
+    const byte_len = napiGetU32(env, argv[2], "argument 2 must be u32 (byteLen)") orelse return null;
+
+    var ab: c.napi_value = undefined;
+    var data_ptr: ?*anyopaque = null;
+    if (c.napi_create_arraybuffer(env, byte_len, &data_ptr, &ab) != c.napi_ok) {
+        return napiThrow(env, "napi: alloc out ArrayBuffer failed");
+    }
+    var typed: c.napi_value = undefined;
+    if (c.napi_create_typedarray(env, c.napi_uint8_array, byte_len, ab, 0, &typed) != c.napi_ok) {
+        return napiThrow(env, "napi: alloc Uint8Array failed");
+    }
+    const out = @as([*]u8, @ptrCast(data_ptr.?))[0..byte_len];
+    metal.readBuffer(buf, offset, out);
+    return typed;
+}
+
+fn napiMetalDispatchOneShot(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argc: usize = 5; var argv: [5]c.napi_value = undefined;
+    _ = c.napi_get_cb_info(env, info, &argc, &argv, null, null);
+    if (argc < 5) return napiThrow(env, "metalDispatchOneShot(handle, name, bindings, grid, threadgroup) requires 5 args");
+
+    var raw: u64 = 0; var lossless: bool = false;
+    if (c.napi_get_value_bigint_uint64(env, argv[0], &raw, &lossless) != c.napi_ok or raw == 0) {
+        return napiThrow(env, "argument 0 must be backend BigInt");
+    }
+    const b: *metal.Backend = @ptrFromInt(@as(usize, @intCast(raw)));
+
+    const name_buf = napiGetString(env, argv[1], "argument 1 must be string (name)") orelse return null;
+    defer std.heap.c_allocator.free(name_buf);
+
+    const n = napiArrayLen(env, argv[2]) orelse return napiThrow(env, "argument 2 must be array (bindings)");
+    if (n > 16) return napiThrow(env, "too many bindings");
+    var bindings: [16]metal.Binding = undefined;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const item = napiArrayGet(env, argv[2], i) orelse return napiThrow(env, "bindings[i]");
+        const idx_v = napiNamedProperty(env, item, "index") orelse return napiThrow(env, "bindings[i].index");
+        const idx = napiGetU32(env, idx_v, "bindings[i].index") orelse return null;
+        // Either {bytes: Uint8Array} or {bufPtr: BigInt, offset?: u32}.
+        var bytes_v: c.napi_value = undefined;
+        if (c.napi_get_named_property(env, item, "bytes", &bytes_v) == c.napi_ok) {
+            var t: c.napi_valuetype = undefined;
+            if (c.napi_typeof(env, bytes_v, &t) == c.napi_ok and t != c.napi_undefined and t != c.napi_null) {
+                const bytes = napiGetUint8Array(env, bytes_v, "bindings[i].bytes") orelse return null;
+                bindings[i] = .{ .bytes = .{ .index = idx, .bytes = bytes } };
+                continue;
+            }
+        }
+        const ptr_v = napiNamedProperty(env, item, "bufPtr") orelse return napiThrow(env, "bindings[i] needs bytes or bufPtr");
+        var bufRaw: u64 = 0;
+        if (c.napi_get_value_bigint_uint64(env, ptr_v, &bufRaw, &lossless) != c.napi_ok or bufRaw == 0) {
+            return napiThrow(env, "bindings[i].bufPtr must be non-null BigInt");
+        }
+        const buf: metal.cb.TsMetalBuffer = @ptrFromInt(@as(usize, @intCast(bufRaw)));
+        var off: u32 = 0;
+        var off_v: c.napi_value = undefined;
+        if (c.napi_get_named_property(env, item, "offset", &off_v) == c.napi_ok) {
+            var t: c.napi_valuetype = undefined;
+            if (c.napi_typeof(env, off_v, &t) == c.napi_ok and t == c.napi_number) {
+                off = napiGetU32(env, off_v, "bindings[i].offset") orelse return null;
+            }
+        }
+        bindings[i] = .{ .buffer = .{ .index = idx, .buf = buf, .offset = off } };
+    }
+
+    const grid_arr = argv[3];
+    const tg_arr = argv[4];
+    const gx = napiGetU32(env, napiArrayGet(env, grid_arr, 0) orelse return napiThrow(env, "grid[0]"), "grid[0]") orelse return null;
+    const gy = napiGetU32(env, napiArrayGet(env, grid_arr, 1) orelse return napiThrow(env, "grid[1]"), "grid[1]") orelse return null;
+    const gz = napiGetU32(env, napiArrayGet(env, grid_arr, 2) orelse return napiThrow(env, "grid[2]"), "grid[2]") orelse return null;
+    const tx = napiGetU32(env, napiArrayGet(env, tg_arr, 0) orelse return napiThrow(env, "tg[0]"), "tg[0]") orelse return null;
+    const ty = napiGetU32(env, napiArrayGet(env, tg_arr, 1) orelse return napiThrow(env, "tg[1]"), "tg[1]") orelse return null;
+    const tz = napiGetU32(env, napiArrayGet(env, tg_arr, 2) orelse return napiThrow(env, "tg[2]"), "tg[2]") orelse return null;
+
+    metal.dispatchOneShot(b, name_buf, bindings[0..n], .{ gx, gy, gz }, .{ tx, ty, tz }) catch |err| {
+        return switch (err) {
+            metal.MetalError.UnknownKernel => napiThrow(env, "metal: unknown kernel name (not in shaders.metal)"),
+            metal.MetalError.PipelineCreateFailed => napiThrow(env, "metal: pipeline creation failed (see stderr)"),
+            else => napiThrow(env, "metal: dispatchOneShot failed"),
+        };
+    };
+    var u: c.napi_value = undefined;
+    _ = c.napi_get_undefined(env, &u);
+    return u;
 }
 
 fn napiBenchDispatch(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {

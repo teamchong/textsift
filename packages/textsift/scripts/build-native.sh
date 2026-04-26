@@ -46,11 +46,23 @@ case "$HOST_OS" in
   *) EXTRA_LINK="" ;;
 esac
 
+# On macOS we additionally compile the Metal Obj-C bridge so the
+# Metal-direct backend can run alongside the wgpu-native one. clang
+# (invoked by zig) handles .m files when given -fobjc-arc.
+EXTRA_SRC=()
+case "$HOST_OS" in
+  darwin)
+    EXTRA_SRC+=( -cflags -fobjc-arc -- "${PKG_ROOT}/src/native/metal/bridge.m" )
+    ;;
+esac
+
 mise exec -- zig build-lib \
   "${PKG_ROOT}/src/native/napi.zig" \
+  "${EXTRA_SRC[@]}" \
   -dynamic -lc \
   -I "$NODE_INC" \
   -I "$WGPU_DIR/include" \
+  -I "${PKG_ROOT}/src/native/metal" \
   -L "$WGPU_DIR/lib" \
   -lwgpu_native \
   -fPIC \

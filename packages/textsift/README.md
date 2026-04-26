@@ -2,7 +2,7 @@
 
 > **Personal learning project.** Treat as such — no SLA, no roadmap commitment. See the [main README](https://github.com/teamchong/textsift) for context.
 
-PII detection + redaction running [openai/privacy-filter](https://huggingface.co/openai/privacy-filter) on the user's device. Custom WGSL kernels for WebGPU and Zig+SIMD128 WASM kernels for everywhere else. **No transformers.js dependency.**
+PII detection + redaction running [openai/privacy-filter](https://huggingface.co/openai/privacy-filter) on the user's device. Per-platform GPU backends (Metal on macOS, Vulkan on Linux, Dawn on Windows, WGSL in browsers); Zig + SIMD128 WASM as the no-GPU fallback. The native BPE tokenizer is pure TS, so apps that don't already ship `@huggingface/transformers` save a multi-MB dep.
 
 ```sh
 npm install textsift

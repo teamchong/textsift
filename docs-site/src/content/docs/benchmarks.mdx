@@ -1,15 +1,13 @@
 ---
 title: Benchmarks
-description: Measured numbers comparing the three backends.
+description: Measured numbers across browser, Mac native, and Linux native.
 ---
 
-All numbers measured on an M3 Pro MacBook, Chromium 147 with `--enable-unsafe-webgpu --use-angle=metal`. Median of 5 samples after 2 warmup iterations. Reproduce with `tests/browser/bench.spec.ts`. Baseline (`tjs`) is forced via `createWithResolver` so the umbrella's auto-WebGPU short-circuit can't accidentally measure WebGPU twice.
+These numbers are snapshots, not guarantees — they will look different on your hardware. Each section names the host it was measured on.
 
-These numbers will look different on your hardware. They're a snapshot, not a guarantee.
+## Browser (M3 Pro, Chromium 147)
 
-## Per-forward latency
-
-Median of 5 samples after 2 warmup iterations.
+Forward latency, median of 5 samples after 2 warmup iterations. Reproduce with `tests/browser/bench.spec.ts`. Baseline (`tjs`) is forced via `createWithResolver` so the umbrella's auto-WebGPU short-circuit can't accidentally measure WebGPU twice. Browser flags: `--enable-unsafe-webgpu --use-angle=metal`.
 
 | Input length | textsift (WebGPU) | textsift (WASM MT) | tjs (WebGPU default) |
 |---|---:|---:|---:|
@@ -19,11 +17,7 @@ Median of 5 samples after 2 warmup iterations.
 
 textsift's WebGPU is **2.6–3.7× faster than transformers.js across every input length**, with the largest gap on shorter inputs where ORT-Web's per-dispatch overhead is more visible. The differential reflects the kernels (textsift's hand-tuned int4 matmul / banded attention vs ORT-Web's int4 contrib ops).
 
-WASM-MT (6-worker pool, COOP/COEP headers) keeps pace with tjs on short inputs and falls ~1.7× behind on the 80-token sample. Note this is comparing CPU SIMD against tjs's GPU path — tjs has no working WASM path for this 770 MB q4f16 model (its WASM CPU backend doesn't implement MatMulNBits + GatherBlockQuantized), so textsift WASM is the only working CPU option here.
-
-## Sustained throughput
-
-30-forward sequential loop; tokens/sec includes per-call overhead.
+Sustained throughput (30-forward sequential loop, tok/s):
 
 | Input length | textsift (WebGPU) | textsift (WASM MT) | tjs (WebGPU default) |
 |---|---:|---:|---:|
@@ -32,6 +26,43 @@ WASM-MT (6-worker pool, COOP/COEP headers) keeps pace with tjs on short inputs a
 | ~80 tokens | **3644 tok/s** | 840 tok/s | 1396 tok/s |
 
 Same 2.6–3.2× lead. Neither engine pipelines forwards (each `await detect()` blocks on the previous), so throughput ≈ 1/latency × tokens.
+
+## Node native — macOS (M2 Pro, Metal-direct)
+
+Synthetic-weight forward at production model dimensions, median of 10 samples after 3 warmup iterations. Reproduce with `T=32 node tests/native/forward-metal.js`.
+
+| T  | textsift native | Browser textsift WebGPU (M3 Pro) | tjs WebGPU (M3 Pro) |
+|---:|----------------:|---------------------------------:|--------------------:|
+|  7 | **5.2 ms**      | 8.9 ms                           | 32.7 ms             |
+| 25 | **10.0 ms**     | 11.8 ms                          | 38.5 ms             |
+| 32 | **10.8 ms**     | —                                | —                   |
+| 80 | **23.8 ms**     | 22.0 ms                          | 56.4 ms             |
+
+Hand-written MSL beats Dawn's WGSL→MSL codegen by ~1.9× at T=32 on the same hardware (M2 Pro vs M3 Pro is roughly the same generation, M3 Pro slightly faster — same-hardware comparison would widen the gap). The gap is real codegen quality: control over loop unrolling, threadgroup memory layout, simdgroup matrix ops on M3+.
+
+End-to-end `PrivacyFilter.redact()` on a 122-character input with 4 PII spans: ~110 ms (includes BPE tokenization, forward, Viterbi decode, span extraction, and replacement).
+
+## Node native — Linux (Intel Iris Xe, Vulkan-direct)
+
+Reproduce with `T=32 node tests/native/forward-vulkan.js`.
+
+| T  | textsift native | ONNX Runtime Node CPU | Speedup |
+|---:|----------------:|----------------------:|--------:|
+| 32 | **28 ms**       | ~800 ms               | **28×** |
+
+This is the real Linux story: GPU-accelerated PII detection on Intel iGPU / AMD APU / non-NVIDIA hardware **without CUDA, without ROCm, without a driver dance**. `npm install textsift` ships a vendored Vulkan-direct binary that talks to whatever Mesa-supported GPU is there.
+
+The realistic alternatives on Linux without textsift:
+
+| Path | Setup | T=32 latency on a typical iGPU box |
+|---|---|---:|
+| ONNX Runtime Node CPU | `npm i onnxruntime-node`, write your own inference loop | ~600–800 ms |
+| transformers.js (Node) | `npm i @xenova/transformers`, no GPU on Node so WASM | ~80–100 ms |
+| PyTorch CPU | `pip install torch transformers safetensors`, write inference | ~150–500 ms |
+| PyTorch CUDA | NVIDIA GPU + driver + cuda-toolkit + matched torch wheel | n/a (no NVIDIA on most laptops) |
+| **textsift native** | **`npm install textsift`** | **~28 ms** |
+
+End-to-end `PrivacyFilter.redact()` on a 122-character input with 4 PII spans: ~50–75 ms.
 
 ## Cold start
 

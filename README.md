@@ -2,7 +2,7 @@
 
 > **Personal learning project.** I built this to teach myself WebGPU compute shaders, Zig→WASM with SIMD intrinsics, and the o200k-style BPE tokenizer pipeline. The code works and the tests pass, but treat it as such — there's no SLA, no roadmap commitment, no team behind it. PRs and bug reports welcome; "production support" is not.
 
-PII detection and redaction that runs [openai/privacy-filter](https://huggingface.co/openai/privacy-filter) on the user's device. WebGPU when available; Zig + SIMD128 WASM otherwise. Apache 2.0.
+PII detection and redaction that runs [openai/privacy-filter](https://huggingface.co/openai/privacy-filter) on the user's device. Per-platform GPU fast paths (Metal on macOS, Vulkan on Linux, Dawn on Windows, WebGPU in browsers); Zig + SIMD128 WASM as the no-GPU fallback. Apache 2.0.
 
 [**Docs**](https://teamchong.github.io/textsift/) · [**Quickstart**](https://teamchong.github.io/textsift/quickstart/) · [**Playground**](https://teamchong.github.io/textsift/playground/) · [**API**](https://teamchong.github.io/textsift/api/)
 
@@ -18,21 +18,20 @@ npm install textsift
 // Browser / Node-via-WASM — pure WebGPU + WASM, no native binary.
 import { PrivacyFilter } from "textsift/browser";
 
-// Node native — NAPI binding (in progress, see issue #79). PrivacyFilter
-// throws today; the kernel layer is done (Metal-direct on macOS, all 15
-// kernels byte-equal vs browser, ~1.9× faster end-to-end at T=32).
+// Node native — auto-picks the platform's GPU fast path (Metal on macOS,
+// Vulkan on Linux, Dawn on Windows). Falls back to WASM if no GPU.
 import { PrivacyFilter } from "textsift";
 ```
 
-Bundlers (Vite/Webpack/esbuild/etc.) resolve `textsift/browser` and never touch the native entry. Node code that wants the fastest path resolves `textsift` and gets the native binding (once #79 lands).
+Bundlers (Vite/Webpack/esbuild/etc.) resolve `textsift/browser` and never touch the native entry. Node code resolves `textsift` and gets the platform-native binding via `optionalDependencies`.
 
 The model is OpenAI's; the value here is packaging:
 
-- A native o200k-style BPE tokenizer in pure TypeScript (no `@huggingface/transformers` runtime dependency).
-- Two custom backends — WGSL for WebGPU and Zig-compiled SIMD WASM — that produce byte-identical span output.
-- A WASM path that loads `model_q4f16.onnx` at all (ORT-Web's WASM EP doesn't, because its WASM bundle has no `MatMulNBits` / `GatherBlockQuantized` kernel).
-- Persistent OPFS caching of the 770 MB model weights, configured by default.
-- A streaming overload of `detect()` and `redact()` for AI-proxy / LLM-output-filtering use cases — pass an `AsyncIterable<string>` instead of a `string`. O(N) over a stream of N tokens, vs O(N²) for the naive "call detect after every chunk" pattern.
+- A native o200k-style BPE tokenizer in pure TypeScript. If you're not already shipping `@huggingface/transformers` for other models, that's a real bundle-size win.
+- Per-platform native GPU backends — hand-written MSL on macOS, hand-written GLSL→SPIR-V on Linux, Tint→D3D12 on Windows — plus WGSL for browser WebGPU. All produce byte-identical span output.
+- A WASM CPU path (Zig + SIMD128) that loads `model_q4f16.onnx` directly. The transformers.js / ORT-Web stack can't load this model on CPU because ORT-Web's WASM bundle lacks `MatMulNBits` / `GatherBlockQuantized` — different runtimes (onnxruntime-node, web-llm, etc.) can in principle, but no JS ecosystem alternative ships out-of-the-box.
+- Persistent OPFS caching of the 770 MB model weights in browsers (filesystem cache in Node), configured by default.
+- Streaming overloads of `detect()` and `redact()` — pass an `AsyncIterable<string>` to abort an LLM stream the moment a credit card / API key appears, render redacted text progressively as it arrives, or front a model gateway (Cloudflare Worker style) that has to forward chunk-by-chunk.
 - Custom rule engine (regex + match-fn) that merges with model spans. Built-in `"secrets"` preset covers JWT, GitHub PAT, AWS, Slack, OpenAI/Anthropic/Google/Stripe keys, and PEM private-key headers.
 
 ## Use
@@ -59,7 +58,7 @@ Detect-only:
 const { spans, containsPii } = await filter.detect(text);
 ```
 
-Streaming detect / redact (proxy use case) — same `detect()` / `redact()`, just pass an async source:
+Streaming detect / redact — abort an LLM stream when PII appears, render progressively, or proxy chunk-by-chunk. Same `detect()` / `redact()`, just pass an async source:
 
 ```ts
 async function* llmStream() {
@@ -94,9 +93,11 @@ const filter = await PrivacyFilter.create({ presets: ["secrets"] });
 
 Batch inputs, custom markers, per-category enabling — see the [API reference](https://teamchong.github.io/textsift/api/).
 
-## Measured numbers (M3 Pro, Chromium 147)
+## Measured numbers
 
-Steady-state per-forward latency, median of 5 runs:
+Per-forward latency, median of 5–10 runs, synthetic-weight bench at production model dimensions.
+
+**Browser (M3 Pro, Chromium 147):**
 
 | Input length | textsift (WebGPU) | textsift (WASM MT) | tjs (WebGPU) |
 |---|---:|---:|---:|
@@ -104,17 +105,27 @@ Steady-state per-forward latency, median of 5 runs:
 | ~25 tokens | **11.8 ms** | 44.6 ms | 38.5 ms |
 | ~80 tokens | **22.0 ms** | 95.9 ms | 56.4 ms |
 
-Sustained throughput (30-forward loop, tok/s):
+textsift WebGPU is 2.6–3.7× faster than transformers.js across every input length.
 
-| Input length | textsift (WebGPU) | textsift (WASM MT) | tjs (WebGPU) |
-|---|---:|---:|---:|
-| ~7 tokens | **801** | 249 | 249 |
-| ~25 tokens | **2068** | 558 | 644 |
-| ~80 tokens | **3644** | 840 | 1396 |
+**Node native — macOS (M2 Pro, Metal-direct):**
 
-WebGPU is 2.6–3.7× faster than transformers.js on both metrics across every input size. textsift WASM is the only working CPU option for this q4f16 model — tjs has no working WASM path because ORT-Web's WASM EP lacks the int4 contrib kernels.
+| T   | textsift native | tjs CPU equivalent |
+|----:|----------------:|-------------------:|
+|  7  | **5.2 ms**      | ~30 ms             |
+| 32  | **10.8 ms**     | ~40 ms             |
+| 80  | **23.8 ms**     | ~95 ms             |
 
-We don't claim a cold-start speedup. See [benchmarks](https://teamchong.github.io/textsift/benchmarks/) for the rationale; in short, the difference between OPFS (default here) and Cache API (default in tjs) is a storage choice, not an inference-engine one.
+Hand-written MSL beats Dawn's WGSL→MSL codegen by ~1.9× on the same hardware.
+
+**Node native — Linux (Intel Iris Xe, Vulkan-direct):**
+
+| T   | textsift native | ONNX Runtime Node CPU |
+|----:|----------------:|----------------------:|
+| 32  | **28 ms**       | ~800 ms (**28×** slower) |
+
+The Linux story is the real differentiator: GPU-accelerated PII detection on Intel iGPU / AMD APU / non-NVIDIA hardware **without CUDA, without ROCm, without driver dance**. `npm install textsift` ships a vendored Vulkan-direct binary that talks to whatever Mesa-supported GPU is there.
+
+**Cold start:** we don't claim a speedup over transformers.js. See [benchmarks](https://teamchong.github.io/textsift/benchmarks/) for the rationale; the OPFS-vs-Cache-API gap is a storage choice, not an inference-engine one.
 
 These numbers will look different on your hardware.
 
@@ -127,11 +138,17 @@ packages/
       browser/         ← public API, viterbi, chunking, redaction, native BPE tokenizer
       zig/             ← Zig kernels → WASM
       c/               ← FMA shim for relaxed_simd
-      index.ts         ← Node native entry (NAPI binding for #79)
-    scripts/           ← inline-wasm.mjs, serve-coi.py, etc.
+      native/          ← Node-native backends (Metal / Vulkan / Dawn) + NAPI bindings
+        metal/         ← Mac: Obj-C bridge + hand-written MSL kernels
+        vulkan/        ← Linux: C bridge + hand-written GLSL → SPIR-V kernels
+        dawn/          ← Windows + Linux fallback: Dawn C++ via Tint
+        shaders/       ← canonical WGSL kernels (single source of truth)
+      index.ts         ← Node native entry (auto-picks platform GPU + WASM fallback)
+    scripts/           ← inline-wasm.mjs, build-native.sh, serve-coi.py, etc.
 docs-site/             ← Astro + Starlight docs site
 tests/browser/         ← Playwright tests
-  helpers/             ← bench-only TransformersJsBackend (not shipped)
+tests/native/          ← Node native conformance + bench + integration tests
+.github/workflows/     ← test / release / bench across linux/darwin/windows
 ```
 
 ## Development

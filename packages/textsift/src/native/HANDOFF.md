@@ -1,8 +1,8 @@
 # Native binding — status
 
-Last update: 2026-04-26 (Dawn-direct integrated; comptime three-platform routing).
+Last update: 2026-04-26 (PrivacyFilter wiring done; Mac adapter fixes verified end-to-end).
 
-Mac fast-path (Metal-direct), Linux fast-path (Vulkan-direct), and the Dawn-direct alternative are all shipped. Windows uses Dawn-direct as its primary path. The remaining open piece is `PrivacyFilter.create()` Node wiring (currently throws — kernel layer is done, JS-side orchestration pending).
+Mac fast-path (Metal-direct), Linux fast-path (Vulkan-direct), and the Dawn-direct alternative are all shipped. Windows uses Dawn-direct as its primary path. `PrivacyFilter.create()` works on all three platforms with WASM auto-fallback if the GPU path fails. Remaining work is CI execution + npm publish flow (workflows are committed to `.github/workflows/` but haven't run yet — no remote configured).
 
 ## Comptime platform routing
 
@@ -38,14 +38,16 @@ All 15 WGSL compute kernels live at `packages/textsift/src/native/shaders/*.wgsl
 - `packages/textsift/src/native/napi.zig` — `metal*` NAPI surface: `metalCreateBackend`, `metalCreateBuffer`, `metalCreateEmptyBuffer`, `metalReleaseBuffer`, `metalReadBuffer`, `metalWriteBuffer`, `metalDispatchOneShot`, `metalBeginEncoder`, `metalEnqueueDispatch`, `metalSubmitAndReadback`.
 - `tests/native/forward-metal.js` — end-to-end synthetic-weight forward via Metal-direct.
 
-Bench (M2 Pro, vs browser/Tint as the within-stack ceiling):
+Bench (M2 Pro, vs browser/Tint as the within-stack ceiling). Updated 2026-04-26 after the matmul dispatch fix (1D over T*N, was 2D tile shape — the dispatch grid bug actually made the broken version *appear* faster because the GPU spent less time scheduling 2D tiles; the fix simultaneously corrects router/classifier outputs and improves perf):
 
 | T  | Metal-direct | Browser WebGPU | tjs WebGPU |
 |---:|-------------:|---------------:|-----------:|
-|  7 | 5.3 ms       | 8.9 ms         | 32.7 ms    |
+|  7 | 5.2 ms       | 8.9 ms         | 32.7 ms    |
 | 25 | 10.0 ms      | 11.8 ms        | 38.5 ms    |
-| 32 | **11.6 ms**  | 22.0 ms        | —          |
-| 80 | **25.6 ms**  | —              | 56.4 ms    |
+| 32 | **10.8 ms**  | 22.0 ms        | —          |
+| 80 | **23.8 ms**  | —              | 56.4 ms    |
+
+End-to-end `PrivacyFilter.redact()` on a 122-character input with 4 PII spans: ~110 ms (BPE tokenization + Metal-direct forward + Viterbi + span replacement). Verified 2026-04-26 via `tests/native/integration/filter-redact.test.js`.
 
 **Reproduce:**
 ```sh

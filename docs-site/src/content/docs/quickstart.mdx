@@ -15,15 +15,14 @@ One package, two entry points so browsers never bundle native code:
 // Browser / Node-via-WASM. WebGPU + Zig+SIMD128 WASM. No native binary.
 import { PrivacyFilter } from "textsift/browser";
 
-// Node native NAPI binding (issue #79 — PrivacyFilter throws today;
-// the underlying kernel layer is done. On macOS the Metal-direct
-// kernels run the forward in ~11.6 ms at T=32 vs ~22 ms in the
-// browser. Wiring the high-level PrivacyFilter through the kernel
-// layer is the remaining work.).
+// Node native — auto-picks the platform's GPU fast path (Metal on macOS,
+// Vulkan on Linux, Dawn on Windows). Falls back to WASM if no GPU is
+// available. The right per-platform .node binary is pulled in via
+// optionalDependencies at install time.
 import { PrivacyFilter } from "textsift";
 ```
 
-The rest of this page uses the browser entry.
+The examples below use the browser entry, but the API is identical for both.
 
 ## Redact
 

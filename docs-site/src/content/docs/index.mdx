@@ -26,15 +26,15 @@ This is a self-education project. I built it to teach myself WebGPU compute shad
 
 ## What this is
 
-A npm package that runs [openai/privacy-filter](https://huggingface.co/openai/privacy-filter) — a 1.5B / 50M-active MoE bidirectional token classifier for PII detection — entirely on the user's device. WebGPU when available, WASM (Zig + SIMD128) otherwise. Apache 2.0. **No transformers.js dependency.**
+A npm package that runs [openai/privacy-filter](https://huggingface.co/openai/privacy-filter) — a 1.5B / 50M-active MoE bidirectional token classifier for PII detection — entirely on the user's device. Per-platform GPU fast paths (Metal on macOS, Vulkan on Linux, Dawn on Windows, WebGPU in browsers); Zig + SIMD128 WASM as the no-GPU fallback. Apache 2.0.
 
 The model is OpenAI's; the value of this package is packaging:
 
-- A native o200k-style BPE tokenizer in pure TypeScript (no `@huggingface/transformers` runtime dependency).
-- Two custom backends — WGSL kernels for WebGPU and Zig-compiled SIMD WASM — that produce byte-identical span output.
-- A WebAssembly path that works at all on this model: ORT-Web's WASM EP (which transformers.js uses under the hood) is missing the `MatMulNBits` and `GatherBlockQuantized` kernels the int4 export needs, so `transformers.js` with `device: "wasm"` fails session creation. textsift's WASM backend is a from-scratch implementation that doesn't go through ORT-Web.
-- Persistent OPFS caching of the 770 MB model weights, configured by default.
-- Streaming overloads of `detect()` and `redact()` — pass an `AsyncIterable<string>` (LLM token stream, ReadableStream-derived iterable, etc.) instead of a `string`. `detect(stream)` yields spans as they become detectable; `redact(stream)` yields safe-to-emit redacted text fragments. O(N) total work over a stream of N tokens, vs O(N²) for the naive "call detect after every chunk" pattern.
+- A native o200k-style BPE tokenizer in pure TypeScript. If your app doesn't already ship `@huggingface/transformers` for other models, that's a real bundle-size win.
+- Per-platform native GPU backends — hand-MSL on macOS, hand-GLSL→SPIR-V on Linux, Tint→D3D12 on Windows, plus WGSL for browser WebGPU. All produce byte-identical span output.
+- A WASM CPU path (Zig + SIMD128) that loads `model_q4f16.onnx` directly. The transformers.js / ORT-Web stack can't: ORT-Web's WASM bundle has no `MatMulNBits` / `GatherBlockQuantized` kernels for int4. Other JS runtimes (`onnxruntime-node`, `web-llm`, etc.) can in principle but don't ship out-of-the-box for this model.
+- Persistent OPFS caching of the 770 MB model weights in browsers (filesystem cache in Node), configured by default.
+- Streaming overloads of `detect()` and `redact()` — pass an `AsyncIterable<string>` to abort an LLM stream the moment a credit card or API key appears, render redacted text progressively, or front a model gateway (Cloudflare-Worker style) that has to forward chunk-by-chunk.
 - Custom rule engine + built-in `"secrets"` preset (JWT, GitHub PAT, AWS, Slack, OpenAI/Anthropic/Google/Stripe keys, PEM private-key headers).
 
 ## Install
@@ -49,9 +49,8 @@ One package, two entry points so browsers never bundle native code:
 // Browser / Node-via-WASM (today)
 import { PrivacyFilter } from "textsift/browser";
 
-// Node native NAPI binding (issue #79 — PrivacyFilter throws today;
-// the underlying kernel layer is done and Metal-direct on macOS is
-// ~1.9× faster than browser at T=32. See packages/textsift/src/native/STATUS.md.)
+// Node native — auto-picks the platform's GPU fast path (Metal on
+// macOS, Vulkan on Linux, Dawn on Windows). Falls back to WASM if no GPU.
 import { PrivacyFilter } from "textsift";
 ```
 
@@ -71,7 +70,7 @@ console.log(result.redactedText);
 
 ## Measured numbers
 
-M3 Pro MacBook, Chromium 147, median of 5 forward passes after 2 warmups. Reproduce with `npx playwright test bench.spec.ts`.
+**Browser (M3 Pro, Chromium 147)** — per-forward latency, median of 5 runs:
 
 | Input length | textsift (WebGPU) | textsift (WASM MT) | tjs (WebGPU default) |
 |---|---:|---:|---:|
@@ -79,13 +78,31 @@ M3 Pro MacBook, Chromium 147, median of 5 forward passes after 2 warmups. Reprod
 | ~25 tokens | **11.8 ms** | 44.6 ms | 38.5 ms |
 | ~80 tokens | **22.0 ms** | 95.9 ms | 56.4 ms |
 
-WebGPU is 2.6–3.7× faster than transformers.js's WebGPU path on every input length. textsift WASM is the only working CPU path for this q4f16 model.
+textsift WebGPU is 2.6–3.7× faster than transformers.js across every input length.
 
-We don't claim a cold-start speedup over transformers.js. The OPFS-vs-Cache-API gap is a storage decision, not an inference-engine one. See [benchmarks](/textsift/benchmarks/) for the full breakdown.
+**Node native (M2 Pro, Metal-direct)** — synthetic-weight forward at production model dimensions:
 
-## CPU-only environments
+| T  | textsift native |
+|---:|----------------:|
+|  7 | **5.2 ms**      |
+| 32 | **10.8 ms**     |
+| 80 | **23.8 ms**     |
 
-`textsift` is the only currently-working path for `model_q4f16.onnx` outside of WebGPU. transformers.js's WASM EP can't load this model (missing `MatMulNBits` / `GatherBlockQuantized`); textsift's WASM backend is a separate implementation that runs the int4 matmul + GQA + sparse MoE in Zig-compiled SIMD128. Browsers without WebGPU, server-side Node, edge workers — all work.
+Hand-written MSL beats Dawn's WGSL→MSL codegen by ~1.9× on the same hardware.
+
+**Node native (Linux Intel Iris Xe, Vulkan-direct)** — the differentiator:
+
+| T  | textsift native | ONNX Runtime Node CPU | Speedup |
+|---:|----------------:|----------------------:|--------:|
+| 32 | **28 ms**       | ~800 ms               | **28×** |
+
+GPU-accelerated PII filtering on Intel iGPU / AMD APU / non-NVIDIA hardware **without CUDA, without ROCm, without driver dance**. `npm install textsift` ships a vendored Vulkan-direct binary that talks to whatever Mesa-supported GPU is there.
+
+**Cold start:** we don't claim a speedup over transformers.js. The OPFS-vs-Cache-API gap is a storage decision, not an inference-engine one. See [benchmarks](/textsift/benchmarks/) for the full breakdown.
+
+## CPU fallback
+
+If no GPU is available (Linux without Vulkan, Node in a sandbox, browsers without WebGPU + shader-f16), `import { PrivacyFilter } from "textsift"` automatically falls back to the WASM CPU path. textsift's WASM is a Zig + SIMD128 implementation that loads `model_q4f16.onnx` directly — `transformers.js` with `device: "wasm"` fails session creation on this model because ORT-Web is missing the int4 contrib kernels (`MatMulNBits` / `GatherBlockQuantized`), so within the standard JS-app ecosystem this is the only working CPU path. Other runtimes (e.g. `onnxruntime-node` with custom ops, `web-llm`) can in principle load it but require setup textsift doesn't.
 
 ## Caveats
 

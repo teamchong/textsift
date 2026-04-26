@@ -1,14 +1,17 @@
 ---
 title: Backends
-description: Two execution engines behind the same public API.
+description: Per-platform GPU fast paths + WASM fallback behind the same API.
 ---
 
-textsift ships two interchangeable backends. The public API (`PrivacyFilter.create`, `redact`, `detect`) is identical across both — the backend is an implementation detail picked at construction.
+textsift picks the fastest available backend at `create()` time. The public API (`PrivacyFilter.create`, `redact`, `detect`) is identical across all of them — the backend is an implementation detail.
 
-| Backend | Compute |
-|---|---|
-| `webgpu` | Custom WGSL kernels (int4 matmul, banded attention, sparse MoE). Requires `shader-f16`. |
-| `wasm` | Custom Zig + SIMD128 → WASM. Multi-thread when COOP/COEP headers set. |
+| Backend | Where it runs | Compute |
+|---|---|---|
+| `metal-direct` | macOS (Node) | Hand-written MSL kernels via Obj-C bridge |
+| `vulkan-direct` | Linux (Node) | Hand-written GLSL → SPIR-V via glslangValidator |
+| `dawn-direct` | Windows (Node) + Linux fallback | Tint → D3D12 / Vulkan via statically-linked Dawn |
+| `webgpu` | Browsers | Custom WGSL kernels (int4 matmul, banded attention, sparse MoE). Requires `shader-f16`. |
+| `wasm` | Anywhere with no GPU | Custom Zig + SIMD128 → WASM. Multi-thread when COOP/COEP headers set. |
 
 ## Backend decision tree
 
@@ -18,33 +21,41 @@ textsift ships two interchangeable backends. The public API (`PrivacyFilter.crea
               ▼
  ┌────────────────────────────────────────┐
  │ explicit backend ?                     │
- │   "webgpu" → use it                    │
- │   "wasm"   → use it                    │
+ │   "webgpu" / "wasm" → use it           │
  └────────────┬───────────────────────────┘
               │ (no explicit backend or "auto")
               ▼
- ┌────────────────────────────────────────┐
- │ navigator.gpu + shader-f16 available ? │
- └────────────┬───────────────────────────┘
-       yes    │    no
-       ▼            ▼
-   backend:"webgpu"   backend:"wasm"
+        ┌─────────────┐
+        │  Node?      │
+        └──┬────────┬─┘
+        yes│        │no
+           ▼        ▼
+   ┌─────────────┐  ┌─────────────────────────────┐
+   │ try native  │  │ navigator.gpu + shader-f16? │
+   │  (Metal /   │  └──────┬──────────────────┬───┘
+   │  Vulkan /   │     yes │              no  │
+   │  Dawn)      │         ▼                  ▼
+   │             │   backend:"webgpu"   backend:"wasm"
+   │ if fails →  │
+   │   wasm      │
+   └─────────────┘
 ```
 
 ## Compatibility
 
-| | Chromium 147 | Firefox 129 | Safari 19 | Node 22 |
-|---|:-:|:-:|:-:|:-:|
-| `webgpu` | ✅ | ⚠️ `shader-f16` preview | ⚠️ `shader-f16` preview | ❌ |
-| `wasm` | ✅ | ✅ | ✅ | ✅ |
+| | Chromium 147 | Firefox 129 | Safari 19 | Node 22 (macOS) | Node 22 (Linux) | Node 22 (Win) |
+|---|:-:|:-:|:-:|:-:|:-:|:-:|
+| `webgpu` | ✅ | ⚠️ `shader-f16` preview | ⚠️ `shader-f16` preview | — | — | — |
+| `metal-direct` | — | — | — | ✅ | — | — |
+| `vulkan-direct` | — | — | — | — | ✅ (Mesa loader) | — |
+| `dawn-direct` | — | — | — | — | ✅ fallback | ✅ |
+| `wasm` | ✅ | ✅ | ✅ | ✅ fallback | ✅ fallback | ✅ fallback |
 
-`backend: "wasm"` is the only currently-working CPU path for `model_q4f16.onnx` in browsers. transformers.js with `device: "wasm"` fails session creation because ORT-Web's WASM bundle has no implementation for the `GatherBlockQuantized` and `MatMulNBits` ONNX contrib ops the int4 export uses.
-
-For Node-native execution (no WASM, full SIMD width), the `textsift` bare-import path is reserved for the upcoming NAPI binding (issue #79). The high-level `PrivacyFilter` still throws — use `textsift/browser` for Node-via-WASM. The underlying Metal-direct kernel layer is done on macOS (all 15 kernels byte-equal vs browser, ~1.9× faster end-to-end at T=32; see `packages/textsift/src/native/STATUS.md`). Linux Vulkan-direct is the next backend.
+textsift's WASM backend is a from-scratch implementation that loads `model_q4f16.onnx` directly. Within the standard JS-app ecosystem this is the only working CPU path — `transformers.js` with `device: "wasm"` fails session creation on this model because ORT-Web has no implementations for the `GatherBlockQuantized` / `MatMulNBits` ONNX contrib ops the int4 export uses. Other runtimes (`onnxruntime-node` with custom ops, `web-llm`) can in principle run it but require setup textsift doesn't.
 
 ## Output parity
 
-Both backends produce **byte-identical spans** on the same input (`tests/browser/smoke.spec.ts` + `webgpu-smoke.spec.ts`). Logit magnitudes drift by up to ~0.2 RMS due to fp16 rounding differences accumulating across 8 transformer layers, but argmax (and hence Viterbi + span decode) is preserved.
+All backends produce **byte-identical spans** on the same input. Conformance is enforced kernel-by-kernel against the canonical browser WGSL fixtures (15/15 pass for both Metal-direct and Vulkan-direct). Logit magnitudes drift by up to ~0.2 RMS due to fp16 rounding differences accumulating across 8 transformer layers, but argmax (and hence Viterbi + span decode) is preserved.
 
 ## Switching backends at runtime
 
@@ -58,13 +69,13 @@ wasm.dispose();
 const gpu = await PrivacyFilter.create({ backend: "webgpu" });
 ```
 
-Both share the same OPFS cache for the 770 MB model — switching is a ~1-second warmup, not a full re-download.
+Both share the same model cache (OPFS in browsers, filesystem at `~/.cache/textsift/` in Node) for the 770 MB weights — switching is a ~1-second warmup, not a full re-download.
 
 ## Memory footprint
 
 | Backend | Resident memory during inference |
 |---|---|
-| `webgpu` | ~30 MB JS heap + ~800 MB GPU buffers |
+| GPU (any: webgpu / metal-direct / vulkan-direct / dawn-direct) | ~30 MB JS heap + ~800 MB GPU buffers |
 | `wasm` | ~800 MB WASM linear memory |
 
-`webgpu` is the most memory-efficient since weights live in GPU buffers and JS holds only kernel-dispatch state.
+GPU backends are the most memory-efficient since weights live in GPU buffers and JS holds only kernel-dispatch state.

@@ -673,21 +673,30 @@ pub fn dispatchMatmulF32(
     c.wgpuBufferUnmap(readback);
 }
 
-/// Run the shared `rms_norm.wgsl` kernel against caller-supplied
-/// raw bindings. Inputs/outputs are opaque byte buffers — the JS
-/// side packs/unpacks the f16 representation. This signature stays
-/// generic enough that the conformance test can hand it the bytes
-/// it loaded from the browser-dumped fixture and compare the
-/// returned bytes byte-equal (or within 1 fp16 ULP).
-pub fn dispatchRmsnorm(
-    uniform_bytes: []const u8, // 16 bytes: { T, D, eps, _pad }
-    x_bytes: []const u8, // T*D * 2 bytes (f16)
-    gamma_bytes: []const u8, // D * 2 bytes (f16)
-    output: []u8, // T*D * 2 bytes (f16)
-    dispatch_x: u32, // typically T (one workgroup per row)
-) WgpuError!void {
-    const wgsl_src = @embedFile("shaders/rms_norm.wgsl");
+pub const StorageInput = struct { binding: u32, bytes: []const u8 };
+pub const KernelOutput = struct { binding: u32, bytes: []u8 };
 
+/// Generic kernel dispatcher. Every shader port becomes a thin
+/// wrapper over this — pass the WGSL source, the uniform buffer
+/// (or empty slice if the shader has none), the storage inputs by
+/// binding index, the output binding+buffer, and the (x, y, z)
+/// workgroup count. Handles instance/device/pipeline/bind-group/
+/// dispatch/readback in one pass.
+pub fn dispatchKernel(
+    wgsl_src: []const u8,
+    uniform_bytes: []const u8,
+    uniform_binding: u32,
+    inputs: []const StorageInput,
+    output: KernelOutput,
+    /// When non-null, these bytes are uploaded to the output buffer
+    /// before dispatch — needed for kernels that read+write the same
+    /// binding (e.g. rope_apply uses qk as both input and output).
+    output_initial: ?[]const u8,
+    /// Up to N additional uniform buffers beyond the first (used by
+    /// shaders like cast_f32_to_fp16_scaled with two uniforms).
+    extra_uniforms: []const StorageInput,
+    dispatch: [3]u32,
+) WgpuError!void {
     const handles = try createInstanceAndAdapter();
     defer c.wgpuInstanceRelease(handles.instance);
     defer c.wgpuAdapterRelease(handles.adapter);
@@ -719,65 +728,156 @@ pub fn dispatchRmsnorm(
     if (pipeline == null) return WgpuError.ComputePipelineFailed;
     defer c.wgpuComputePipelineRelease(pipeline);
 
-    // ── buffers (uniform written via writeBuffer, storage via staging) ──
-    var u_desc: c.WGPUBufferDescriptor = std.mem.zeroes(c.WGPUBufferDescriptor);
-    u_desc.usage = c.WGPUBufferUsage_Uniform | c.WGPUBufferUsage_CopyDst;
-    u_desc.size = uniform_bytes.len;
-    const u_buf = c.wgpuDeviceCreateBuffer(device, &u_desc);
-    if (u_buf == null) return WgpuError.BufferCreateFailed;
-    defer c.wgpuBufferRelease(u_buf);
-    c.wgpuQueueWriteBuffer(queue, u_buf, 0, uniform_bytes.ptr, uniform_bytes.len);
+    // Uniform buffer (optional).
+    var u_buf: c.WGPUBuffer = null;
+    if (uniform_bytes.len > 0) {
+        var u_desc: c.WGPUBufferDescriptor = std.mem.zeroes(c.WGPUBufferDescriptor);
+        u_desc.usage = c.WGPUBufferUsage_Uniform | c.WGPUBufferUsage_CopyDst;
+        u_desc.size = uniform_bytes.len;
+        u_buf = c.wgpuDeviceCreateBuffer(device, &u_desc);
+        if (u_buf == null) return WgpuError.BufferCreateFailed;
+        c.wgpuQueueWriteBuffer(queue, u_buf, 0, uniform_bytes.ptr, uniform_bytes.len);
+    }
+    defer if (u_buf != null) c.wgpuBufferRelease(u_buf);
 
-    const x_buf = try uploadStorageBuffer(device, x_bytes);
-    defer c.wgpuBufferRelease(x_buf);
-    const gamma_buf = try uploadStorageBuffer(device, gamma_bytes);
-    defer c.wgpuBufferRelease(gamma_buf);
+    // Storage input buffers (each uploaded via staging copy).
+    var input_bufs: [16]c.WGPUBuffer = undefined;
+    if (inputs.len > 16) return WgpuError.BufferRangeFailed;
+    for (inputs, 0..) |input, i| {
+        input_bufs[i] = try uploadStorageBuffer(device, input.bytes);
+    }
+    defer for (input_bufs[0..inputs.len]) |buf| c.wgpuBufferRelease(buf);
 
+    // Output storage buffer. CopyDst added so we can pre-populate
+    // for in-place kernels that read+write the same binding.
     var y_desc: c.WGPUBufferDescriptor = std.mem.zeroes(c.WGPUBufferDescriptor);
-    y_desc.usage = c.WGPUBufferUsage_Storage | c.WGPUBufferUsage_CopySrc;
-    y_desc.size = output.len;
+    y_desc.usage = c.WGPUBufferUsage_Storage | c.WGPUBufferUsage_CopySrc | c.WGPUBufferUsage_CopyDst;
+    y_desc.size = output.bytes.len;
     const y_buf = c.wgpuDeviceCreateBuffer(device, &y_desc);
     if (y_buf == null) return WgpuError.BufferCreateFailed;
     defer c.wgpuBufferRelease(y_buf);
+    if (output_initial) |init_bytes| {
+        if (init_bytes.len != output.bytes.len) return WgpuError.BufferRangeFailed;
+        // Upload via staging — same pattern as the input buffers.
+        var stage_desc: c.WGPUBufferDescriptor = std.mem.zeroes(c.WGPUBufferDescriptor);
+        stage_desc.usage = c.WGPUBufferUsage_CopySrc;
+        stage_desc.size = init_bytes.len;
+        stage_desc.mappedAtCreation = 1;
+        const stage = c.wgpuDeviceCreateBuffer(device, &stage_desc);
+        if (stage == null) return WgpuError.BufferCreateFailed;
+        defer c.wgpuBufferRelease(stage);
+        const stage_ptr = c.wgpuBufferGetMappedRange(stage, 0, init_bytes.len);
+        if (stage_ptr == null) return WgpuError.BufferRangeFailed;
+        @memcpy(@as([*]u8, @ptrCast(stage_ptr))[0..init_bytes.len], init_bytes);
+        c.wgpuBufferUnmap(stage);
+        const enc0 = c.wgpuDeviceCreateCommandEncoder(device, null);
+        defer c.wgpuCommandEncoderRelease(enc0);
+        c.wgpuCommandEncoderCopyBufferToBuffer(enc0, stage, 0, y_buf, 0, init_bytes.len);
+        const cmd0 = c.wgpuCommandEncoderFinish(enc0, null);
+        defer c.wgpuCommandBufferRelease(cmd0);
+        var cmds0 = [_]c.WGPUCommandBuffer{cmd0};
+        c.wgpuQueueSubmit(queue, cmds0.len, &cmds0);
+    }
 
+    // Extra uniforms (each created + written, like the primary uniform).
+    var extra_uniform_bufs: [8]c.WGPUBuffer = undefined;
+    if (extra_uniforms.len > 8) return WgpuError.BufferRangeFailed;
+    for (extra_uniforms, 0..) |eu, i| {
+        var ed: c.WGPUBufferDescriptor = std.mem.zeroes(c.WGPUBufferDescriptor);
+        ed.usage = c.WGPUBufferUsage_Uniform | c.WGPUBufferUsage_CopyDst;
+        ed.size = eu.bytes.len;
+        const eb = c.wgpuDeviceCreateBuffer(device, &ed);
+        if (eb == null) return WgpuError.BufferCreateFailed;
+        c.wgpuQueueWriteBuffer(queue, eb, 0, eu.bytes.ptr, eu.bytes.len);
+        extra_uniform_bufs[i] = eb;
+    }
+    defer for (extra_uniform_bufs[0..extra_uniforms.len]) |buf| c.wgpuBufferRelease(buf);
+
+    // Readback buffer (host-visible).
     var read_desc: c.WGPUBufferDescriptor = std.mem.zeroes(c.WGPUBufferDescriptor);
     read_desc.usage = c.WGPUBufferUsage_MapRead | c.WGPUBufferUsage_CopyDst;
-    read_desc.size = output.len;
+    read_desc.size = output.bytes.len;
     const readback = c.wgpuDeviceCreateBuffer(device, &read_desc);
     if (readback == null) return WgpuError.BufferCreateFailed;
     defer c.wgpuBufferRelease(readback);
 
+    // Bind group: 1 (optional) uniform + N storage inputs + 1 storage output.
+    var entries: [32]c.WGPUBindGroupEntry = undefined;
+    var entry_count: usize = 0;
+    if (uniform_bytes.len > 0) {
+        entries[entry_count] = .{
+            .nextInChain = null,
+            .binding = uniform_binding,
+            .buffer = u_buf,
+            .offset = 0,
+            .size = uniform_bytes.len,
+            .sampler = null,
+            .textureView = null,
+        };
+        entry_count += 1;
+    }
+    for (extra_uniforms, 0..) |eu, i| {
+        entries[entry_count] = .{
+            .nextInChain = null,
+            .binding = eu.binding,
+            .buffer = extra_uniform_bufs[i],
+            .offset = 0,
+            .size = eu.bytes.len,
+            .sampler = null,
+            .textureView = null,
+        };
+        entry_count += 1;
+    }
+    for (inputs, 0..) |input, i| {
+        entries[entry_count] = .{
+            .nextInChain = null,
+            .binding = input.binding,
+            .buffer = input_bufs[i],
+            .offset = 0,
+            .size = input.bytes.len,
+            .sampler = null,
+            .textureView = null,
+        };
+        entry_count += 1;
+    }
+    entries[entry_count] = .{
+        .nextInChain = null,
+        .binding = output.binding,
+        .buffer = y_buf,
+        .offset = 0,
+        .size = output.bytes.len,
+        .sampler = null,
+        .textureView = null,
+    };
+    entry_count += 1;
+
     const bgl = c.wgpuComputePipelineGetBindGroupLayout(pipeline, 0);
     defer c.wgpuBindGroupLayoutRelease(bgl);
-    var entries = [_]c.WGPUBindGroupEntry{
-        .{ .nextInChain = null, .binding = 0, .buffer = u_buf, .offset = 0, .size = uniform_bytes.len, .sampler = null, .textureView = null },
-        .{ .nextInChain = null, .binding = 1, .buffer = x_buf, .offset = 0, .size = x_bytes.len, .sampler = null, .textureView = null },
-        .{ .nextInChain = null, .binding = 2, .buffer = gamma_buf, .offset = 0, .size = gamma_bytes.len, .sampler = null, .textureView = null },
-        .{ .nextInChain = null, .binding = 3, .buffer = y_buf, .offset = 0, .size = output.len, .sampler = null, .textureView = null },
-    };
     var bg_desc: c.WGPUBindGroupDescriptor = std.mem.zeroes(c.WGPUBindGroupDescriptor);
     bg_desc.layout = bgl;
-    bg_desc.entryCount = entries.len;
+    bg_desc.entryCount = entry_count;
     bg_desc.entries = &entries;
     const bg = c.wgpuDeviceCreateBindGroup(device, &bg_desc);
     if (bg == null) return WgpuError.BindGroupFailed;
     defer c.wgpuBindGroupRelease(bg);
 
+    // Encoder + dispatch + readback copy.
     const encoder = c.wgpuDeviceCreateCommandEncoder(device, null);
     defer c.wgpuCommandEncoderRelease(encoder);
     const pass = c.wgpuCommandEncoderBeginComputePass(encoder, null);
     c.wgpuComputePassEncoderSetPipeline(pass, pipeline);
     c.wgpuComputePassEncoderSetBindGroup(pass, 0, bg, 0, null);
-    c.wgpuComputePassEncoderDispatchWorkgroups(pass, dispatch_x, 1, 1);
+    c.wgpuComputePassEncoderDispatchWorkgroups(pass, dispatch[0], dispatch[1], dispatch[2]);
     c.wgpuComputePassEncoderEnd(pass);
     c.wgpuComputePassEncoderRelease(pass);
-    c.wgpuCommandEncoderCopyBufferToBuffer(encoder, y_buf, 0, readback, 0, output.len);
+    c.wgpuCommandEncoderCopyBufferToBuffer(encoder, y_buf, 0, readback, 0, output.bytes.len);
     const cmd = c.wgpuCommandEncoderFinish(encoder, null);
     defer c.wgpuCommandBufferRelease(cmd);
     var cmds = [_]c.WGPUCommandBuffer{cmd};
     c.wgpuQueueSubmit(queue, cmds.len, &cmds);
     _ = c.wgpuDevicePoll(device, 1, null);
 
+    // Map → memcpy → unmap.
     var map_state = MapState{};
     const map_cb = c.WGPUBufferMapCallbackInfo{
         .nextInChain = null,
@@ -786,7 +886,7 @@ pub fn dispatchRmsnorm(
         .userdata1 = &map_state,
         .userdata2 = null,
     };
-    _ = c.wgpuBufferMapAsync(readback, c.WGPUMapMode_Read, 0, output.len, map_cb);
+    _ = c.wgpuBufferMapAsync(readback, c.WGPUMapMode_Read, 0, output.bytes.len, map_cb);
     var spins: u32 = 0;
     while (!map_state.fired and spins < 1_000_000) : (spins += 1) {
         _ = c.wgpuDevicePoll(device, 0, null);
@@ -795,13 +895,75 @@ pub fn dispatchRmsnorm(
     if (!map_state.fired or map_state.status != c.WGPUMapAsyncStatus_Success) {
         return WgpuError.BufferMapFailed;
     }
-    const mapped = c.wgpuBufferGetMappedRange(readback, 0, output.len);
+    const mapped = c.wgpuBufferGetMappedRange(readback, 0, output.bytes.len);
     if (mapped == null) {
         c.wgpuBufferUnmap(readback);
         return WgpuError.BufferRangeFailed;
     }
-    @memcpy(output, @as([*]const u8, @ptrCast(mapped))[0..output.len]);
+    @memcpy(output.bytes, @as([*]const u8, @ptrCast(mapped))[0..output.bytes.len]);
     c.wgpuBufferUnmap(readback);
+}
+
+pub fn dispatchRmsnorm(
+    uniform_bytes: []const u8,
+    x_bytes: []const u8,
+    gamma_bytes: []const u8,
+    output: []u8,
+    dispatch_x: u32,
+) WgpuError!void {
+    return dispatchKernel(
+        @embedFile("shaders/rms_norm.wgsl"),
+        uniform_bytes,
+        0,
+        &[_]StorageInput{
+            .{ .binding = 1, .bytes = x_bytes },
+            .{ .binding = 2, .bytes = gamma_bytes },
+        },
+        .{ .binding = 3, .bytes = output },
+        null,
+        &[_]StorageInput{},
+        .{ dispatch_x, 1, 1 },
+    );
+}
+
+/// Generic shader-by-name dispatch driver. The conformance test
+/// passes the WGSL filename + raw fixture bytes; we map name → embed
+/// → call dispatchKernel. Each entry is one line — no per-shader
+/// bespoke wrapper code.
+pub fn dispatchByName(
+    name: []const u8,
+    uniform_bytes: []const u8,
+    extra_uniforms: []const StorageInput,
+    inputs: []const StorageInput,
+    output: KernelOutput,
+    output_initial: ?[]const u8,
+    dispatch: [3]u32,
+) WgpuError!void {
+    const wgsl = shaderByName(name) orelse return WgpuError.ShaderModuleFailed;
+    return dispatchKernel(wgsl, uniform_bytes, 0, inputs, output, output_initial, extra_uniforms, dispatch);
+}
+
+/// Static lookup of every embedded shader. Adding a new shader =
+/// one line below + writing the .wgsl file + adding it to the
+/// conformance harness page.
+fn shaderByName(name: []const u8) ?[]const u8 {
+    const eql = std.mem.eql;
+    if (eql(u8, name, "rms_norm")) return @embedFile("shaders/rms_norm.wgsl");
+    if (eql(u8, name, "embed_lookup_int4")) return @embedFile("shaders/embed_lookup_int4.wgsl");
+    if (eql(u8, name, "rope_apply")) return @embedFile("shaders/rope_apply.wgsl");
+    if (eql(u8, name, "matmul_int4_fp16_f16")) return @embedFile("shaders/matmul_int4_fp16_f16.wgsl");
+    if (eql(u8, name, "matmul_int4_f32_f32")) return @embedFile("shaders/matmul_int4_f32_f32.wgsl");
+    if (eql(u8, name, "banded_attention")) return @embedFile("shaders/banded_attention.wgsl");
+    if (eql(u8, name, "swiglu_clamp")) return @embedFile("shaders/swiglu_clamp.wgsl");
+    if (eql(u8, name, "router_topk")) return @embedFile("shaders/router_topk.wgsl");
+    if (eql(u8, name, "qmoe_gate_up")) return @embedFile("shaders/qmoe_gate_up.wgsl");
+    if (eql(u8, name, "qmoe_down_scatter")) return @embedFile("shaders/qmoe_down_scatter.wgsl");
+    if (eql(u8, name, "add_rmsnorm_fp16_to_f32")) return @embedFile("shaders/add_rmsnorm_fp16_to_f32.wgsl");
+    if (eql(u8, name, "cast_fp16_to_f32")) return @embedFile("shaders/cast_fp16_to_f32.wgsl");
+    if (eql(u8, name, "cast_f32_to_fp16_scaled")) return @embedFile("shaders/cast_f32_to_fp16_scaled.wgsl");
+    if (eql(u8, name, "add_fp16")) return @embedFile("shaders/add_fp16.wgsl");
+    if (eql(u8, name, "zero_f32")) return @embedFile("shaders/zero_f32.wgsl");
+    return null;
 }
 
 /// Helper: create a Storage|CopyDst buffer, upload `bytes` via a

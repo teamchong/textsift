@@ -1,5 +1,5 @@
 {
-  "shader": "rms_norm",
+  "shader": "cast_fp16_to_f32",
   "uniform": {
     "binding": 0,
     "byteLength": 16
@@ -8,18 +8,13 @@
   "inputs": [
     {
       "binding": 1,
-      "name": "x",
-      "byteLength": 1024
-    },
-    {
-      "binding": 2,
-      "name": "gamma",
-      "byteLength": 256
+      "name": "src",
+      "byteLength": 512
     }
   ],
   "output": {
-    "binding": 3,
-    "dtype": "f16",
+    "binding": 2,
+    "dtype": "f32",
     "byteLength": 1024,
     "hasInitial": false
   },

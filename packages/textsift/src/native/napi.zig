@@ -22,6 +22,7 @@ export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) c.napi
     register(env, exports, "dispatchDouble", napiDispatchDouble) catch return null;
     register(env, exports, "matmulF32", napiMatmulF32) catch return null;
     register(env, exports, "dispatchRmsnorm", napiDispatchRmsnorm) catch return null;
+    register(env, exports, "dispatchByName", napiDispatchByName) catch return null;
     return exports;
 }
 
@@ -361,6 +362,165 @@ fn napiDispatchRmsnorm(env: c.napi_env, info: c.napi_callback_info) callconv(.c)
             wgpu.WgpuError.ShaderF16Unavailable =>
                 napiThrow(env, "WebGPU adapter lacks shader-f16. Use textsift/browser instead."),
             else => napiThrow(env, "wgpu: dispatchRmsnorm failed"),
+        };
+    };
+    return out_typed;
+}
+
+fn napiGetString(env: c.napi_env, value: c.napi_value, label: [*:0]const u8) ?[]u8 {
+    var byte_len: usize = 0;
+    if (c.napi_get_value_string_utf8(env, value, null, 0, &byte_len) != c.napi_ok) {
+        _ = c.napi_throw_error(env, null, label);
+        return null;
+    }
+    // Zig allocator-managed buffer for the duration of the call.
+    const buf = std.heap.c_allocator.alloc(u8, byte_len + 1) catch {
+        _ = c.napi_throw_error(env, null, "napi: oom reading string");
+        return null;
+    };
+    var actual: usize = 0;
+    if (c.napi_get_value_string_utf8(env, value, buf.ptr, buf.len, &actual) != c.napi_ok) {
+        std.heap.c_allocator.free(buf);
+        _ = c.napi_throw_error(env, null, label);
+        return null;
+    }
+    return buf[0..actual];
+}
+
+fn napiArrayLen(env: c.napi_env, arr: c.napi_value) ?u32 {
+    var n: u32 = 0;
+    if (c.napi_get_array_length(env, arr, &n) != c.napi_ok) return null;
+    return n;
+}
+
+fn napiArrayGet(env: c.napi_env, arr: c.napi_value, i: u32) ?c.napi_value {
+    var v: c.napi_value = undefined;
+    if (c.napi_get_element(env, arr, i, &v) != c.napi_ok) return null;
+    return v;
+}
+
+fn napiNamedProperty(env: c.napi_env, obj: c.napi_value, name: [*:0]const u8) ?c.napi_value {
+    var v: c.napi_value = undefined;
+    if (c.napi_get_named_property(env, obj, name, &v) != c.napi_ok) return null;
+    return v;
+}
+
+/// Generic shader dispatch driven by name + JS-provided bindings.
+///
+/// JS signature:
+///   dispatchByName(
+///     name: string,
+///     uniformBytes: Uint8Array,                    // primary uniform (binding 0); empty if no uniform
+///     extraUniforms: Array<{binding: number, bytes: Uint8Array}>,
+///     inputs: Array<{binding: number, bytes: Uint8Array}>,
+///     output: {binding: number, byteLength: number, initial?: Uint8Array},
+///     dispatch: [number, number, number],
+///   ) → Uint8Array
+fn napiDispatchByName(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argc: usize = 6;
+    var argv: [6]c.napi_value = undefined;
+    if (c.napi_get_cb_info(env, info, &argc, &argv, null, null) != c.napi_ok) {
+        return napiThrow(env, "napi_get_cb_info failed");
+    }
+    if (argc < 6) {
+        return napiThrow(env, "dispatchByName requires six arguments");
+    }
+    const name_buf = napiGetString(env, argv[0], "argument 0 must be string (name)") orelse return null;
+    defer std.heap.c_allocator.free(name_buf);
+    const uniform_bytes = napiGetUint8Array(env, argv[1], "argument 1 must be Uint8Array (uniform)") orelse return null;
+
+    // Parse extra uniforms array.
+    const extra_n = napiArrayLen(env, argv[2]) orelse return napiThrow(env, "argument 2 must be array (extraUniforms)");
+    if (extra_n > 8) return napiThrow(env, "too many extraUniforms (max 8)");
+    var extra_storage: [8]wgpu.StorageInput = undefined;
+    var extra_buf_storage: [8][]const u8 = undefined;
+    _ = &extra_buf_storage;
+    var ei: u32 = 0;
+    while (ei < extra_n) : (ei += 1) {
+        const item = napiArrayGet(env, argv[2], ei) orelse return napiThrow(env, "extraUniforms[i] read failed");
+        const binding_v = napiNamedProperty(env, item, "binding") orelse return napiThrow(env, "extraUniforms[i].binding missing");
+        const bytes_v = napiNamedProperty(env, item, "bytes") orelse return napiThrow(env, "extraUniforms[i].bytes missing");
+        const binding = napiGetU32(env, binding_v, "extraUniforms[i].binding must be u32") orelse return null;
+        const bytes = napiGetUint8Array(env, bytes_v, "extraUniforms[i].bytes must be Uint8Array") orelse return null;
+        extra_storage[ei] = .{ .binding = binding, .bytes = bytes };
+    }
+
+    // Parse inputs array.
+    const in_n = napiArrayLen(env, argv[3]) orelse return napiThrow(env, "argument 3 must be array (inputs)");
+    if (in_n > 16) return napiThrow(env, "too many inputs (max 16)");
+    var in_storage: [16]wgpu.StorageInput = undefined;
+    var ii: u32 = 0;
+    while (ii < in_n) : (ii += 1) {
+        const item = napiArrayGet(env, argv[3], ii) orelse return napiThrow(env, "inputs[i] read failed");
+        const binding_v = napiNamedProperty(env, item, "binding") orelse return napiThrow(env, "inputs[i].binding missing");
+        const bytes_v = napiNamedProperty(env, item, "bytes") orelse return napiThrow(env, "inputs[i].bytes missing");
+        const binding = napiGetU32(env, binding_v, "inputs[i].binding must be u32") orelse return null;
+        const bytes = napiGetUint8Array(env, bytes_v, "inputs[i].bytes must be Uint8Array") orelse return null;
+        in_storage[ii] = .{ .binding = binding, .bytes = bytes };
+    }
+
+    // Parse output object: {binding, byteLength, initial?}.
+    const out_obj = argv[4];
+    const out_binding_v = napiNamedProperty(env, out_obj, "binding") orelse return napiThrow(env, "output.binding missing");
+    const out_blen_v = napiNamedProperty(env, out_obj, "byteLength") orelse return napiThrow(env, "output.byteLength missing");
+    const out_binding = napiGetU32(env, out_binding_v, "output.binding must be u32") orelse return null;
+    const out_blen = napiGetU32(env, out_blen_v, "output.byteLength must be u32") orelse return null;
+
+    // Parse optional output.initial.
+    var out_initial: ?[]const u8 = null;
+    {
+        var v: c.napi_value = undefined;
+        if (c.napi_get_named_property(env, out_obj, "initial", &v) == c.napi_ok) {
+            var t: c.napi_valuetype = undefined;
+            if (c.napi_typeof(env, v, &t) == c.napi_ok and t != c.napi_undefined and t != c.napi_null) {
+                const b = napiGetUint8Array(env, v, "output.initial must be Uint8Array") orelse return null;
+                out_initial = b;
+            }
+        }
+    }
+
+    // Parse dispatch [x, y, z].
+    const disp_arr = argv[5];
+    const dx_v = napiArrayGet(env, disp_arr, 0) orelse return napiThrow(env, "dispatch[0] missing");
+    const dy_v = napiArrayGet(env, disp_arr, 1) orelse return napiThrow(env, "dispatch[1] missing");
+    const dz_v = napiArrayGet(env, disp_arr, 2) orelse return napiThrow(env, "dispatch[2] missing");
+    const dx = napiGetU32(env, dx_v, "dispatch[0] must be u32") orelse return null;
+    const dy = napiGetU32(env, dy_v, "dispatch[1] must be u32") orelse return null;
+    const dz = napiGetU32(env, dz_v, "dispatch[2] must be u32") orelse return null;
+
+    // Allocate output Uint8Array.
+    var out_ab: c.napi_value = undefined;
+    var out_data_ptr: ?*anyopaque = null;
+    if (c.napi_create_arraybuffer(env, out_blen, &out_data_ptr, &out_ab) != c.napi_ok) {
+        return napiThrow(env, "napi: failed to allocate output ArrayBuffer");
+    }
+    var out_typed: c.napi_value = undefined;
+    if (c.napi_create_typedarray(env, c.napi_uint8_array, out_blen, out_ab, 0, &out_typed) != c.napi_ok) {
+        return napiThrow(env, "napi: failed to allocate output Uint8Array");
+    }
+    const out_slice = @as([*]u8, @ptrCast(out_data_ptr.?))[0..out_blen];
+
+    wgpu.dispatchByName(
+        name_buf,
+        uniform_bytes,
+        extra_storage[0..extra_n],
+        in_storage[0..in_n],
+        .{ .binding = out_binding, .bytes = out_slice },
+        out_initial,
+        .{ dx, dy, dz },
+    ) catch |err| {
+        return switch (err) {
+            wgpu.WgpuError.ShaderModuleFailed => napiThrow(env, "wgpu: createShaderModule failed (unknown shader name?)"),
+            wgpu.WgpuError.ComputePipelineFailed => napiThrow(env, "wgpu: createComputePipeline failed"),
+            wgpu.WgpuError.BindGroupFailed => napiThrow(env, "wgpu: createBindGroup failed"),
+            wgpu.WgpuError.BufferCreateFailed => napiThrow(env, "wgpu: createBuffer failed"),
+            wgpu.WgpuError.BufferMapFailed => napiThrow(env, "wgpu: buffer.mapAsync failed"),
+            wgpu.WgpuError.BufferRangeFailed => napiThrow(env, "wgpu: buffer range failed"),
+            wgpu.WgpuError.AdapterUnavailable =>
+                napiThrow(env, "WebGPU adapter not available on this host. Use textsift/browser instead."),
+            wgpu.WgpuError.ShaderF16Unavailable =>
+                napiThrow(env, "WebGPU adapter lacks shader-f16. Use textsift/browser instead."),
+            else => napiThrow(env, "wgpu: dispatchByName failed"),
         };
     };
     return out_typed;

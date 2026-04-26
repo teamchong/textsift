@@ -1,5 +1,5 @@
 {
-  "shader": "rms_norm",
+  "shader": "add_fp16",
   "uniform": {
     "binding": 0,
     "byteLength": 16
@@ -8,19 +8,19 @@
   "inputs": [
     {
       "binding": 1,
-      "name": "x",
-      "byteLength": 1024
+      "name": "a",
+      "byteLength": 512
     },
     {
       "binding": 2,
-      "name": "gamma",
-      "byteLength": 256
+      "name": "b",
+      "byteLength": 512
     }
   ],
   "output": {
     "binding": 3,
     "dtype": "f16",
-    "byteLength": 1024,
+    "byteLength": 512,
     "hasInitial": false
   },
   "dispatch": [

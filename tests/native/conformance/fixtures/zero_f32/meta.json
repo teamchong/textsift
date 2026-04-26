@@ -1,0 +1,20 @@
+{
+  "shader": "zero_f32",
+  "uniform": {
+    "binding": 0,
+    "byteLength": 16
+  },
+  "extraUniforms": [],
+  "inputs": [],
+  "output": {
+    "binding": 1,
+    "dtype": "u32",
+    "byteLength": 1024,
+    "hasInitial": true
+  },
+  "dispatch": [
+    4,
+    1,
+    1
+  ]
+}

@@ -1,26 +1,27 @@
 {
-  "shader": "rms_norm",
+  "shader": "cast_f32_to_fp16_scaled",
   "uniform": {
     "binding": 0,
     "byteLength": 16
   },
-  "extraUniforms": [],
-  "inputs": [
+  "extraUniforms": [
     {
       "binding": 1,
-      "name": "x",
-      "byteLength": 1024
-    },
+      "name": "scale",
+      "byteLength": 16
+    }
+  ],
+  "inputs": [
     {
       "binding": 2,
-      "name": "gamma",
-      "byteLength": 256
+      "name": "src",
+      "byteLength": 1024
     }
   ],
   "output": {
     "binding": 3,
     "dtype": "f16",
-    "byteLength": 1024,
+    "byteLength": 512,
     "hasInitial": false
   },
   "dispatch": [

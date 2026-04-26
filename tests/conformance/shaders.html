@@ -17,9 +17,6 @@
 
       import { f32_to_f16, pack_f16, unpack_f16, makeRng } from "/tests/conformance/fp16.js";
 
-      // Fetch WGSL straight from the .wgsl source files — that's the
-      // single source of truth shared with the native Zig binding
-      // (which @embedFiles the same paths). No build-step coupling.
       async function loadShader(name) {
         const r = await fetch(`/packages/textsift/src/native/shaders/${name}.wgsl`);
         if (!r.ok) throw new Error(`fetch ${name}.wgsl: ${r.status}`);
@@ -29,35 +26,117 @@
       const $out = document.getElementById("out");
       const log = (m) => { $out.textContent += "\n" + m; };
 
-      // Each entry: name, WGSL filename, dims, build-input function,
-      // bindings (in WGSL @binding order), output binding index +
-      // length (in elements).
+      // ── helpers used by the shader registry below ──
+      function dimsBuf(values) {
+        // Pack `values` (each {tag: 'u32'|'f32', value: number}) into a
+        // little-endian uniform buffer aligned to 16 bytes.
+        const buf = new ArrayBuffer(Math.max(16, ((values.length * 4 + 15) >> 4) << 4));
+        const view = new DataView(buf);
+        for (let i = 0; i < values.length; i++) {
+          if (values[i].tag === "u32") view.setUint32(i * 4, values[i].value, true);
+          else view.setFloat32(i * 4, values[i].value, true);
+        }
+        return new Uint8Array(buf);
+      }
+      function rngF32(seed, n, scale = 0.5) {
+        const rng = makeRng(seed);
+        const out = new Float32Array(n);
+        for (let i = 0; i < n; i++) out[i] = rng() * scale;
+        return out;
+      }
+      function rngF16(seed, n, scale = 0.5) {
+        return new Uint8Array(pack_f16(rngF32(seed, n, scale)).buffer);
+      }
+      function rngI32Range(seed, n, hi) {
+        const rng = makeRng(seed);
+        const out = new Int32Array(n);
+        for (let i = 0; i < n; i++) out[i] = Math.floor((rng() + 1) * 0.5 * hi) % hi;
+        return new Uint8Array(out.buffer);
+      }
+      function rngU32Range(seed, n, max) {
+        const rng = makeRng(seed);
+        const out = new Uint32Array(n);
+        for (let i = 0; i < n; i++) out[i] = Math.floor((rng() + 1) * 0.5 * max) >>> 0;
+        return new Uint8Array(out.buffer);
+      }
+
+      // Each entry produces a complete dispatch description: name,
+      // uniform buffer, input bindings, output binding, dispatch (x,y,z).
       const SHADERS = [
+        // ── element-wise ──
         {
           name: "rms_norm",
-          dims: { T: 4, D: 128, eps: 1e-6 },
-          // Returns the binding contents in @binding order. Each entry:
-          //   { dtype: "uniform"|"storage", buffer: ArrayBufferLike }
-          build({ T, D, eps }) {
-            const rng = makeRng(0xc0ffee);
-            const x = new Float32Array(T * D);
-            const gamma = new Float32Array(D);
-            for (let i = 0; i < x.length; i++) x[i] = rng() * 0.5;
-            for (let i = 0; i < gamma.length; i++) gamma[i] = 1.0 + rng() * 0.1;
-            const dimsBuf = new ArrayBuffer(16);
-            const dimsView = new DataView(dimsBuf);
-            dimsView.setUint32(0, T, true);
-            dimsView.setUint32(4, D, true);
-            dimsView.setFloat32(8, eps, true);
-            dimsView.setUint32(12, 0, true); // _pad
+          build() {
+            const T = 4, D = 128, eps = 1e-6;
             return {
-              uniform: { binding: 0, bytes: new Uint8Array(dimsBuf) },
+              uniform: { binding: 0, bytes: dimsBuf([{tag:"u32",value:T},{tag:"u32",value:D},{tag:"f32",value:eps},{tag:"u32",value:0}]) },
               inputs: [
-                { binding: 1, name: "x", bytes: new Uint8Array(pack_f16(x).buffer) },
-                { binding: 2, name: "gamma", bytes: new Uint8Array(pack_f16(gamma).buffer) },
+                { binding: 1, name: "x", bytes: rngF16(1, T*D, 0.5) },
+                { binding: 2, name: "gamma", bytes: rngF16(2, D, 1.0) },
               ],
-              output: { binding: 3, elements: T * D, dtype: "f16" },
-              dispatch: [T, 1, 1], // one workgroup per row of T
+              output: { binding: 3, elements: T*D, dtype: "f16" },
+              dispatch: [T, 1, 1],
+            };
+          },
+        },
+        {
+          name: "zero_f32",
+          build() {
+            const N = 256;
+            return {
+              uniform: { binding: 0, bytes: dimsBuf([{tag:"u32",value:N},{tag:"u32",value:0},{tag:"u32",value:0},{tag:"u32",value:0}]) },
+              inputs: [],
+              output: { binding: 1, elements: N, dtype: "u32" },
+              // The kernel zeroes the output; harness pre-fills with garbage
+              // so we know zeros came from the shader, not from buffer init.
+              outputInitial: rngU32Range(99, N, 0xffffff),
+              dispatch: [Math.ceil(N / 64), 1, 1],
+            };
+          },
+        },
+        {
+          name: "cast_fp16_to_f32",
+          build() {
+            const N = 256;
+            return {
+              uniform: { binding: 0, bytes: dimsBuf([{tag:"u32",value:N},{tag:"u32",value:0},{tag:"u32",value:0},{tag:"u32",value:0}]) },
+              inputs: [
+                { binding: 1, name: "src", bytes: rngF16(3, N, 1.0) },
+              ],
+              output: { binding: 2, elements: N, dtype: "f32" },
+              dispatch: [Math.ceil(N / 64), 1, 1],
+            };
+          },
+        },
+        {
+          name: "cast_f32_to_fp16_scaled",
+          build() {
+            const N = 256;
+            return {
+              uniform: { binding: 0, bytes: dimsBuf([{tag:"u32",value:N},{tag:"u32",value:0},{tag:"u32",value:0},{tag:"u32",value:0}]) },
+              extraUniforms: [
+                { binding: 1, name: "scale", bytes: dimsBuf([{tag:"f32",value:0.5}]) },
+              ],
+              inputs: [
+                { binding: 2, name: "src", bytes: new Uint8Array(rngF32(4, N, 2.0).buffer) },
+              ],
+              output: { binding: 3, elements: N, dtype: "f16" },
+              dispatch: [Math.ceil(N / 64), 1, 1],
+            };
+          },
+        },
+        {
+          name: "add_fp16",
+          build() {
+            const N = 256;
+            return {
+              uniform: { binding: 0, bytes: dimsBuf([{tag:"u32",value:N},{tag:"u32",value:0},{tag:"u32",value:0},{tag:"u32",value:0}]) },
+              inputs: [
+                { binding: 1, name: "a", bytes: rngF16(5, N, 0.5) },
+                { binding: 2, name: "b", bytes: rngF16(6, N, 0.5) },
+              ],
+              output: { binding: 3, elements: N, dtype: "f16" },
+              dispatch: [Math.ceil(N / 64), 1, 1],
             };
           },
         },
@@ -74,9 +153,10 @@
         for (const shader of SHADERS) {
           log(`\n[${shader.name}]`);
           const wgsl = await loadShader(shader.name);
-          const built = shader.build(shader.dims);
+          const built = shader.build();
           const elemBytes = built.output.dtype === "f16" ? 2 : 4;
           const outBytes = built.output.elements * elemBytes;
+          const extraUniforms = built.extraUniforms ?? [];
 
           const module = device.createShaderModule({ code: wgsl });
           const pipeline = device.createComputePipeline({
@@ -90,6 +170,15 @@
           });
           device.queue.writeBuffer(uBuf, 0, built.uniform.bytes);
 
+          const extraBufs = extraUniforms.map((eu) => {
+            const buf = device.createBuffer({
+              size: eu.bytes.byteLength,
+              usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+            device.queue.writeBuffer(buf, 0, eu.bytes);
+            return { ...eu, buffer: buf };
+          });
+
           const inBufs = built.inputs.map((entry) => {
             const buf = device.createBuffer({
               size: entry.bytes.byteLength,
@@ -101,8 +190,11 @@
 
           const outBuf = device.createBuffer({
             size: outBytes,
-            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
           });
+          if (built.outputInitial) {
+            device.queue.writeBuffer(outBuf, 0, built.outputInitial);
+          }
           const readback = device.createBuffer({
             size: outBytes,
             usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
@@ -110,6 +202,7 @@
 
           const bgEntries = [
             { binding: built.uniform.binding, resource: { buffer: uBuf } },
+            ...extraBufs.map((e) => ({ binding: e.binding, resource: { buffer: e.buffer } })),
             ...inBufs.map((e) => ({ binding: e.binding, resource: { buffer: e.buffer } })),
             { binding: built.output.binding, resource: { buffer: outBuf } },
           ];
@@ -132,12 +225,24 @@
           log(`  output: ${outBytes} bytes`);
 
           fixtures[shader.name] = {
-            dims: shader.dims,
-            uniform: Array.from(built.uniform.bytes),
-            inputs: built.inputs.map((e) => ({ name: e.name, bytes: Array.from(e.bytes) })),
-            output: { dtype: built.output.dtype, bytes: Array.from(outBytesView) },
+            uniform: { binding: built.uniform.binding, bytes: Array.from(built.uniform.bytes) },
+            extraUniforms: extraUniforms.map((eu) => ({
+              binding: eu.binding,
+              name: eu.name,
+              bytes: Array.from(eu.bytes),
+            })),
+            inputs: built.inputs.map((e) => ({
+              binding: e.binding,
+              name: e.name,
+              bytes: Array.from(e.bytes),
+            })),
+            output: {
+              binding: built.output.binding,
+              dtype: built.output.dtype,
+              bytes: Array.from(outBytesView),
+              initial: built.outputInitial ? Array.from(built.outputInitial) : null,
+            },
             dispatch: built.dispatch,
-            workgroupSize: [64, 1, 1], // matches the shaders we ship today
           };
         }
         window.__fixtures = fixtures;

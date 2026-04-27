@@ -424,6 +424,23 @@ export class PrivacyFilter {
         typeof navigator !== "undefined" &&
         !!(navigator as { gpu?: unknown }).gpu;
 
+      // For auto mode, also probe shader-f16: the WebGPU backend
+      // requires it, and we'd rather fall back to WASM than throw at
+      // warmup on adapters that don't expose it (software adapters,
+      // headless chromium in CI, some older Linux Mesa drivers).
+      // Explicit `backend: "webgpu"` skips the probe so warmup throws
+      // with the actual WebGPU error.
+      let webgpuUsable = hasWebGPU;
+      if (hasWebGPU && requested === "auto") {
+        try {
+          const gpu = (navigator as unknown as { gpu: { requestAdapter(): Promise<{ features: { has(name: string): boolean } } | null> } }).gpu;
+          const adapter = await gpu.requestAdapter();
+          webgpuUsable = !!adapter && adapter.features.has("shader-f16");
+        } catch {
+          webgpuUsable = false;
+        }
+      }
+
       let backend: InferenceBackend | null = null;
 
       if (requested === "auto" && this.backendResolver) {
@@ -438,7 +455,7 @@ export class PrivacyFilter {
         const chosen: "webgpu" | "wasm" =
           requested === "webgpu" ? "webgpu"
           : requested === "wasm" ? "wasm"
-          : hasWebGPU ? "webgpu"
+          : webgpuUsable ? "webgpu"
           : "wasm";
         progress?.({ stage: "compile", backend: chosen });
         backend = await selectBackend({

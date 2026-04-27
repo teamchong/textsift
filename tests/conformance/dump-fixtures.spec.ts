@@ -13,9 +13,12 @@ import { test, expect } from "@playwright/test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { skipWithoutShaderF16 } from "../browser/helpers/skip-without-shader-f16";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURES_ROOT = resolve(HERE, "../native/conformance/fixtures");
+
+test.beforeEach(skipWithoutShaderF16);
 
 test("dump shader conformance fixtures from browser WebGPU", async ({ page }) => {
   test.setTimeout(2 * 60_000);

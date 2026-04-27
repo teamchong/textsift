@@ -5,6 +5,9 @@
  */
 
 import { test, expect } from "@playwright/test";
+import { skipWithoutShaderF16 } from "./helpers/skip-without-shader-f16";
+
+test.beforeEach(skipWithoutShaderF16);
 
 test("webgpu cold-start timing breakdown", async ({ page }) => {
   test.setTimeout(5 * 60_000);

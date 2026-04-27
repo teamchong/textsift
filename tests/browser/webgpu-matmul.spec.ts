@@ -5,6 +5,9 @@
  */
 
 import { test, expect } from "@playwright/test";
+import { skipWithoutShaderF16 } from "./helpers/skip-without-shader-f16";
+
+test.beforeEach(skipWithoutShaderF16);
 
 test("webgpu matmul_int4 parity vs wasm", async ({ page }) => {
   const consoleErrors: string[] = [];

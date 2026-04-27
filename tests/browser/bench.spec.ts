@@ -11,6 +11,9 @@
  */
 
 import { test, expect } from "@playwright/test";
+import { skipWithoutShaderF16 } from "./helpers/skip-without-shader-f16";
+
+test.beforeEach(skipWithoutShaderF16);
 
 test("e2e perf bench vs transformers.js default", async ({ page }) => {
   test.setTimeout(10 * 60_000); // model downloads can be slow

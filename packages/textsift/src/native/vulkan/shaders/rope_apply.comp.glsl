@@ -40,11 +40,18 @@ void main() {
     float16_t a = qk[head_base + 2u * p];
     float16_t b = qk[head_base + 2u * p + 1u];
 
-    float16_t ac = a * c;
-    float16_t bs = b * s;
-    float16_t bc = b * c;
-    float16_t as_ = a * s;
+    // Compute the rotation in f32 and narrow once at the end. The
+    // browser fixture (Tint→SPIR-V) keeps intermediates in f32 across
+    // multiply→subtract, which matters here: `a*c - b*s` cancels when
+    // the rotation angle is small, and rounding twice at f16 (once after
+    // each multiply, once after the subtract) drifts up to ~44 ULPs vs
+    // the fixture. glslang→SPIR-V doesn't promote on its own, so we do
+    // it explicitly. Single narrowing rounding matches Tint's behaviour.
+    float ac = float(a) * float(c);
+    float bs = float(b) * float(s);
+    float bc = float(b) * float(c);
+    float as_ = float(a) * float(s);
 
-    qk[head_base + 2u * p]      = ac - bs;
-    qk[head_base + 2u * p + 1u] = bc + as_;
+    qk[head_base + 2u * p]      = float16_t(ac - bs);
+    qk[head_base + 2u * p + 1u] = float16_t(bc + as_);
 }

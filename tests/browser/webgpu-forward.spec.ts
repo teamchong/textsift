@@ -6,6 +6,9 @@
  */
 
 import { test, expect } from "@playwright/test";
+import { skipWithoutShaderF16 } from "./helpers/skip-without-shader-f16";
+
+test.beforeEach(skipWithoutShaderF16);
 
 test("webgpu forward parity vs wasm", async ({ page }) => {
   // Cold-cache run downloads ~770 MB across two backends; allow 5 min.

@@ -8,11 +8,14 @@ import { test, expect } from "@playwright/test";
 import { writeFileSync, mkdirSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { skipWithoutShaderF16 } from "../browser/helpers/skip-without-shader-f16";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OUT = resolve(HERE, "../native/conformance/fixtures/_browser-bench.json");
 
 const CHAIN_LEN = process.env.CHAIN ?? "1";
+
+test.beforeEach(skipWithoutShaderF16);
 
 test(`browser shader microbench (chain=${CHAIN_LEN})`, async ({ page }) => {
   test.setTimeout(2 * 60_000);

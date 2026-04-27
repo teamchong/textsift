@@ -62,6 +62,14 @@ jobs:
         shell: pwsh
         run: choco install -y cmake ninja
 
+      # Set up MSVC env so Zig finds the Windows SDK system libraries
+      # (d3dcompiler.lib, d3d12.lib, dxgi.lib — required by Dawn's
+      # static webgpu_dawn.lib). Sets LIB / INCLUDE / PATH for the rest
+      # of the job. Runner-only step; no-op on Linux/Mac.
+      - name: Setup MSVC env (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Cache Dawn build
         if: matrix.backend == 'dawn'
         id: dawn-cache

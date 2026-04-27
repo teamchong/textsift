@@ -86,9 +86,17 @@ case "$HOST_OS" in
     # runner — same hidden-visibility CMake flags as Linux).
     # No -lstdc++: that's a MinGW-ism. With -target windows-msvc Zig
     # links MSVC's C++ runtime (msvcprt) automatically.
+    # Explicit -lucrt -lvcruntime: Zig's `-lc` on windows-msvc pulls
+    # msvcrt.lib (the static-startup wrapper) but doesn't always pull
+    # ucrt.lib (the UCRT imports). Without it, msvcrt's vcstartup
+    # utility.obj references `__acrt_thread_attach` etc. as undefined
+    # — lld-link warns at link time, but the resulting .node segfaults
+    # at LoadLibrary because the unresolved imports fire from the DLL
+    # entry on every thread attach.
     EXTRA_LINK_ARGS=(
       "-L${PKG_ROOT}/vendor/dawn/lib"
       -lwebgpu_dawn -ld3d12 -ldxgi -ld3dcompiler
+      -lucrt -lvcruntime
     )
     # Zig's link step on Windows (msvc ABI) doesn't pick up the LIB env
     # var that vcvars64.bat / ilammy/msvc-dev-cmd populates. Translate

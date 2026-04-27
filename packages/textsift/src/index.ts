@@ -67,11 +67,10 @@ export class PrivacyFilter extends BrowserPrivacyFilter {
       offline: opts.offline,
     };
     const resolver: BackendResolver = {
-      async resolveAuto({ bundle, quantization }) {
+      async resolveAuto({ bundle }) {
         try {
           const backend = new NodeBackend({
             bundle,
-            quantization,
             device: "webgpu",
             ...loaderOverrides,
           });

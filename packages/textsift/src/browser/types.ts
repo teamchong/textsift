@@ -191,15 +191,6 @@ export interface CreateOptions {
   wasmModuleUrl?: string;
 
   /**
-   * Quantization level for the model weights. Defaults to `"int8"`, which
-   * maps to `onnx/model_q4f16.onnx` (~772 MB) — the smallest ONNX export
-   * in openai/privacy-filter that runs in a browser without OOM.  `"int4"`
-   * maps to the same file.  `"fp16"` maps to `onnx/model_fp16.onnx` (~2 GB)
-   * for maximum accuracy; only use it if memory permits.
-   */
-  quantization?: "int4" | "int8" | "fp16";
-
-  /**
    * Called during the (one-time, per-origin) model download + warmup.
    * Not called on subsequent calls that hit the OPFS cache.
    */

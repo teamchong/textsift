@@ -12,7 +12,6 @@ import type { InferenceBackend } from "./abstract.js";
 import type { LoadedModelBundle } from "../model/loader.js";
 
 export interface SelectOptions {
-  quantization: "int4" | "int8" | "fp16";
   /** Execution device for the WebGPU backend. */
   device: "auto" | "wasm" | "webgpu";
   bundle: LoadedModelBundle;
@@ -32,14 +31,12 @@ export async function selectBackend(opts: SelectOptions): Promise<InferenceBacke
     const { WebGpuBackend } = await import("./webgpu.js");
     return new WebGpuBackend({
       bundle: opts.bundle,
-      quantization: opts.quantization,
       device: opts.device,
     });
   }
   const { WasmBackend } = await import("./wasm.js");
   return new WasmBackend({
     bundle: opts.bundle,
-    quantization: opts.quantization,
     device: opts.device,
     wasmModuleUrl: opts.wasmModuleUrl,
   });

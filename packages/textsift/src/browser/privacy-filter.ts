@@ -80,7 +80,6 @@ export interface BackendResolver {
     bundle: LoadedModelBundle;
     hasWebGPU: boolean;
     isNode: boolean;
-    quantization: "int4" | "int8" | "fp16";
   }): Promise<InferenceBackend | null>;
 }
 
@@ -351,6 +350,20 @@ export class PrivacyFilter {
     this.state = { kind: "disposed" };
   }
 
+  /**
+   * Symbol.dispose support — lets callers use the TS 5.2+ `using`
+   * declaration for automatic cleanup at scope exit:
+   *
+   * ```ts
+   * using filter = await PrivacyFilter.create();
+   * await filter.redact(text);
+   * // filter.dispose() called automatically when this scope ends
+   * ```
+   */
+  [Symbol.dispose](): void {
+    this.dispose();
+  }
+
   // --------------------------------------------------------------
   // Internals
   // --------------------------------------------------------------
@@ -410,7 +423,6 @@ export class PrivacyFilter {
         !isNode &&
         typeof navigator !== "undefined" &&
         !!(navigator as { gpu?: unknown }).gpu;
-      const quantization = this.opts.quantization ?? "int8";
 
       let backend: InferenceBackend | null = null;
 
@@ -419,7 +431,6 @@ export class PrivacyFilter {
           bundle,
           hasWebGPU,
           isNode,
-          quantization,
         });
       }
 
@@ -431,7 +442,6 @@ export class PrivacyFilter {
           : "wasm";
         progress?.({ stage: "compile", backend: chosen });
         backend = await selectBackend({
-          quantization,
           device: hasWebGPU ? "webgpu" : "auto",
           bundle,
           backend: chosen,

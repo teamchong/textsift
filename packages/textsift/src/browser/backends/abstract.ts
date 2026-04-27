@@ -58,7 +58,6 @@ export interface InferenceBackend {
 /** Common constructor argument for all backend implementations. */
 export interface BackendConstructionOptions {
   bundle: LoadedModelBundle;
-  quantization: "int4" | "int8" | "fp16";
   /** Execution device hint. Custom backends may interpret this however they need; built-in backends ignore it. */
   device: "auto" | "wasm" | "webgpu";
   /**

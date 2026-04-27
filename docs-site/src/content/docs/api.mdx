@@ -18,8 +18,7 @@ static create(options?: CreateOptions): Promise<PrivacyFilter>;
 | field | type | default | notes |
 |---|---|---|---|
 | `modelSource` | `string` | HuggingFace Hub URL | Point at your own mirror (R2/S3/on-prem). |
-| `backend` | `"auto" \| "wasm" \| "webgpu"` | `"auto"` | `"auto"` picks WebGPU when available, WASM otherwise. |
-| `quantization` | `"int4" \| "int8" \| "fp16"` | `"int8"` | All three map to `model_q4f16.onnx` today. |
+| `backend` | `"auto" \| "wasm" \| "webgpu"` | `"auto"` | `"auto"` picks WebGPU when available, WASM otherwise. On Node, `"webgpu"` resolves to the platform native fast path (Metal / Vulkan / Dawn). |
 | `onProgress` | `(ev: ProgressEvent) => void` | — | Fires during download + warmup. |
 | `signal` | `AbortSignal` | — | Cancels a slow first-time load. |
 | `markers` | `MarkerStrategy` | `"[<label>]"` | Per-category replacement text. |
@@ -91,13 +90,24 @@ redactTable(
 
 Classifies columns (or uses pre-supplied `classifications`), then per-cell applies one of three modes to PII columns: `"redact"` (default — markers via the filter's `markers` strategy), `"synth"` (realistic fakes via `markerPresets.faker()` shared across the table for cross-row consistency), or `"drop_column"` (omit the column entirely).
 
-### `dispose()`
+### `dispose()` / `Symbol.dispose`
 
 ```ts
 dispose(): void;
+[Symbol.dispose](): void;
 ```
 
-Releases GPU buffers + WASM memory. Calls after dispose throw.
+Releases GPU buffers + WASM memory. Calls after dispose throw. Safe to call more than once.
+
+`Symbol.dispose` lets you use TypeScript 5.2+'s `using` declaration so cleanup happens automatically at scope exit — no manual `dispose()` call:
+
+```ts
+{
+  using filter = await PrivacyFilter.create();
+  const r = await filter.redact(text);
+  // filter.dispose() runs automatically when the block exits
+}
+```
 
 ## Types
 

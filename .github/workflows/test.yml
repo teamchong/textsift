@@ -148,16 +148,22 @@ jobs:
         run: cd packages/textsift && bun build src/index.ts --outdir dist --target node --format esm --sourcemap=external
 
       # ── Conformance (per-backend) ──
+      # Use bash on every host so stdout/stderr stream identically — pwsh's
+      # default `-command ". '{0}'"` invocation can swallow process output
+      # when the child exits non-zero before flushing.
       - name: Conformance — Vulkan-direct
         if: matrix.backend == 'vulkan'
+        shell: bash
         run: node tests/native/vulkan/conformance-all.js
 
       - name: Conformance — Dawn-direct
         if: matrix.backend == 'dawn'
+        shell: bash
         run: node tests/native/dawn/conformance-all.js
 
       - name: Conformance — Metal-direct
         if: matrix.backend == 'metal'
+        shell: bash
         run: node tests/native/metal/conformance-all.js
 
       # ── End-to-end PrivacyFilter integration test ──
@@ -170,9 +176,11 @@ jobs:
           key: textsift-model-q4f16-2026-04-26
 
       - name: Integration test — filter().redact() end-to-end (native GPU path)
+        shell: bash
         run: node tests/native/integration/filter-redact.test.js
 
       - name: Integration test — WASM fallback fires when native unavailable
+        shell: bash
         run: node tests/native/integration/filter-fallback.test.js
 
   # Browser test path — independent of the native test matrix above.

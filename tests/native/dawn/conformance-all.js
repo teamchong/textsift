@@ -10,10 +10,27 @@ import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import { f16_to_f32 } from "../../conformance/fp16.js";
 
+// Surface the actual platform/architecture/load failure on Windows
+// (where pwsh's default invocation has been swallowing late stderr)
+// so future CI runs aren't silent on .node load problems.
+process.on("uncaughtException", (e) => {
+  console.error(`[dawn-conformance] uncaught: ${e.stack ?? e}`);
+  process.exit(1);
+});
+console.error(`[dawn-conformance] node=${process.version} platform=${process.platform} arch=${process.arch}`);
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 const NATIVE_PATH = resolve(HERE, "../../../packages/textsift/dist/textsift-native.node");
 const FIXTURES_DIR = resolve(HERE, "../conformance/fixtures");
-const native = createRequire(import.meta.url)(NATIVE_PATH);
+console.error(`[dawn-conformance] loading native from: ${NATIVE_PATH}`);
+let native;
+try {
+  native = createRequire(import.meta.url)(NATIVE_PATH);
+} catch (e) {
+  console.error(`[dawn-conformance] failed to load .node: ${e.stack ?? e}`);
+  process.exit(1);
+}
+console.error(`[dawn-conformance] native loaded ok`);
 
 function readBin(file) {
   return new Uint8Array(readFileSync(file));

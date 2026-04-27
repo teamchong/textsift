@@ -32,6 +32,13 @@ const c = @cImport({
     @cInclude("node_api.h");
 });
 
+// NAPI_AUTO_LENGTH is `#define NAPI_AUTO_LENGTH SIZE_MAX` in node_api.h.
+// On Windows MSVC, translate-c can't parse SIZE_MAX (defined as
+// `0xFFFFFFFFFFFFFFFFui64` — non-standard suffix), so `NAPI_AUTO_LENGTH`
+// becomes a `@compileError`. Define our own equivalent that works on
+// every host's translate-c output.
+const NAPI_AUTO_LENGTH: usize = std.math.maxInt(usize);
+
 export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) c.napi_value {
     Metal.registerAll(env, exports) catch return null;
     Vulkan.registerAll(env, exports) catch return null;
@@ -46,7 +53,7 @@ fn register(
     cb: c.napi_callback,
 ) !void {
     var fn_value: c.napi_value = undefined;
-    if (c.napi_create_function(env, name, c.NAPI_AUTO_LENGTH, cb, null, &fn_value) != c.napi_ok) {
+    if (c.napi_create_function(env, name, NAPI_AUTO_LENGTH, cb, null, &fn_value) != c.napi_ok) {
         return error.RegisterFailed;
     }
     if (c.napi_set_named_property(env, exports, name, fn_value) != c.napi_ok) {
@@ -224,7 +231,7 @@ fn napiMetalDeviceName(env: c.napi_env, info: c.napi_callback_info) callconv(.c)
     const b: *metal.Backend = @ptrFromInt(@as(usize, @intCast(raw)));
     const name = metal.deviceName(b);
     var s: c.napi_value = undefined;
-    if (c.napi_create_string_utf8(env, name, c.NAPI_AUTO_LENGTH, &s) != c.napi_ok) {
+    if (c.napi_create_string_utf8(env, name, NAPI_AUTO_LENGTH, &s) != c.napi_ok) {
         return napiThrow(env, "napi: failed to create name string");
     }
     return s;
@@ -594,7 +601,7 @@ const Vulkan = if (is_linux) struct {
         const b: *vk.Backend = @ptrFromInt(@as(usize, @intCast(raw)));
         const name = vk.deviceName(b);
         var s: c.napi_value = undefined;
-        if (c.napi_create_string_utf8(env, name, c.NAPI_AUTO_LENGTH, &s) != c.napi_ok) {
+        if (c.napi_create_string_utf8(env, name, NAPI_AUTO_LENGTH, &s) != c.napi_ok) {
             return napiThrow(env, "napi: failed to create string");
         }
         return s;
@@ -945,7 +952,7 @@ const Dawn = if (is_windows) struct {
         const b: *dn.Backend = @ptrFromInt(@as(usize, @intCast(raw)));
         const name = dn.deviceName(b);
         var s: c.napi_value = undefined;
-        if (c.napi_create_string_utf8(env, name, c.NAPI_AUTO_LENGTH, &s) != c.napi_ok) {
+        if (c.napi_create_string_utf8(env, name, NAPI_AUTO_LENGTH, &s) != c.napi_ok) {
             return napiThrow(env, "napi: failed to create string");
         }
         return s;

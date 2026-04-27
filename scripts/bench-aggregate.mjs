@@ -28,6 +28,8 @@ console.log("# Cross-platform benchmark");
 console.log("");
 console.log("Same model (`openai/privacy-filter` model_q4f16.onnx), one runner per OS family. Lower latency = better.");
 console.log("");
+console.log("**Hardware honesty:** GitHub Actions runners rarely have real GPUs. Linux gets Mesa llvmpipe (CPU software rasterizer pretending to be Vulkan); Windows gets no D3D12 adapter at all; only macOS runners ship real silicon. Numbers below are **labelled by what actually ran**, so a llvmpipe row isn't read as if it represents Vulkan-direct on Intel iGPU. Real-hardware numbers live in `packages/textsift/src/native/HANDOFF.md`.");
+console.log("");
 console.log("**How to read these numbers:**");
 console.log("- < 16 ms feels instant (60 fps frame budget)");
 console.log("- < 50 ms feels interactive (chat tooltip threshold)");
@@ -35,39 +37,64 @@ console.log("- < 100 ms is the standard interactive UI threshold");
 console.log("- ≥ 250 ms is a user-visible delay");
 console.log("");
 
+const deviceLabel = (a) => {
+  switch (a.device_kind) {
+    case "real-gpu": return `real GPU (${a.device_name})`;
+    case "software-fallback": return `⚠️ software CPU (${a.device_name})`;
+    case "no-adapter": return "_no GPU adapter_";
+    default: return a.device_kind ?? "(unknown)";
+  }
+};
+
+// Per-runner device summary first — anyone scanning this should
+// immediately see what hardware each row's numbers came from.
+console.log("## Device per runner");
+console.log("");
+console.log(`| OS | backend | device |`);
+console.log(`|---|---|---|`);
+for (const a of all.sort((x, y) => x.os_family.localeCompare(y.os_family))) {
+  console.log(`| ${a.os_family} | ${a.backend}-direct | ${deviceLabel(a)} |`);
+}
+console.log("");
+
 // Headline: textsift native vs ORT Node CPU at T=32 — the realistic
 // "what would I use otherwise" comparison, with explicit speedup.
-const withOrt = all.filter((a) => a.ort_node_cpu_ms !== null);
-if (withOrt.length > 0) {
+// Restrict to real-GPU rows; software-fallback comparisons are CPU-vs-CPU
+// and don't represent the hand-tuned-GPU value prop.
+const headlineRows = all.filter((a) =>
+  a.ort_node_cpu_ms !== null && a.device_kind === "real-gpu"
+);
+if (headlineRows.length > 0) {
   console.log("## vs. the realistic Node baseline (ORT Node CPU, same model)");
   console.log("");
-  console.log("ORT Node CPU is what most devs reach for if they don't use textsift: `npm i onnxruntime-node` and write the loader by hand. Same model bytes, same hardware as the runner — just a different inference engine.");
+  console.log("ORT Node CPU is what most devs reach for if they don't use textsift: `npm i onnxruntime-node` and write the loader by hand. Same model bytes, same hardware as the runner — just a different inference engine. **Only real-GPU rows are shown** below; software-fallback runs on CI runners aren't a meaningful comparison.");
   console.log("");
-  console.log(`| OS | textsift native @ T=32 | ORT Node CPU @ T=32 | speedup |`);
-  console.log(`|---|---:|---:|---:|`);
-  for (const a of withOrt.sort((x, y) => x.os_family.localeCompare(y.os_family))) {
+  console.log(`| OS | device | textsift @ T=32 | ORT Node CPU @ T=32 | speedup |`);
+  console.log(`|---|---|---:|---:|---:|`);
+  for (const a of headlineRows.sort((x, y) => x.os_family.localeCompare(y.os_family))) {
     const fwd32 = a.forward.find((f) => f.T === 32);
     if (!fwd32 || a.ort_node_cpu_ms === null) continue;
     const speedup = (a.ort_node_cpu_ms / fwd32.median).toFixed(1);
-    console.log(`| ${a.os_family} (${a.backend}) | ${fwd32.median.toFixed(1)} ms | ${a.ort_node_cpu_ms.toFixed(0)} ms | **${speedup}× faster** |`);
+    console.log(`| ${a.os_family} | ${a.device_name ?? "(unknown)"} | ${fwd32.median.toFixed(1)} ms | ${a.ort_node_cpu_ms.toFixed(0)} ms | **${speedup}× faster** |`);
   }
   console.log("");
 }
 
-// Forward-pass detail table.
+// Forward-pass detail table — every row, with device kind so software
+// numbers can't be confused with real-GPU numbers.
 const Ts = [7, 25, 32, 80];
 console.log("## textsift forward latency by input size");
 console.log("");
-console.log("Pure GPU-compute time per forward (median of 10 iters). Excludes tokenization + Viterbi + redaction overhead — see the end-to-end section below for those.");
+console.log("Pure compute time per forward (median of 10 iters). Excludes tokenization + Viterbi + redaction overhead — see the end-to-end section below for those.");
 console.log("");
-console.log(`| OS | backend |${Ts.map((T) => ` T=${T} `).join("|")}|`);
-console.log(`|---|---|${Ts.map(() => "---:").join("|")}|`);
+console.log(`| OS | backend | device |${Ts.map((T) => ` T=${T} `).join("|")}|`);
+console.log(`|---|---|---|${Ts.map(() => "---:").join("|")}|`);
 for (const a of all.sort((x, y) => x.os_family.localeCompare(y.os_family))) {
   const cells = Ts.map((T) => {
     const r = a.forward.find((f) => f.T === T);
     return r ? ` ${r.median.toFixed(1)} ms ` : ` — `;
   });
-  console.log(`| ${a.os_family} | ${a.backend}-direct |${cells.join("|")}|`);
+  console.log(`| ${a.os_family} | ${a.backend}-direct | ${deviceLabel(a)} |${cells.join("|")}|`);
 }
 console.log("");
 

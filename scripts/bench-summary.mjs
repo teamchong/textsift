@@ -10,6 +10,7 @@
 import { spawnSync } from "node:child_process";
 import { writeFileSync, appendFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
+import { createRequire } from "node:module";
 
 const OS_FAMILY = process.env.OS_FAMILY || "unknown";
 const BACKEND = process.env.BACKEND || "unknown";
@@ -20,6 +21,43 @@ const FORWARD_BY_BACKEND = {
   metal: "tests/native/forward-metal.js",
   dawn: "tests/native/forward-dawn.js",
 };
+
+// Probe the GPU device name + classify it. CI runners on GitHub Actions
+// rarely have real GPUs: Linux gets Mesa llvmpipe (CPU), Windows gets
+// no D3D12 adapter, Mac gets the runner's silicon (real). Honest
+// reporting depends on telling these apart.
+function probeDevice() {
+  const NATIVE_PATH = resolve("packages/textsift/dist/textsift-native.node");
+  if (!existsSync(NATIVE_PATH)) return { name: null, kind: "missing-binary" };
+  let native;
+  try { native = createRequire(import.meta.url)(NATIVE_PATH); }
+  catch (e) { return { name: null, kind: "load-error", error: e.message }; }
+  const probes = {
+    vulkan: { create: "vulkanCreateBackend", name: "vulkanDeviceName", destroy: "vulkanDestroyBackend" },
+    metal: { create: "metalCreateBackend", name: "metalDeviceName", destroy: "metalDestroyBackend" },
+    dawn: { create: "dawnCreateBackend", name: "dawnDeviceName", destroy: "dawnDestroyBackend" },
+  };
+  const p = probes[BACKEND];
+  if (!p || typeof native[p.create] !== "function") {
+    return { name: null, kind: "no-binding-for-backend" };
+  }
+  let handle;
+  try { handle = native[p.create](); }
+  catch (e) {
+    if (/no .* adapter|createBackend failed|Vulkan loader|no Dawn/i.test(e.message)) {
+      return { name: null, kind: "no-adapter", error: e.message };
+    }
+    return { name: null, kind: "init-error", error: e.message };
+  }
+  let name = "(unknown)";
+  try { name = native[p.name](handle); } catch (_) { /* ignore */ }
+  try { native[p.destroy](handle); } catch (_) { /* ignore */ }
+  // Software-fallback patterns. llvmpipe = Mesa CPU rasterizer for Vulkan;
+  // lavapipe = name in newer Mesa; swiftshader = Google's CPU GL/Vulkan.
+  const isSoftware = /llvmpipe|lavapipe|swiftshader|software/i.test(name);
+  return { name, kind: isSoftware ? "software-fallback" : "real-gpu" };
+}
+const device = probeDevice();
 
 const forwardJs = FORWARD_BY_BACKEND[BACKEND];
 if (!forwardJs) {
@@ -99,6 +137,8 @@ const summary = {
   os_family: OS_FAMILY,
   backend: BACKEND,
   ts: new Date().toISOString(),
+  device_name: device.name,
+  device_kind: device.kind,                 // real-gpu | software-fallback | no-adapter | ...
   forward: results,
   ort_node_cpu_ms: ortMedian,
   e2e_redact_ms: e2eRedactMs,
@@ -108,6 +148,18 @@ writeFileSync("bench-results.json", JSON.stringify(summary, null, 2));
 // ── Markdown for $GITHUB_STEP_SUMMARY ──
 const lines = [];
 lines.push(`## ${OS_FAMILY} / ${BACKEND}-direct`);
+lines.push("");
+// Surface the actual silicon (or lack of it) up front so the numbers
+// are read with the right hardware context.
+if (device.kind === "real-gpu") {
+  lines.push(`**Device:** \`${device.name}\` (real GPU)`);
+} else if (device.kind === "software-fallback") {
+  lines.push(`**Device:** \`${device.name}\` — ⚠️ software CPU rasterizer (no GPU on this runner). The numbers below are NOT representative of textsift on real hardware.`);
+} else if (device.kind === "no-adapter") {
+  lines.push(`**Device:** _no compatible GPU adapter on this runner._ Forward bench skipped; e2e \`redact()\` still runs via the WASM fallback path.`);
+} else {
+  lines.push(`**Device:** _unavailable_ (${device.kind}${device.error ? `: ${device.error}` : ""})`);
+}
 lines.push("");
 lines.push(`Forward latency at T tokens (one column = how long a single \`detect()\` / \`redact()\` call's GPU compute takes for an input of T tokens). Lower is better. **Interactive UI threshold ≈ 100 ms; chat/tooltip threshold ≈ 50 ms; "feels instant" ≈ 16 ms.**`);
 lines.push("");

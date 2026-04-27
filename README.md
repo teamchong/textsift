@@ -4,9 +4,9 @@
 
 PII detection and redaction that runs [openai/privacy-filter](https://huggingface.co/openai/privacy-filter) on the user's device. Per-platform GPU fast paths (Metal on macOS, Vulkan on Linux, Dawn on Windows, WebGPU in browsers); Zig + SIMD128 WASM as the no-GPU fallback. Apache 2.0.
 
-[**Docs**](https://teamchong.github.io/textsift/) · [**Quickstart**](https://teamchong.github.io/textsift/quickstart/) · [**Playground**](https://teamchong.github.io/textsift/playground/) · [**API**](https://teamchong.github.io/textsift/api/) · [**Intro video**](https://teamchong.github.io/textsift/intro.mp4)
+[**Docs**](https://teamchong.github.io/textsift/) · [**Quickstart**](https://teamchong.github.io/textsift/quickstart/) · [**Playground**](https://teamchong.github.io/textsift/playground/) · [**API**](https://teamchong.github.io/textsift/api/) · [**Architecture deck**](https://teamchong.github.io/textsift/intro.pdf)
 
-> Architecture walkthrough — [▶ play](https://teamchong.github.io/textsift/intro.mp4)
+> Architecture walkthrough — [open the deck](https://teamchong.github.io/textsift/intro.pdf)
 
 ## What this is
 

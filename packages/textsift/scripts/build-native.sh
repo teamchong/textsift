@@ -150,7 +150,7 @@ fi
 mise exec -- zig build-lib \
   "${PKG_ROOT}/src/native/napi.zig" \
   "${EXTRA_SRC[@]}" \
-  "${ZIG_TARGET_ARGS[@]}" \
+  ${ZIG_TARGET_ARGS[@]+"${ZIG_TARGET_ARGS[@]}"} \
   -dynamic -lc \
   -I "$NODE_INC" \
   -I "${PKG_ROOT}/src/native" \

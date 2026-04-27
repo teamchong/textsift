@@ -1,14 +1,21 @@
 // Conformance test: textsift's span output for each fixture input
-// must match the PyTorch reference (committed to
+// must match the canonical ONNX reference (committed to
 // tests/conformance/pytorch/fixtures.json).
 //
-// The fixtures are produced by tests/conformance/pytorch/generate-fixtures.py
-// against `openai/privacy-filter` via HuggingFace transformers — that's the
-// canonical PyTorch path. If textsift's WASM/native backends agree with
-// those spans, the implementation is span-equivalent to PyTorch.
+// "Canonical ONNX reference" = the same `model_q4f16.onnx` file
+// textsift loads, run through ONNX Runtime, decoded with the same
+// Viterbi+biases textsift uses (loaded from the model's
+// `viterbi_calibration.json`). That removes both the precision
+// confounder (fp32 vs q4f16) and the decoder confounder (argmax vs
+// Viterbi) from the comparison; what remains is pure "does
+// textsift's reimplementation match the canonical pipeline?"
 //
-// Skip cleanly if `fixtures.json` hasn't been generated yet, so a fresh
-// clone without Python+torch installed doesn't fail this check; the
+// Fixtures are produced by tests/conformance/pytorch/generate-fixtures.py
+// (kept under that directory name for historical reasons — the script
+// no longer touches PyTorch).
+//
+// Skip cleanly if `fixtures.json` hasn't been generated yet, so a
+// fresh clone without Python installed doesn't fail this check; the
 // regenerator instructions live in tests/conformance/pytorch/README.md.
 
 import { readFileSync, existsSync } from "node:fs";
@@ -61,7 +68,7 @@ for (const fx of fixtures) {
     mismatches++;
     console.error(
       `FAIL "${text.slice(0, 50)}…"\n` +
-        `  PyTorch: ${expectedKey || "(none)"}\n` +
+        `  reference: ${expectedKey || "(none)"}\n` +
         `  textsift: ${actualKey || "(none)"}`,
     );
   }
@@ -71,8 +78,8 @@ filter.dispose();
 
 if (mismatches > 0) {
   console.error(
-    `\n${mismatches}/${fixtures.length} fixtures disagree with PyTorch reference`,
+    `\n${mismatches}/${fixtures.length} fixtures disagree with ONNX reference`,
   );
   process.exit(1);
 }
-console.log(`\n${fixtures.length}/${fixtures.length} fixtures agree with PyTorch reference`);
+console.log(`\n${fixtures.length}/${fixtures.length} fixtures agree with ONNX reference`);

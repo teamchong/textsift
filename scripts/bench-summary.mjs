@@ -57,24 +57,8 @@ for (const T of [7, 25, 32, 80]) {
   if (r) results.push(r);
 }
 
-// ORT comparison only on Linux (others lack the test harness for now).
-let ortMedian = null;
-if (OS_FAMILY === "linux") {
-  const ortPath = resolve("tests/native/bench-onnx/ort-vs-vulkan.js");
-  if (existsSync(ortPath)) {
-    const out = spawnSync("node", [ortPath], {
-      env: { ...process.env, T: "32", ITERS: "10", WARMUP: "3" },
-      encoding: "utf8",
-      timeout: 10 * 60 * 1000,
-    });
-    if (out.status === 0) {
-      const m = out.stdout.match(/ONNX Runtime Node \(CPU\):\s+([\d.]+)\s+ms/);
-      if (m) ortMedian = Number(m[1]);
-    }
-  }
-}
-
-// End-to-end PrivacyFilter integration latency.
+// End-to-end PrivacyFilter integration latency. Runs first because it
+// populates the model cache that the ORT baseline reads from.
 let e2eRedactMs = null;
 const integ = spawnSync("node", ["tests/native/integration/filter-redact.test.js"], {
   encoding: "utf8",
@@ -83,6 +67,31 @@ const integ = spawnSync("node", ["tests/native/integration/filter-redact.test.js
 if (integ.status === 0) {
   const m = integ.stdout.match(/redact\(\) = ([\d.]+) ms/);
   if (m) e2eRedactMs = Number(m[1]);
+}
+
+// ORT baseline runs on every OS — same model bytes, same hardware,
+// different inference engine. The realistic comparison: "what would
+// I get if I just `npm i onnxruntime-node` and wrote the loader
+// myself?" — across Linux/Mac/Windows.
+let ortMedian = null;
+{
+  const ortPath = resolve("tests/native/bench-onnx/ort-baseline.js");
+  if (existsSync(ortPath)) {
+    const out = spawnSync("node", [ortPath], {
+      env: { ...process.env, T: "32", ITERS: "10", WARMUP: "3" },
+      encoding: "utf8",
+      timeout: 10 * 60 * 1000,
+    });
+    if (out.status === 0) {
+      const m = out.stdout.match(/ORT_BASELINE_RESULT\s+(\{[^}]+\})/);
+      if (m) {
+        try { ortMedian = JSON.parse(m[1]).median_ms ?? null; }
+        catch { /* ignore parse errors */ }
+      }
+    } else if (out.stderr) {
+      console.error(`[bench-summary] ort-baseline failed:\n${out.stderr}`);
+    }
+  }
 }
 
 // ── Write JSON for aggregation ──
@@ -100,24 +109,48 @@ writeFileSync("bench-results.json", JSON.stringify(summary, null, 2));
 const lines = [];
 lines.push(`## ${OS_FAMILY} / ${BACKEND}-direct`);
 lines.push("");
+lines.push(`Forward latency at T tokens (one column = how long a single \`detect()\` / \`redact()\` call's GPU compute takes for an input of T tokens). Lower is better. **Interactive UI threshold ≈ 100 ms; chat/tooltip threshold ≈ 50 ms; "feels instant" ≈ 16 ms.**`);
+lines.push("");
+
+const fwd32 = results.find((r) => r.T === 32);
+const ortRatio = (ortMedian !== null && fwd32) ? (ortMedian / fwd32.median) : null;
+
+lines.push(`| T | textsift (${BACKEND}-direct) | ORT Node CPU baseline | speedup |`);
+lines.push(`|---:|---:|---:|---:|`);
+for (const r of results) {
+  // ORT was only measured at T=32; show "—" otherwise rather than
+  // pretending we have a per-T baseline.
+  const ortCell = (r.T === 32 && ortMedian !== null) ? `${ortMedian.toFixed(0)} ms` : "—";
+  const speedupCell = (r.T === 32 && ortRatio !== null) ? `**${ortRatio.toFixed(1)}× faster**` : "—";
+  lines.push(`| ${r.T} | ${r.median.toFixed(1)} ms | ${ortCell} | ${speedupCell} |`);
+}
+lines.push("");
+
+if (ortMedian !== null && fwd32) {
+  lines.push(`**Interpretation (T=32):** textsift native is ${ortRatio.toFixed(1)}× faster than the realistic Node.js alternative on the same hardware. ORT Node CPU is what most devs reach for first via \`npm i onnxruntime-node\` + a hand-rolled loader.`);
+  lines.push("");
+}
+
+if (e2eRedactMs !== null) {
+  const e2eClass = e2eRedactMs < 50 ? "feels instant"
+    : e2eRedactMs < 100 ? "interactive"
+    : e2eRedactMs < 250 ? "noticeable but acceptable"
+    : "user-visible delay";
+  lines.push(`**End-to-end \`PrivacyFilter.redact()\`:** ${e2eRedactMs.toFixed(1)} ms (${e2eClass}) — 122-char input with 4 PII spans, includes BPE tokenization + forward + Viterbi + span replacement.`);
+  lines.push("");
+}
+
+lines.push(`<details><summary>Raw min/median per T</summary>`);
+lines.push("");
 lines.push(`| T | median | min |`);
 lines.push(`|---:|---:|---:|`);
 for (const r of results) {
   lines.push(`| ${r.T} | ${r.median.toFixed(1)} ms | ${r.min.toFixed(1)} ms |`);
 }
 lines.push("");
-if (ortMedian !== null) {
-  const fwd32 = results.find((r) => r.T === 32);
-  if (fwd32) {
-    const speedup = (ortMedian / fwd32.median).toFixed(1);
-    lines.push(`**ORT Node CPU (T=32):** ${ortMedian.toFixed(1)} ms — textsift native is **${speedup}× faster**`);
-    lines.push("");
-  }
-}
-if (e2eRedactMs !== null) {
-  lines.push(`**End-to-end \`PrivacyFilter.redact()\`:** ${e2eRedactMs.toFixed(1)} ms (122-char input, 4 PII spans)`);
-  lines.push("");
-}
+lines.push(`</details>`);
+lines.push("");
+
 appendFileSync(GITHUB_STEP_SUMMARY, lines.join("\n") + "\n");
 
 console.log(lines.join("\n"));

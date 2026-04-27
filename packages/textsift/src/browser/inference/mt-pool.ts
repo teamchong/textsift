@@ -78,7 +78,15 @@ const KERNEL_ID = new Map<string, number>(
 // integer-representable, scalar f32 args (eps, scale) round-trip
 // losslessly enough for our kernels' tolerance.
 const MAX_ARGS = 20;
-const MAX_CALLS = 256;
+// Per-worker call cap for one MtPool.run() batch. Each forward pass
+// of the MoE expert layer issues up to 5 kernels (gather → gate_up →
+// swiglu → down → scatter_add) per active expert; with 64 experts a
+// single worker can hit ~300 calls when routing is skewed. Streaming
+// workloads (`redact-stream`, `rules`, `stream`) drove the previous
+// 256 cap into the wall — bump to 512 to absorb worst-case routing
+// without per-batch splitting. Memory cost: 1 + 512 * (2 + 20) =
+// 11265 f64 ≈ 88 KB per worker slot (was ~44 KB).
+const MAX_CALLS = 512;
 const HEADER_F64S = 1;
 const PER_CALL_F64S = 2 + MAX_ARGS;
 const SLOT_F64S = HEADER_F64S + MAX_CALLS * PER_CALL_F64S;

@@ -4,7 +4,9 @@
 
 PII detection and redaction that runs [openai/privacy-filter](https://huggingface.co/openai/privacy-filter) on the user's device. Per-platform GPU fast paths (Metal on macOS, Vulkan on Linux, Dawn on Windows, WebGPU in browsers); Zig + SIMD128 WASM as the no-GPU fallback. Apache 2.0.
 
-[**Docs**](https://teamchong.github.io/textsift/) · [**Quickstart**](https://teamchong.github.io/textsift/quickstart/) · [**Playground**](https://teamchong.github.io/textsift/playground/) · [**API**](https://teamchong.github.io/textsift/api/)
+[**Docs**](https://teamchong.github.io/textsift/) · [**Quickstart**](https://teamchong.github.io/textsift/quickstart/) · [**Playground**](https://teamchong.github.io/textsift/playground/) · [**API**](https://teamchong.github.io/textsift/api/) · [**Intro video**](https://teamchong.github.io/textsift/intro.mp4)
+
+> 4-minute architecture walkthrough — [▶ play](https://teamchong.github.io/textsift/intro.mp4)
 
 ## What this is
 
@@ -47,7 +49,7 @@ repos:
 # Or as a GitHub Action — block PRs that introduce PII; findings
 # show up inline + in the repo's Security tab via SARIF.
 # .github/workflows/pii.yml
-- uses: teamchong/textsift@v1
+- uses: teamchong/textsift@v0.1.0
   with:
     sarif-output: textsift.sarif
 - uses: github/codeql-action/upload-sarif@v3
@@ -181,7 +183,7 @@ textsift WebGPU is 2.6–3.7× faster than transformers.js across every input le
 | 32  | **10.8 ms**     | ~40 ms             |
 | 80  | **23.8 ms**     | ~95 ms             |
 
-Hand-written MSL beats Dawn's WGSL→MSL codegen by ~1.9× on the same hardware.
+Hand-written MSL beats Tint's WGSL→MSL codegen by ~1.9× on the same hardware.
 
 **Node native — Linux (Intel Iris Xe, Vulkan-direct):**
 
@@ -207,7 +209,7 @@ packages/
       native/          ← Node-native backends (Metal / Vulkan / Dawn) + NAPI bindings
         metal/         ← Mac: Obj-C bridge + hand-written MSL kernels
         vulkan/        ← Linux: C bridge + hand-written GLSL → SPIR-V kernels
-        dawn/          ← Windows + Linux fallback: Dawn C++ via Tint
+        dawn/          ← Windows: Dawn C++ via Tint
         shaders/       ← canonical WGSL kernels (single source of truth)
       index.ts         ← Node native entry (auto-picks platform GPU + WASM fallback)
     scripts/           ← inline-wasm.mjs, build-native.sh, serve-coi.py, etc.

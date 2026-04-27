@@ -84,9 +84,11 @@ case "$HOST_OS" in
     # Windows system libs Dawn references (d3d12, dxgi, d3dcompiler).
     # See vendor/dawn/lib/webgpu_dawn.lib (built on the Windows CI
     # runner — same hidden-visibility CMake flags as Linux).
+    # No -lstdc++: that's a MinGW-ism. With -target windows-msvc Zig
+    # links MSVC's C++ runtime (msvcprt) automatically.
     EXTRA_LINK_ARGS=(
       "-L${PKG_ROOT}/vendor/dawn/lib"
-      -lwebgpu_dawn -ld3d12 -ldxgi -ld3dcompiler -lstdc++
+      -lwebgpu_dawn -ld3d12 -ldxgi -ld3dcompiler
     )
     # Zig's link step on Windows (msvc ABI) doesn't pick up the LIB env
     # var that vcvars64.bat / ilammy/msvc-dev-cmd populates. Translate
@@ -134,9 +136,21 @@ case "$HOST_OS" in
     ;;
 esac
 
+# On Windows, target MSVC ABI explicitly. Zig's default
+# `native-native` resolves to `windows-gnu` (MinGW) — but Dawn's
+# webgpu_dawn.lib is built with MSVC ABI (clang on Windows defaults
+# to MSVC). Mixing them produces duplicate-symbol link errors on
+# Control Flow Guard intrinsics (libmingw32 vs msvcrt). Forcing
+# `windows-msvc` makes Zig link MSVC's C runtime exclusively.
+ZIG_TARGET_ARGS=()
+if [[ "$HOST_OS" == "windows" ]]; then
+  ZIG_TARGET_ARGS=( -target "${HOST_ARCH}-windows-msvc" )
+fi
+
 mise exec -- zig build-lib \
   "${PKG_ROOT}/src/native/napi.zig" \
   "${EXTRA_SRC[@]}" \
+  "${ZIG_TARGET_ARGS[@]}" \
   -dynamic -lc \
   -I "$NODE_INC" \
   -I "${PKG_ROOT}/src/native" \

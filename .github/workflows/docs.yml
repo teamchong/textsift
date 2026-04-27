@@ -3,7 +3,16 @@ name: Deploy Docs
 on:
   push:
     branches: [main]
-    paths: [docs-site/**, .github/workflows/docs.yml]
+    # Browser bundle (and its WASM/TS sources) feeds the playground
+    # via the textsift/browser alias; rebuild docs when those change.
+    paths:
+      - 'docs-site/**'
+      - 'packages/textsift/src/browser/**'
+      - 'packages/textsift/src/zig/**'
+      - 'packages/textsift/src/c/**'
+      - 'packages/textsift/scripts/**'
+      - 'packages/textsift/package.json'
+      - '.github/workflows/docs.yml'
   workflow_dispatch:
 
 permissions:
@@ -21,13 +30,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
 
-      - run: cd docs-site && npm ci
+      - uses: jdx/mise-action@v2
+        with:
+          experimental: true
 
-      - run: cd docs-site && npx astro build
+      - name: Install binaryen (wasm-opt)
+        run: sudo apt-get install -y binaryen
+
+      - name: Install workspace deps
+        run: npm install --no-audit --no-fund
+
+      # The docs site aliases `textsift/browser` to
+      # packages/textsift/dist/browser/index.js (gitignored). Build it
+      # first so astro's vite resolver can find it.
+      - name: Build textsift browser bundle
+        run: cd packages/textsift && npm run build:browser
+
+      - name: Build docs site
+        run: cd docs-site && npx astro build
 
       - uses: actions/upload-pages-artifact@v3
         with:

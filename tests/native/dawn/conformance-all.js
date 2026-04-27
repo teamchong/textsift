@@ -158,7 +158,21 @@ const SHADERS = [
   "qmoe_down_scatter",
 ];
 
-const handle = native.dawnCreateBackend();
+// On CI runners (especially headless Windows on GitHub Actions),
+// Dawn often can't find a D3D12-capable adapter at all. Treat that
+// as a skip — the conformance test verifies kernel correctness on
+// real GPUs; without an adapter there's literally nothing to test.
+let handle;
+try {
+  handle = native.dawnCreateBackend();
+} catch (e) {
+  if (/createBackend failed|no Dawn-compatible adapter/i.test(e.message)) {
+    console.log(`SKIP Dawn-direct conformance: ${e.message}`);
+    console.log("(no GPU adapter on this runner — expected on headless CI)");
+    process.exit(0);
+  }
+  throw e;
+}
 console.log(`[dawn] device: ${native.dawnDeviceName(handle)}\n`);
 
 let failed = 0;

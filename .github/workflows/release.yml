@@ -163,13 +163,16 @@ jobs:
       # Build the browser bundle (includes WASM SIMD path for browsers).
       - run: npm run build:browser -w textsift
 
+      # npm trusted publishing (OIDC). The job's `id-token: write`
+      # permission lets `npm publish --provenance` exchange the GitHub
+      # OIDC token for an npm publish token at request time — no
+      # NPM_TOKEN secret needed. Configure on npmjs.com under each
+      # package's "Trusted Publishers" → GitHub Actions, pointing at
+      # this repo + this workflow file.
       - name: Publish per-triple subpackages
         run: node scripts/publish-natives.mjs
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
       - name: Publish umbrella textsift package
         run: cd packages/textsift && npm publish --access public --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

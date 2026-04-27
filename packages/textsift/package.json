@@ -25,7 +25,14 @@
     "textsift": "./dist/cli.js"
   },
   "files": [
-    "dist/",
+    "dist/index.js",
+    "dist/index.d.ts",
+    "dist/cli.js",
+    "dist/sarif.js",
+    "dist/sarif.d.ts",
+    "dist/browser/**/*.js",
+    "dist/browser/**/*.d.ts",
+    "dist/native/**/*.d.ts",
     "LICENSE",
     "README.md"
   ],

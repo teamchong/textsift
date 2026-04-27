@@ -51,7 +51,7 @@ End-to-end on a 122-character input with 4 PII spans: `redact()` returns in ~50�
 | Windows x86_64 | Dawn-direct | Tint → D3D12 via statically-linked Google Dawn |
 | (any platform, no GPU) | WASM fallback | Zig + SIMD128 in WebAssembly |
 
-Each platform's `.node` binary is built with comptime-gated Zig code so it only contains the relevant backend — Mac binaries don't ship Vulkan code, Windows binaries don't ship Obj-C, etc. npm picks the right `optionalDependencies` subpackage at install time (`@textsift/native-{linux-x64,linux-arm64,darwin-x64,darwin-arm64,win32-x64}`).
+Each platform's `.node` binary is built with comptime-gated Zig code so it only contains the relevant backend — Mac binaries don't ship Vulkan code, Windows binaries don't ship Obj-C, etc. npm picks the right `optionalDependencies` subpackage at install time (`textsift-native-{linux-x64,linux-arm64,darwin-x64,darwin-arm64,win32-x64}`).
 
 ## Linux prereqs (one-time)
 

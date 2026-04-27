@@ -30,6 +30,6 @@ packages/textsift/vendor/dawn/lib/*.dll
 # across OS by scripts/bench-aggregate.mjs into the workflow summary).
 bench-results.json
 # Per-triple subpackage staging dir written by scripts/publish-natives.mjs.
-# Contents are published to npm as @textsift/native-{linux-x64,...} and
+# Contents are published to npm as textsift-native-{linux-x64,...} and
 # linked from the umbrella package's optionalDependencies.
 dist-pkg/

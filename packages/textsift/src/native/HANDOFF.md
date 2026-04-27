@@ -124,7 +124,7 @@ GitHub Actions matrix + `optionalDependencies` are committed at `.github/workflo
 
 When the repo is pushed and the matrix runs for the first time, expect ~30–60 min for the cold Dawn build per OS; subsequent runs hit the per-OS cache and complete in 10–20 s.
 
-`@textsift/native-{darwin-arm64,darwin-x64,linux-x64,linux-arm64,win32-x64}` per-triple subpackages are wired through `release.yml`. NPM_TOKEN secret needs to be set in repo settings before `release.yml` works.
+`textsift-native-{darwin-arm64,darwin-x64,linux-x64,linux-arm64,win32-x64}` per-triple subpackages are wired through `release.yml`. NPM_TOKEN secret needs to be set in repo settings before `release.yml` works.
 
 ### PrivacyFilter wiring (DONE)
 

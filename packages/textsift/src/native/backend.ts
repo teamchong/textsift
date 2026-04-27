@@ -313,14 +313,14 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 
 /**
  * Resolve the .node binary. Production install:
- *   `@textsift/native-${platform}-${arch}/textsift-native.node`
+ *   `textsift-native-${platform}-${arch}/textsift-native.node`
  *   (one of the optionalDependencies; npm picks the right one at install).
  * Dev / monorepo:
  *   `<this dir>/textsift-native.node` (built by scripts/build-native.sh).
  */
 function resolveNativePath(): string {
   const triple = `${process.platform}-${process.arch}`;
-  const subpackage = `@textsift/native-${triple}/textsift-native.node`;
+  const subpackage = `textsift-native-${triple}/textsift-native.node`;
   try {
     return createRequire(import.meta.url).resolve(subpackage);
   } catch {

@@ -42,8 +42,17 @@ jobs:
         with:
           experimental: true
 
-      - name: Install binaryen (wasm-opt)
-        run: sudo apt-get install -y binaryen
+      - name: Install binaryen (wasm-opt) from upstream release
+        # Ubuntu's apt binaryen is too old to parse the SIMD opcodes
+        # that Zig 0.16 emits. Pin to a recent upstream tarball that
+        # matches the version on developer Macs (homebrew binaryen 128).
+        run: |
+          set -e
+          BINARYEN_VERSION="version_128"
+          curl -fsSL "https://github.com/WebAssembly/binaryen/releases/download/${BINARYEN_VERSION}/binaryen-${BINARYEN_VERSION}-x86_64-linux.tar.gz" | tar -xz -C /tmp
+          sudo cp -r /tmp/binaryen-${BINARYEN_VERSION}/bin/* /usr/local/bin/
+          sudo cp -r /tmp/binaryen-${BINARYEN_VERSION}/lib/* /usr/local/lib/
+          wasm-opt --version
 
       - name: Install workspace deps
         run: npm install --no-audit --no-fund

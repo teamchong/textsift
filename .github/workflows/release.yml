@@ -120,6 +120,21 @@ jobs:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
+      - uses: jdx/mise-action@v2
+        with:
+          experimental: true
+
+      - name: Install binaryen (wasm-opt) from upstream release
+        # Apt's binaryen is too old to parse the SIMD opcodes Zig 0.16
+        # emits. Pin to match developer Macs (homebrew binaryen 128).
+        run: |
+          set -e
+          BINARYEN_VERSION="version_128"
+          curl -fsSL "https://github.com/WebAssembly/binaryen/releases/download/${BINARYEN_VERSION}/binaryen-${BINARYEN_VERSION}-x86_64-linux.tar.gz" | tar -xz -C /tmp
+          sudo cp -r /tmp/binaryen-${BINARYEN_VERSION}/bin/* /usr/local/bin/
+          sudo cp -r /tmp/binaryen-${BINARYEN_VERSION}/lib/* /usr/local/lib/
+          wasm-opt --version
+
       - name: Download all .node artifacts
         uses: actions/download-artifact@v4
         with:

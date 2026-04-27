@@ -6,10 +6,14 @@
 #
 #   macOS    → Metal-direct (hand-written MSL via Obj-C bridge)
 #   Linux    → Vulkan-direct (hand-written GLSL → SPIR-V via glslangValidator)
-#                 + Dawn-direct (Tint codegen, statically linked, for measurement)
-#   Windows  → Dawn-direct only (Tint → D3D12 via Dawn's backend selection;
+#   Windows  → Dawn-direct (Tint → D3D12 via Dawn's backend selection;
 #                no Vulkan-direct because glslang isn't standard on Win and
 #                no Metal/Obj-C)
+#
+# Dawn was previously also compiled into the Linux .node, but Dawn on Linux
+# uses Vulkan internally — if the loader is missing, Dawn fails the same
+# way Vulkan-direct does. The fallback was redundant; the real Linux
+# fallback when no GPU is present is the WASM CPU path.
 #
 # Each case below contributes its own EXTRA_LINK and EXTRA_SRC; if a case
 # is empty (e.g. an unsupported host) we fail loud rather than silently
@@ -48,10 +52,10 @@ case "$HOST_OS" in
     EXTRA_LINK="-framework Metal -framework Foundation -framework QuartzCore -framework IOKit -framework CoreGraphics -framework MetalKit -framework AppKit"
     ;;
   linux)
-    # libvulkan for Vulkan-direct, libwebgpu_dawn (statically linked,
-    # built with hidden visibility so Dawn's bundled abseil doesn't
-    # collide with V8's at runtime) + stdc++/pthread/dl/m for Dawn.
-    EXTRA_LINK="-lvulkan -L${PKG_ROOT}/vendor/dawn/lib -lwebgpu_dawn -lstdc++ -lpthread -ldl -lm"
+    # libvulkan for Vulkan-direct. Dawn is no longer linked on Linux —
+    # it would have used Vulkan internally anyway, so the fallback was
+    # redundant.
+    EXTRA_LINK="-lvulkan -lpthread -ldl -lm"
     ;;
   windows)
     # Dawn brings its own D3D12 backend; we just link the static lib +
@@ -85,9 +89,6 @@ case "$HOST_OS" in
     done
     shopt -u nullglob
     EXTRA_SRC+=( "${PKG_ROOT}/src/native/vulkan/bridge.c" )
-    # Dawn-direct C bridge (lives alongside Vulkan-direct; both backends
-    # build into the same .node so tests can A/B them on Linux).
-    EXTRA_SRC+=( "${PKG_ROOT}/src/native/dawn/bridge.c" )
     ;;
   windows)
     # Windows ships only the Dawn-direct bridge — no Vulkan-direct (no

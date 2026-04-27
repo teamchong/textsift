@@ -11,8 +11,14 @@ const builtin = @import("builtin");
 //
 //   macOS   → Metal-direct (hand-written MSL via Obj-C bridge)
 //   Linux   → Vulkan-direct (hand-written GLSL → SPIR-V via glslangValidator)
-//             + Dawn-direct (Tint codegen, kept available for measurement)
-//   Windows → Dawn-direct (Tint → D3D12 via Dawn's Vulkan/D3D12 backend selection)
+//   Windows → Dawn-direct (Tint → D3D12 via Dawn's backend selection)
+//
+// Dawn was previously also compiled into the Linux .node as a fallback,
+// but Dawn on Linux uses Vulkan internally — if the Vulkan loader is
+// missing, Dawn fails the same way Vulkan-direct does, so the fallback
+// was redundant. The real Linux fallback when no GPU is available is
+// the WASM CPU path. Cuts ~30 min off the Linux Dawn cold build and
+// 37 MB of statically-linked C++ from the Linux .node binary.
 //
 // Each backend's struct is `if (gate) struct { ... } else struct { empty registerAll }`,
 // so the un-taken branch is never analyzed by Zig — that's how we keep
@@ -857,17 +863,20 @@ const Vulkan = if (is_linux) struct {
     }
 };
 
-// ── Dawn-direct backend (Linux + Windows) ──
+// ── Dawn-direct backend (Windows) ──
 //
 // Statically-linked Google Dawn C++ library with a thin C bridge in
 // dawn/bridge.{h,c}. Tint compiles the canonical WGSL kernels at runtime
-// to SPIR-V (Linux/Vulkan backend) or HLSL→D3D12 (Windows/D3D12 backend);
-// Dawn handles the platform abstraction internally.
+// to HLSL → D3D12; Dawn handles the platform abstraction internally.
 //
-// On Linux this lives alongside Vulkan-direct so we can A/B Tint codegen
-// vs our hand-written GLSL→SPIR-V on the same hardware. On Windows it's
-// the only path (until/unless someone writes D3D12-direct with hand-tuned
-// HLSL kernels — analogous effort to the Mac Metal-direct port).
+// Windows-only because:
+//   - macOS has Metal-direct (hand-written MSL via Obj-C bridge).
+//   - Linux has Vulkan-direct (hand-written GLSL → SPIR-V); Dawn on Linux
+//     uses Vulkan internally, so it would fail the same way Vulkan-direct
+//     does when the loader is missing — redundant fallback.
+//   - Windows is the only platform without a hand-tuned native path, until
+//     someone writes D3D12-direct with hand-written HLSL kernels (analogous
+//     effort to the Mac Metal-direct port).
 //
 // JS calling convention for dawn* dispatches:
 //   - bindings: Array<BigInt> — buf handles in storage-binding-slot order.
@@ -875,7 +884,7 @@ const Vulkan = if (is_linux) struct {
 //                  concatenated in binding order (must total to the
 //                  pipeline's uniform_total_size; empty if 0).
 //   - grid:     Array<u32>[3] — workgroup count.
-const Dawn = if (is_linux or is_windows) struct {
+const Dawn = if (is_windows) struct {
     const dn = @import("dawn_backend.zig");
 
     pub fn registerAll(env: c.napi_env, exports: c.napi_value) !void {

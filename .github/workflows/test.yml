@@ -77,9 +77,9 @@ jobs:
           # the Dawn-only Windows build but doesn't hurt).
           # choco install -y vulkan-sdk  # optional
 
-      # ── Dawn (Linux/Windows only — Mac doesn't compile Dawn into the .node) ──
+      # ── Dawn (Windows only — Mac uses Metal-direct, Linux uses Vulkan-direct) ──
       - name: Cache Dawn build
-        if: matrix.backend != 'metal'
+        if: matrix.backend == 'dawn'
         id: dawn-cache
         uses: actions/cache@v4
         with:
@@ -88,7 +88,7 @@ jobs:
           # If the Dawn revision changes, bump the date suffix above.
 
       - name: Build Dawn (cache miss)
-        if: matrix.backend != 'metal' && steps.dawn-cache.outputs.cache-hit != 'true'
+        if: matrix.backend == 'dawn' && steps.dawn-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           set -e
@@ -116,7 +116,16 @@ jobs:
           mkdir -p "$DAWN_VENDOR/include/webgpu" "$DAWN_VENDOR/include/dawn" "$DAWN_VENDOR/lib"
           cp /tmp/dawn/include/webgpu/webgpu.h "$DAWN_VENDOR/include/webgpu/"
           cp /tmp/dawn/out/gen/include/dawn/webgpu.h "$DAWN_VENDOR/include/dawn/"
-          cp /tmp/dawn/out/src/dawn/native/libwebgpu_dawn.a "$DAWN_VENDOR/lib/"
+          # Dawn produces webgpu_dawn.lib on Windows (MSVC ABI),
+          # libwebgpu_dawn.a on Linux/clang. Copy whichever exists.
+          if [[ -f /tmp/dawn/out/src/dawn/native/webgpu_dawn.lib ]]; then
+            cp /tmp/dawn/out/src/dawn/native/webgpu_dawn.lib "$DAWN_VENDOR/lib/"
+          elif [[ -f /tmp/dawn/out/src/dawn/native/libwebgpu_dawn.a ]]; then
+            cp /tmp/dawn/out/src/dawn/native/libwebgpu_dawn.a "$DAWN_VENDOR/lib/"
+          else
+            echo "no webgpu_dawn static library produced" >&2
+            exit 1
+          fi
 
       # ── Build textsift-native.node ──
       - name: Install npm deps
@@ -136,7 +145,7 @@ jobs:
         run: node tests/native/vulkan/conformance-all.js
 
       - name: Conformance — Dawn-direct
-        if: matrix.backend != 'metal'
+        if: matrix.backend == 'dawn'
         run: node tests/native/dawn/conformance-all.js
 
       - name: Conformance — Metal-direct

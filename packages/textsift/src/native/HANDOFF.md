@@ -1,8 +1,8 @@
 # Native binding — status
 
-Last update: 2026-04-26 (PrivacyFilter wiring done; Mac adapter fixes verified end-to-end).
+Last update: 2026-04-26 (Dawn dropped from Linux build — was redundant with Vulkan-direct since Dawn on Linux uses Vulkan internally).
 
-Mac fast-path (Metal-direct), Linux fast-path (Vulkan-direct), and the Dawn-direct alternative are all shipped. Windows uses Dawn-direct as its primary path. `PrivacyFilter.create()` works on all three platforms with WASM auto-fallback if the GPU path fails. Remaining work is CI execution + npm publish flow (workflows are committed to `.github/workflows/` but haven't run yet — no remote configured).
+Mac fast-path (Metal-direct) and Linux fast-path (Vulkan-direct) are shipped. Windows uses Dawn-direct as its primary path. `PrivacyFilter.create()` works on all three platforms with WASM auto-fallback if the GPU path fails. Remaining work is CI execution + npm publish flow (workflows are committed to `.github/workflows/` but haven't run yet — no remote configured).
 
 ## Comptime platform routing
 
@@ -13,15 +13,15 @@ const is_macos   = builtin.os.tag == .macos;
 const is_linux   = builtin.os.tag == .linux;
 const is_windows = builtin.os.tag == .windows;
 
-const Metal  = if (is_macos)              struct { ... } else struct { empty registerAll };
-const Vulkan = if (is_linux)              struct { ... } else struct { empty registerAll };
-const Dawn   = if (is_linux or is_windows) struct { ... } else struct { empty registerAll };
+const Metal  = if (is_macos)   struct { ... } else struct { empty registerAll };
+const Vulkan = if (is_linux)   struct { ... } else struct { empty registerAll };
+const Dawn   = if (is_windows) struct { ... } else struct { empty registerAll };
 ```
 
 | Platform | Backend on user path | NAPI surfaces in `.node` | Sources compiled |
 |---|---|---|---|
 | macOS arm64/x64 | Metal-direct | `metal*` only | `metal/bridge.{h,m}` + `metal_backend.zig` |
-| Linux x86_64/arm64 | Vulkan-direct | `vulkan*` (primary) + `dawn*` (measurement) | `vulkan/bridge.{h,c}` + `vulkan_backend.zig` + `dawn/bridge.{h,c}` + `dawn_backend.zig` |
+| Linux x86_64/arm64 | Vulkan-direct | `vulkan*` only | `vulkan/bridge.{h,c}` + `vulkan_backend.zig` |
 | Windows x86_64 | Dawn-direct | `dawn*` only | `dawn/bridge.{h,c}` + `dawn_backend.zig` |
 
 The build script (`scripts/build-native.sh`) mirrors the same `case "$HOST_OS"` split and only compiles each platform's source files + linker flags.
@@ -86,18 +86,20 @@ T=32 node tests/native/forward-vulkan.js
 
 GPU compute is the wall. Theoretical Iris Xe memory bandwidth ceiling for our forward (~770 MB weights touched once + scratch) is ~11 ms; we're at ~50% of that. Realistic optimization headroom: ~10–15% wall via subgroup ops + persistent descriptor caching + larger matmul tiles.
 
-### Dawn-direct (cross-platform; Linux measurement + Windows primary)
+### Dawn-direct (Windows primary)
 
 Statically-linked Google Dawn C++ library with a thin C bridge (`dawn/bridge.{h,c}`, ~700 LOC). Tint compiles the canonical WGSL kernels at runtime — single source shared with the browser path, no per-platform shader maintenance.
 
 - `packages/textsift/src/native/dawn/bridge.{h,c}` — C bridge: instance/adapter/device/queue + buffer/pipeline/encoder. Uses `wgpuInstanceWaitAny` for sync (sidesteps the `setImmediate` deadlock that broke `node-webgpu` on heavy loads).
 - `packages/textsift/src/native/dawn_backend.zig` — Zig wrapper mirroring `vulkan_backend.zig`'s API. Multi-uniform support via `uniform_sizes[]` array.
-- `packages/textsift/src/native/napi.zig` — `dawn*` NAPI surface, comptime-gated to `is_linux or is_windows`.
+- `packages/textsift/src/native/napi.zig` — `dawn*` NAPI surface, comptime-gated to `is_windows`.
 - `packages/textsift/vendor/dawn/` — vendored: `include/{webgpu,dawn}/webgpu.h` headers + `lib/libwebgpu_dawn.a` (37 MB, built with hidden visibility so its bundled abseil doesn't collide with V8's at runtime).
 
-**Conformance:** all 15 kernels byte-equal or within fp ε vs browser fixture. Run `node tests/native/dawn/conformance-all.js`.
+**Conformance:** all 15 kernels byte-equal or within fp ε vs browser fixture. Run `node tests/native/dawn/conformance-all.js` on Windows.
 
-Bench (Iris Xe, T=32): Dawn-direct = 55.9 ms vs Vulkan-direct = 26.3 ms. **Vulkan-direct ~2× faster** because (a) hand-tuned GLSL beats Tint's WGSL→SPIR-V codegen on our specific kernels, and (b) Dawn allocates a fresh uniform buffer + bind group per dispatch (133/forward) while Vulkan-direct uses push constants. On Windows where there's no hand-tuned alternative, Dawn-direct is the user path.
+**Why Windows-only:** Dawn was previously also compiled into the Linux .node, but Dawn on Linux uses Vulkan internally — if the Vulkan loader is missing, Dawn fails the same way Vulkan-direct does, so the fallback was redundant. The real Linux fallback when no GPU is available is the WASM CPU path. Cuts ~30 min off the Linux Dawn cold build and 37 MB of statically-linked C++ from the Linux .node binary.
+
+Historical bench (Iris Xe, T=32): Dawn-direct = 55.9 ms vs Vulkan-direct = 26.3 ms — Vulkan-direct ~2× faster because (a) hand-tuned GLSL beats Tint's WGSL→SPIR-V codegen, and (b) Dawn allocates a fresh uniform buffer + bind group per dispatch (133/forward) while Vulkan-direct uses push constants. The same delta is the reason a future D3D12-direct rewrite would be analogous to the Mac Metal-direct port.
 
 **Reproduce Dawn build (one-time):**
 ```sh

@@ -116,30 +116,21 @@ cp include/webgpu/webgpu.h $TEXTSIFT/packages/textsift/vendor/dawn/include/webgp
 cp out/gen/include/dawn/webgpu.h $TEXTSIFT/packages/textsift/vendor/dawn/include/dawn/
 ```
 
-### Packaging (still TODO)
+### Packaging (workflows committed; first run pending)
 
-GitHub Actions matrix + `optionalDependencies` is needed before npm publish:
-- `@textsift/native-darwin-arm64`, `-x64` — Mac arm64/x64 prebuilds
-- `@textsift/native-linux-x64`, `-arm64` — Linux prebuilds (with vendored Dawn lib per-arch)
-- `@textsift/native-win32-x64` — Windows prebuild (with vendored Dawn lib for Win)
+GitHub Actions matrix + `optionalDependencies` are committed at `.github/workflows/{test,release,bench}.yml`. Workflows haven't run yet — no GitHub remote configured.
 
-### PrivacyFilter wiring on the native entry (NEXT)
+When the repo is pushed and the matrix runs for the first time, expect ~30–60 min for the cold Dawn build per OS; subsequent runs hit the per-OS cache and complete in 10–20 s.
 
-Currently `import { PrivacyFilter } from "textsift"` throws — kernel layer is done but the high-level API isn't wired through. The path forward is well-understood:
+`@textsift/native-{darwin-arm64,darwin-x64,linux-x64,linux-arm64,win32-x64}` per-triple subpackages are wired through `release.yml`. NPM_TOKEN secret needs to be set in repo settings before `release.yml` works.
 
-**Required:**
-- Reuse `src/browser/inference/*` (Viterbi, spans, redact, rules, chunking) and `src/browser/model/{tokenizer,calibration,onnx-reader}.ts` — all pure TS, no DOM deps.
-- Replace OPFS model storage with filesystem cache at `$XDG_CACHE_HOME/textsift/<sha>/model_q4f16.onnx` (default `~/.cache/textsift/`). Browser path stays OPFS.
-- Write a Node-side `NativeBackend implements InferenceBackend` (in `src/native/backend.ts`) that:
-  - Calls `dawnCreateBackend / vulkanCreateBackend / metalCreateBackend` based on `process.platform`.
-  - Parses ONNX via existing `parseOnnxGraph`/`resolveTensorBytes`.
-  - Uploads weights using the same name mapping as `WebGpuBackend`'s `uploadWeights()` (lines 1303–1453 of `browser/backends/webgpu.ts`) — replacing `device.createBuffer` with `*CreateBuffer(handle, bytes)`.
-  - `forward()`: literal port of `tests/native/forward-vulkan.js`'s dispatch sequence with weights loaded from ONNX instead of synthetic.
-- Wire `PrivacyFilter.create()` in `src/index.ts` to use `NativeBackend` instead of throwing.
+### PrivacyFilter wiring (DONE)
 
-**The dispatch sequence is already done** — `tests/native/forward-{metal,vulkan,dawn}.js` are the working orchestration with synthetic weights at production dimensions. Replacing the synthetic weights with real ONNX weights is the only delta. The weight-name mapping in `WebGpuBackend.uploadWeights()` (e.g. ONNX tensor `model_embed_tokens_weight_quant` → buffer `embed.int4`) maps directly because `forward-vulkan.js` already uses these same buffer names.
+`PrivacyFilter.create()` on the native entry works end-to-end on macOS (Metal-direct) and Linux (Vulkan-direct), with WASM fallback when no GPU is available. Verified by `tests/native/integration/filter-redact.test.js` (Mac + Linux), `filter-faker.test.js`, `filter-table.test.js`, and `cli.test.js` (14 subprocess tests).
 
-Estimated effort: ~6 hours (full port, conformance test, bench end-to-end vs ORT Node CPU + browser textsift).
+The full path: tokenizer + Viterbi + spans + redact + rules from `src/browser/inference/` are reused unchanged (pure TS, no DOM deps). Model loading from filesystem is in `src/native/loader.ts` with `cacheDir` / `modelPath` / `offline` overrides. Backend selection is in `src/native/backend.ts` with comptime-gated `metal*` / `vulkan*` / `dawn*` NAPI surfaces.
+
+Adapter bug fixed in `14221c3` (Mac side): `metalCreateBuffer` / `metalCreateEmptyBuffer` were dropping the backend handle, and `cast_f32_to_fp16_scaled` needs its two uniform bindings split for Metal (Vulkan/Dawn handle the concatenated form via push constants).
 
 ## Reproduction commands
 

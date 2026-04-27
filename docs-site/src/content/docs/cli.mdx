@@ -1,0 +1,134 @@
+---
+title: CLI
+description: npx textsift — local-first PII redaction from the terminal. Same engine as the lib.
+---
+
+`textsift` ships a CLI as part of the same npm package — no separate install.
+
+```sh
+npx textsift --help
+```
+
+The first run downloads the model (~770 MB) into `~/.cache/textsift/`. Subsequent runs are instant from cache. Same per-platform GPU fast paths as the library (Metal on macOS, Vulkan on Linux, Dawn on Windows; WASM fallback if no GPU).
+
+## Quick examples
+
+```sh
+# Stdin → stdout
+echo "Hi Alice, alice@example.com" | npx textsift redact
+# → Hi [private_person], [private_email]
+
+# File in place
+npx textsift redact ./customer.txt --in-place
+
+# Faker mode — realistic fakes instead of [label] markers
+echo "Hi Alice, alice@example.com" | npx textsift redact --synth
+# → Hi Alice Anderson, alice.anderson@example.com
+
+# Detect-only, JSONL output for jq pipelines
+npx textsift detect ./log.txt --jsonl | jq 'select(.label == "private_email")'
+
+# CSV column classification
+npx textsift classify ./customers.csv --header
+# → JSON: per-column label + confidence + samples
+
+# CSV redaction in three modes
+npx textsift table ./customers.csv --header --mode synth > clean.csv
+npx textsift table ./customers.csv --header --mode drop_column > minimal.csv
+npx textsift table ./customers.csv --header --mode redact > redacted.csv
+
+# Pre-warm the cache (CI / deployment prep)
+npx textsift download
+
+# Cache management
+npx textsift cache info
+npx textsift cache clear
+```
+
+## Subcommands
+
+| Subcommand | Reads | Writes | Wraps |
+|---|---|---|---|
+| `redact [file]` | stdin or `<file>` | stdout (or `<file>` with `--in-place`) | `filter.redact()` |
+| `detect [file]` | stdin or `<file>` | JSON to stdout (`--jsonl` for one-per-line) | `filter.detect()` |
+| `table [file]`  | CSV (stdin or `<file>`) | CSV to stdout (or `<file>` with `--in-place`) | `filter.redactTable()` |
+| `classify [file]` | CSV (stdin or `<file>`) | JSON to stdout | `filter.classifyColumns()` |
+| `download` | — | warms cache | `PrivacyFilter.create()` |
+| `cache info` | — | JSON to stdout | `getCacheInfo()` |
+| `cache clear` | — | (deletes the cache dir) | `clearCache()` |
+
+CSV parsing is RFC 4180 minimal: quoted fields and escaped quotes work; embedded newlines work. Tab-separated and other delimiters aren't yet supported — pre-process with `awk` if you need them.
+
+## Flags
+
+### Redact / detect
+
+| Flag | Effect |
+|---|---|
+| `--in-place` | Write back to `<file>` instead of stdout (no-op when reading stdin) |
+| `--secrets` | Enable the built-in `"secrets"` rule preset (JWT, GitHub PAT, AWS, Slack, OpenAI/Anthropic/Google/Stripe keys, PEM private keys) |
+| `--synth` | Faker mode — realistic fake values instead of `[label]` markers |
+| `--jsonl` | `detect` only: emit one span per line for `jq` pipelines |
+
+### Table / classify
+
+| Flag | Effect |
+|---|---|
+| `--header` | First row is column headers (default: every row is data) |
+| `--mode <m>` | `redact` (default), `synth`, or `drop_column` |
+| `--sample-size <N>` | Cells to sample per column for classification (default: 50) |
+
+### Loader
+
+All loader flags also pick up the corresponding `TEXTSIFT_*` env var, so CI can set them once and every CLI invocation honors them.
+
+| Flag | Env var | Effect |
+|---|---|---|
+| `--cache-dir <path>` | `TEXTSIFT_CACHE_DIR` | Override cache root (default: `$XDG_CACHE_HOME/textsift` or `~/.cache/textsift`) |
+| `--model <path>` | `TEXTSIFT_MODEL_PATH` | Use a pre-staged ONNX file; skip cache + fetch. Companion `.onnx_data` expected at `<path>_data` |
+| `--model-source <url>` | `TEXTSIFT_MODEL_SOURCE` | Override the default HuggingFace URL (use a mirror or your own fork) |
+| `--offline` | `TEXTSIFT_OFFLINE` | Fail loudly on cache miss instead of fetching. No silent WASM fallback either. |
+| `--no-prompt` | — | Don't ask "download 770 MB?" on first run; useful for non-TTY contexts |
+
+### CI workflow example
+
+```yaml
+# .github/workflows/scrub-pii.yml
+name: PII scan
+on: [push, pull_request]
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Cache the 770 MB model across runs
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/textsift
+          key: textsift-model-${{ hashFiles('**/package-lock.json') }}
+
+      # Pre-warm if cache miss
+      - run: npx textsift download
+
+      # Now every subsequent invocation is offline + fast
+      - run: |
+          for f in $(git diff --name-only ${{ github.event.pull_request.base.sha }} \
+                    ${{ github.sha }} -- '*.txt' '*.md'); do
+            npx textsift detect "$f" --offline --no-prompt --jsonl > "$f.pii.jsonl"
+            test ! -s "$f.pii.jsonl" || { echo "PII found in $f"; cat "$f.pii.jsonl"; exit 1; }
+          done
+```
+
+## Choosing CLI vs library
+
+| Use case | Reach for |
+|---|---|
+| One-off file scrubbing | CLI (`npx textsift redact`) |
+| Shell pipeline (`grep`, `awk`, `jq`) | CLI (composes naturally) |
+| GitHub Action / pre-commit hook | CLI (one binary, no build) |
+| Inside a Node app or service | Library (`import { PrivacyFilter } from "textsift"`) |
+| Browser app / front-end | Library (`import { PrivacyFilter } from "textsift/browser"`) |
+| Streaming AI proxy | Library — streaming `detect()` / `redact()` only available via the JS API |
+
+The CLI and lib share the same model cache, native binaries, and fallback logic. Whichever you reach for first, the other Just Works on the same machine without re-download.

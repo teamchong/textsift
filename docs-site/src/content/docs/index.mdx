@@ -43,7 +43,7 @@ The model is OpenAI's; the value of this package is packaging:
 npm install textsift
 ```
 
-One package, two entry points so browsers never bundle native code:
+One package, two import entry points + a CLI:
 
 ```ts
 // Browser / Node-via-WASM (today)
@@ -53,6 +53,14 @@ import { PrivacyFilter } from "textsift/browser";
 // macOS, Vulkan on Linux, Dawn on Windows). Falls back to WASM if no GPU.
 import { PrivacyFilter } from "textsift";
 ```
+
+```sh
+# Same engine as a CLI — composes with shell, no clipboard dance
+echo "Hi Alice, alice@example.com" | npx textsift redact
+npx textsift table customers.csv --header --mode synth > clean.csv
+```
+
+See the [CLI reference](/textsift/cli/) for every subcommand.
 
 ## 30-second example
 

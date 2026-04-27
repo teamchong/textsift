@@ -35,6 +35,7 @@ export default defineConfig({
       sidebar: [
         { label: "Overview", slug: "index" },
         { label: "Quickstart", slug: "quickstart" },
+        { label: "CLI", slug: "cli" },
         { label: "Playground", slug: "playground" },
         { label: "Faker mode playground", slug: "playground-faker" },
         { label: "API Reference", slug: "api" },

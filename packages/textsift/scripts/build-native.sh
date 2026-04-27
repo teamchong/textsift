@@ -41,16 +41,24 @@ OUT="${PKG_ROOT}/dist/textsift-native.node"
 # distributions don't, so we download the official headers tarball
 # under the package's vendor/ dir and reuse on subsequent runs.
 NODE_INC="$(node -p "require('path').join(process.execPath, '../../include/node')")"
+NODE_LIB_DIR=""   # Windows-only: holds node.lib for napi import resolution.
 if [[ ! -d "$NODE_INC" ]]; then
   if [[ "$HOST_OS" == "windows" ]]; then
     NODE_VERSION="$(node -p 'process.versions.node')"
     VENDOR_HEADERS="${PKG_ROOT}/vendor/node-headers/${NODE_VERSION}"
     NODE_INC="${VENDOR_HEADERS}/include/node"
+    NODE_LIB_DIR="${VENDOR_HEADERS}/lib"
     if [[ ! -d "$NODE_INC" ]]; then
       echo "fetching Node ${NODE_VERSION} headers (Windows distros omit them)..." >&2
-      mkdir -p "$VENDOR_HEADERS"
+      mkdir -p "$VENDOR_HEADERS" "$NODE_LIB_DIR"
       TARBALL="https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-headers.tar.gz"
       curl -fsSL "$TARBALL" | tar -xz -C "$VENDOR_HEADERS" --strip-components=1
+      # node.lib is the Windows import library that exposes node.exe's
+      # napi_* exports. Without it, lld-link leaves every napi_* symbol
+      # undefined and the resulting .node segfaults at LoadLibrary.
+      echo "fetching Node ${NODE_VERSION} import lib (node.lib)..." >&2
+      curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/win-x64/node.lib" \
+        -o "${NODE_LIB_DIR}/node.lib"
     fi
   fi
 fi
@@ -95,8 +103,10 @@ case "$HOST_OS" in
     # entry on every thread attach.
     EXTRA_LINK_ARGS=(
       "-L${PKG_ROOT}/vendor/dawn/lib"
+      "-L${NODE_LIB_DIR}"
       -lwebgpu_dawn -ld3d12 -ldxgi -ld3dcompiler
       -lucrt -lvcruntime
+      -lnode
     )
     # Zig's link step on Windows (msvc ABI) doesn't pick up the LIB env
     # var that vcvars64.bat / ilammy/msvc-dev-cmd populates. Translate

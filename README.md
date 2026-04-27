@@ -8,7 +8,7 @@ PII detection and redaction that runs [openai/privacy-filter](https://huggingfac
 
 ## What this is
 
-One npm package, two entry points so browsers never bundle native code:
+One npm package, two entry points + a CLI:
 
 ```sh
 npm install textsift
@@ -21,6 +21,16 @@ import { PrivacyFilter } from "textsift/browser";
 // Node native — auto-picks the platform's GPU fast path (Metal on macOS,
 // Vulkan on Linux, Dawn on Windows). Falls back to WASM if no GPU.
 import { PrivacyFilter } from "textsift";
+```
+
+```sh
+# Same engine as a CLI — no install, no browser, no clipboard dance
+echo "Hi Alice, alice@example.com" | npx textsift redact
+npx textsift table customers.csv --header --mode synth > clean.csv
+npx textsift detect log.txt --jsonl | jq 'select(.label == "private_email")'
+TEXTSIFT_OFFLINE=1 npx textsift redact file.txt   # CI: fail if not pre-cached
+npx textsift download                              # pre-warm in CI
+npx textsift cache info                            # show cache location + size
 ```
 
 Bundlers (Vite/Webpack/esbuild/etc.) resolve `textsift/browser` and never touch the native entry. Node code resolves `textsift` and gets the platform-native binding via `optionalDependencies`.

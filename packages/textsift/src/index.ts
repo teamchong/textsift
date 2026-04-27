@@ -79,6 +79,16 @@ export class PrivacyFilter extends BrowserPrivacyFilter {
           return backend;
         } catch (e) {
           const reason = (e as Error).message;
+          // If the caller explicitly asked for offline mode, don't
+          // silently fall back to WASM (whose own model fetcher
+          // doesn't honor the offline gate). Re-throw so the failure
+          // surfaces.
+          if (opts.offline) {
+            throw new Error(
+              `textsift: native backend unavailable and offline=true ` +
+              `was requested — no fallback. Underlying reason: ${reason}`,
+            );
+          }
           // eslint-disable-next-line no-console
           console.warn(
             `textsift: native GPU backend unavailable (${reason}). ` +

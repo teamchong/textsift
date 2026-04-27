@@ -91,8 +91,8 @@ export class PrivacyFilter extends BrowserPrivacyFilter {
           // eslint-disable-next-line no-console
           console.warn(
             `textsift: native GPU backend unavailable (${reason}). ` +
-              `Falling back to WASM CPU path. Install Vulkan drivers and rebuild ` +
-              `for the fast path on Linux. See packages/textsift/src/native/HANDOFF.md.`,
+              `Falling back to WASM CPU path. Install Vulkan drivers ` +
+              `(libvulkan-dev / mesa-vulkan-drivers) for the fast path on Linux.`,
           );
           // Returning null tells the base class to fall through to the
           // built-in selectBackend(), which picks WASM in Node since

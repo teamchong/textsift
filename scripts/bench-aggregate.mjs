@@ -28,7 +28,7 @@ console.log("# Cross-platform benchmark");
 console.log("");
 console.log("Same model (`openai/privacy-filter` model_q4f16.onnx), one runner per OS family. Lower latency = better.");
 console.log("");
-console.log("**Hardware honesty:** GitHub Actions runners rarely have real GPUs. Linux gets Mesa llvmpipe (CPU software rasterizer pretending to be Vulkan); Windows gets no D3D12 adapter at all; only macOS runners ship real silicon. Numbers below are **labelled by what actually ran**, so a llvmpipe row isn't read as if it represents Vulkan-direct on Intel iGPU. Real-hardware numbers live in `packages/textsift/src/native/HANDOFF.md`.");
+console.log("**Hardware honesty:** GitHub Actions runners rarely have real GPUs. Linux gets Mesa llvmpipe (CPU software rasterizer pretending to be Vulkan); Windows gets no D3D12 adapter at all; only macOS runners ship real silicon. Numbers below are **labelled by what actually ran**, so a llvmpipe row isn't read as if it represents Vulkan-direct on Intel iGPU. Real-hardware numbers live in [`docs-site/src/content/docs/benchmarks.mdx`](https://teamchong.github.io/textsift/benchmarks/).");
 console.log("");
 console.log("**How to read these numbers:**");
 console.log("- < 16 ms feels instant (60 fps frame budget)");

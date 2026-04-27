@@ -317,9 +317,14 @@ const HERE = dirname(fileURLToPath(import.meta.url));
  *   (one of the optionalDependencies; npm picks the right one at install).
  * Dev / monorepo:
  *   `<this dir>/textsift-native.node` (built by scripts/build-native.sh).
+ *
+ * Node reports `process.platform === "win32"` on Windows, but our
+ * subpackage is named `textsift-windows-x64` because the unscoped
+ * `textsift-win32-x64` name trips npm's spam-detection filter.
  */
 function resolveNativePath(): string {
-  const triple = `${process.platform}-${process.arch}`;
+  const platform = process.platform === "win32" ? "windows" : process.platform;
+  const triple = `${platform}-${process.arch}`;
   const subpackage = `textsift-${triple}/textsift-native.node`;
   try {
     return createRequire(import.meta.url).resolve(subpackage);

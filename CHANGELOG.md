@@ -40,5 +40,5 @@ End-to-end `redact()` on a 122-char input with 4 PII spans: ~50–110 ms on real
 ### Pre-1.0 caveats
 
 - Surface is not stable. Breaking changes can land before 1.0.
-- Native-binary CI matrix covers `linux-x64`, `linux-arm64`, `darwin-x64`, `darwin-arm64`, `win32-x64`. Other targets (Alpine/musl, Windows ARM, FreeBSD) fall through to the WASM CPU path.
+- Native-binary CI matrix covers `linux-x64`, `linux-arm64`, `darwin-x64`, `darwin-arm64`, `windows-x64`. Other targets (Alpine/musl, Windows ARM, FreeBSD) fall through to the WASM CPU path.
 - llvmpipe / software-fallback Vulkan adapters are tolerated (`rope_apply` allows 32 fp16 ULPs of cross-driver drift), but not benchmarked as if they were real GPUs.

@@ -35,8 +35,8 @@ jobs:
             triple: darwin-x64
             backend: metal
           - os: windows-latest
-            label: win32-x64
-            triple: win32-x64
+            label: windows-x64
+            triple: windows-x64
             backend: dawn
 
     steps:

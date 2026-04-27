@@ -513,7 +513,7 @@ binary on each runner, uploads as artifact, then a single `publish`
 job pulls all artifacts and publishes:
 
 - `textsift-{linux-x64,linux-arm64,darwin-x64,darwin-arm64,
-  win32-x64}` (per-triple, single .node each)
+  windows-x64}` (per-triple, single .node each)
 - `textsift` (umbrella, points at all 5 via `optionalDependencies`)
 
 Uses npm OIDC trusted publishing — `id-token: write` permission +

@@ -19,7 +19,7 @@ NAMES=(
   textsift-linux-arm64
   textsift-darwin-x64
   textsift-darwin-arm64
-  textsift-win32-x64
+  textsift-windows-x64
 )
 
 WHOAMI="$(npm whoami)"
@@ -33,6 +33,10 @@ trap 'rm -rf "$WORKDIR"' EXIT
 
 for name in "${NAMES[@]}"; do
   echo
+  if npm view "$name" version >/dev/null 2>&1; then
+    echo "==> $name already on npm, skipping"
+    continue
+  fi
   echo "==> publish $name@0.0.0"
   pkgdir="$WORKDIR/$name"
   mkdir -p "$pkgdir"

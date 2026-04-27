@@ -6,7 +6,7 @@
 // right one at install time.
 //
 // Triples expected in ./native-bins/textsift-${triple}/textsift-native.node:
-//   linux-x64, linux-arm64, darwin-x64, darwin-arm64, win32-x64
+//   linux-x64, linux-arm64, darwin-x64, darwin-arm64, windows-x64
 //
 // The umbrella package's runtime loader reads
 // `process.platform + "-" + process.arch` and requires the matching
@@ -24,7 +24,7 @@ const TRIPLES = [
   { triple: "linux-arm64",   os: "linux",  cpu: "arm64", libc: "glibc" },
   { triple: "darwin-x64",    os: "darwin", cpu: "x64" },
   { triple: "darwin-arm64",  os: "darwin", cpu: "arm64" },
-  { triple: "win32-x64",     os: "win32",  cpu: "x64" },
+  { triple: "windows-x64",   os: "win32",  cpu: "x64" },
 ];
 
 const ROOT = resolve(".");

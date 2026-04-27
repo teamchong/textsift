@@ -1,2 +1,5 @@
 [tools]
-zig = "latest"
+# Pinned for reproducibility — `latest` produced different versions on
+# Mac (0.16.0) vs Linux (0.15.2) and conformance behaved differently
+# between them. Bump deliberately when upgrading.
+zig = "0.16.0"

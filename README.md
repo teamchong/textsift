@@ -6,7 +6,7 @@ PII detection and redaction that runs [openai/privacy-filter](https://huggingfac
 
 [**Docs**](https://teamchong.github.io/textsift/) · [**Quickstart**](https://teamchong.github.io/textsift/quickstart/) · [**Playground**](https://teamchong.github.io/textsift/playground/) · [**API**](https://teamchong.github.io/textsift/api/) · [**Intro video**](https://teamchong.github.io/textsift/intro.mp4)
 
-> 4-minute architecture walkthrough — [▶ play](https://teamchong.github.io/textsift/intro.mp4)
+> Architecture walkthrough — [▶ play](https://teamchong.github.io/textsift/intro.mp4)
 
 ## What this is
 

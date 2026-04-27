@@ -33,6 +33,16 @@ npx textsift download                              # pre-warm in CI
 npx textsift cache info                            # show cache location + size
 ```
 
+```yaml
+# Or as a pre-commit hook — block commits that contain PII
+# .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/teamchong/textsift
+    rev: v0.1.0
+    hooks:
+      - id: textsift-pii-scan
+```
+
 Bundlers (Vite/Webpack/esbuild/etc.) resolve `textsift/browser` and never touch the native entry. Node code resolves `textsift` and gets the platform-native binding via `optionalDependencies`.
 
 The model is OpenAI's; the value here is packaging:

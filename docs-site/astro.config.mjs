@@ -36,6 +36,7 @@ export default defineConfig({
         { label: "Overview", slug: "index" },
         { label: "Quickstart", slug: "quickstart" },
         { label: "CLI", slug: "cli" },
+        { label: "Pre-commit hook", slug: "precommit" },
         { label: "Playground", slug: "playground" },
         { label: "Faker mode playground", slug: "playground-faker" },
         { label: "API Reference", slug: "api" },

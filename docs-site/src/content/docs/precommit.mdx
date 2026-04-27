@@ -1,0 +1,148 @@
+---
+title: Pre-commit hook
+description: Block commits that contain personally identifiable info, using openai/privacy-filter — runs locally on the developer machine via the pre-commit framework.
+---
+
+textsift ships a [pre-commit](https://pre-commit.com) hook that scans staged files for PII before each commit. Same engine as the CLI; runs entirely on the developer machine; no data leaves the host.
+
+## Install
+
+```yaml
+# .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/teamchong/textsift
+    rev: v0.1.0           # pin to a tag — pre-commit doesn't follow `main`
+    hooks:
+      - id: textsift-pii-scan
+```
+
+Then in your repo:
+
+```sh
+pip install pre-commit       # one-time, if you don't have it
+pre-commit install           # wires .git/hooks/pre-commit
+pre-commit run --all-files   # initial sweep across the whole repo
+```
+
+The first run downloads the model (~770 MB) into `~/.cache/textsift/`. Subsequent commits hit the cache.
+
+## What it catches
+
+Each staged file is run through `PrivacyFilter.detect()` with the built-in `secrets` preset enabled. Findings are reported to stderr with line numbers; the commit is blocked if any *blocking* finding is detected.
+
+Default blocking spans:
+- **Model spans** — all 8 categories the model detects (`private_email`, `private_phone`, `private_person`, `private_address`, `private_url`, `private_date`, `account_number`, `secret`).
+- **Rule spans with `severity: "block"`** — the entire `secrets` preset (JWT, GitHub PAT, AWS, Slack, OpenAI/Anthropic/Google/Stripe keys, PEM private keys).
+
+Example output:
+
+```
+textsift-pii-scan: 3 blocking finding(s) across 2 file(s)
+
+  private_person      src/test.ts:42:18  "Alice Carter"
+  private_email       src/test.ts:42:35  "alice@example.com"
+  GITHUB_PAT_CLASSIC  scripts/.env:1:14  "ghp_abcdefghijklmnopqrstuvwxyzABCDEF1234"
+
+Bypass with `git commit --no-verify` (do not commit real PII).
+Adjust severity with TEXTSIFT_PRECOMMIT_SEVERITY=warn|all|block.
+```
+
+## What it skips
+
+The hook filters before invoking the model:
+- Files with extensions in the binary / generated list (`.lock`, `.png`, `.wasm`, `.onnx`, `.pdf`, `.zip`, `.woff2`, etc.)
+- Files larger than 1 MB (configurable via `TEXTSIFT_PRECOMMIT_MAX_BYTES`)
+- Empty files
+- Lockfiles (`package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `bun.lockb`)
+- Minified bundles (`.min.js`, `.min.css`)
+
+Pre-commit's own `exclude` regex in `.pre-commit-hooks.yaml` is the first line of defence; the hook script's extension/size check is a second pass for direct invocation.
+
+## Configuration
+
+### Severity (block what you actually care about)
+
+```yaml
+# .pre-commit-config.yaml
+hooks:
+  - id: textsift-pii-scan
+    args: []                       # no flags by default → strict mode
+    # Or relax for warn-only on a noisy codebase:
+    # args: [--warn-only]
+```
+
+Or via env var (per-developer override without editing the project config):
+
+```sh
+# Block-mode default — all model PII + secrets-preset block-severity rules
+TEXTSIFT_PRECOMMIT_SEVERITY=block git commit ...
+
+# Warn-mode — only true secrets block; model PII reported but doesn't fail
+TEXTSIFT_PRECOMMIT_SEVERITY=warn  git commit ...
+
+# All-mode — anything detected blocks (most strict)
+TEXTSIFT_PRECOMMIT_SEVERITY=all   git commit ...
+```
+
+### Pre-stage the model in CI
+
+In CI, add a step to download the model before pre-commit runs so the hook is always cache-warm:
+
+```yaml
+# .github/workflows/lint.yml
+- uses: actions/cache@v4
+  with:
+    path: ~/.cache/textsift
+    key: textsift-model-${{ hashFiles('.pre-commit-config.yaml') }}
+
+- run: npx textsift download
+
+- uses: pre-commit/[email protected]
+  env:
+    TEXTSIFT_OFFLINE: "1"   # fail fast if cache miss
+```
+
+### All env vars
+
+| Env var | Default | Effect |
+|---|---|---|
+| `TEXTSIFT_PRECOMMIT_SEVERITY` | `block` | `block` / `warn` / `all` — see above |
+| `TEXTSIFT_PRECOMMIT_MAX_BYTES` | `1000000` | Skip files larger than N bytes |
+| `TEXTSIFT_PRECOMMIT_SECRETS` | `1` | Set to `0` to disable the secrets rule preset |
+| `TEXTSIFT_OFFLINE` | unset | Fail loudly on cache miss (no fetch). Useful in CI. |
+| `TEXTSIFT_CACHE_DIR` | `$XDG_CACHE_HOME/textsift` | Override cache root |
+| `TEXTSIFT_MODEL_PATH` | unset | Use a pre-staged ONNX file; skip cache + fetch |
+| `TEXTSIFT_MODEL_SOURCE` | HuggingFace | Mirror or fork URL |
+
+## Bypass + recovery
+
+If the hook flags a false positive or you genuinely need to commit (e.g. pasting test data), bypass with:
+
+```sh
+git commit --no-verify -m "..."
+```
+
+This skips *all* hooks, not just textsift. Use sparingly. The right long-term fix for a recurring false positive is usually to add a custom marker to the file (e.g. `// pragma: textsift-allow private_phone`) — though this isn't yet wired in v0.1.
+
+## Performance
+
+First commit on a fresh dev machine: ~30 sec (model download + warmup). Subsequent commits: ~1.5–3 sec depending on platform and how many files changed (the model loads in ~1 sec from disk; per-file detect is sub-100 ms on Mac Metal-direct, sub-200 ms on Linux Vulkan-direct).
+
+The hook script loads the model **once** and scans all staged files in-process. CLI-per-file would multiply the cold-start cost by N files; the hook avoids that.
+
+## Comparison with other secrets scanners
+
+| Tool | Catches | Doesn't catch |
+|---|---|---|
+| [gitleaks](https://github.com/gitleaks/gitleaks) | High-precision regex secrets | Names, emails, phones, addresses |
+| [trufflehog](https://github.com/trufflesecurity/trufflehog) | Verified secrets (validates against APIs) | General PII |
+| [detect-secrets](https://github.com/Yelp/detect-secrets) | Plaintext secrets via heuristics | General PII |
+| **textsift-pii-scan** | All of the above + model-detected PII (names, emails, phone numbers, addresses, etc.) | (Should be paired with one of the above for high-precision secrets scanning if you want belt-and-braces) |
+
+textsift's secrets preset overlaps heavily with gitleaks's pattern set. If you already use gitleaks, you can disable textsift's secrets preset and let textsift focus on what only it catches:
+
+```sh
+TEXTSIFT_PRECOMMIT_SECRETS=0 pre-commit run --all-files
+```
+
+…or keep both for belt-and-braces coverage.

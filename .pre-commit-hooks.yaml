@@ -1,0 +1,35 @@
+# pre-commit framework hook manifest. Users add this repo to their
+# .pre-commit-config.yaml to scan staged files for PII before commit.
+#
+# Example user config:
+#
+#   repos:
+#     - repo: https://github.com/teamchong/textsift
+#       rev: v0.1.0
+#       hooks:
+#         - id: textsift-pii-scan
+#
+# See https://teamchong.github.io/textsift/precommit/ for details.
+
+- id: textsift-pii-scan
+  name: textsift — scan for PII
+  description: Detect personally identifiable information in staged text files using openai/privacy-filter. Runs entirely on the developer machine; no data leaves the host.
+  entry: node ./packages/textsift/scripts/precommit.js
+  language: node
+  pass_filenames: true
+  # Skip generated / binary / large files. The hook itself also
+  # filters by extension + size as a second line of defence.
+  exclude: |
+    (?ix)
+      ^(
+        (.*/)?(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb)
+        | .*\.(min\.(js|css|html))
+        | .*\.(wasm|node|dylib|so|dll|a|lib|o)
+        | .*\.(onnx|onnx_data|safetensors|gguf|pt|pth|pkl)
+        | .*\.(png|jpe?g|gif|webp|ico|svg|pdf)
+        | .*\.(mp[34]|webm|mov|avi|wav|flac|ogg)
+        | .*\.(zip|tar|gz|7z|rar)
+        | .*\.(woff2?|ttf|otf|eot)
+      )$
+  types_or: [text]
+  stages: [pre-commit]

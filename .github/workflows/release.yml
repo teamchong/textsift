@@ -117,7 +117,7 @@ jobs:
       - name: Upload .node binary
         uses: actions/upload-artifact@v4
         with:
-          name: textsift-native-${{ matrix.triple }}
+          name: textsift-${{ matrix.triple }}
           path: packages/textsift/dist/textsift-native.node
           retention-days: 7
 
@@ -156,7 +156,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: native-bins
-          pattern: textsift-native-*
+          pattern: textsift-*
 
       - run: npm install --no-audit --no-fund
 

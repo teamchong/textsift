@@ -171,7 +171,7 @@ opts.backend === "auto"    → probe; WebGPU if shader-f16 available,
 ```
 
 The umbrella `textsift` package's resolver tries the per-platform
-native binding first via `require("textsift-native-${process.platform}-${process.arch}/textsift-native.node")`.
+native binding first via `require("textsift-${process.platform}-${process.arch}/textsift-native.node")`.
 If the .node fails to load (no GPU, no Vulkan loader, missing
 binary, etc.), the resolver falls through to the WASM backend.
 Throwing the failure is gated behind explicit `offline: true` mode
@@ -512,7 +512,7 @@ measurement.
 binary on each runner, uploads as artifact, then a single `publish`
 job pulls all artifacts and publishes:
 
-- `textsift-native-{linux-x64,linux-arm64,darwin-x64,darwin-arm64,
+- `textsift-{linux-x64,linux-arm64,darwin-x64,darwin-arm64,
   win32-x64}` (per-triple, single .node each)
 - `textsift` (umbrella, points at all 5 via `optionalDependencies`)
 

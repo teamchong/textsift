@@ -5,12 +5,12 @@
 // package lists them all under `optionalDependencies` so npm picks the
 // right one at install time.
 //
-// Triples expected in ./native-bins/textsift-native-${triple}/textsift-native.node:
+// Triples expected in ./native-bins/textsift-${triple}/textsift-native.node:
 //   linux-x64, linux-arm64, darwin-x64, darwin-arm64, win32-x64
 //
 // The umbrella package's runtime loader reads
 // `process.platform + "-" + process.arch` and requires the matching
-// `textsift-native-${triple}` from node_modules.
+// `textsift-${triple}` from node_modules.
 
 import { readFileSync, writeFileSync, mkdirSync, copyFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
@@ -31,7 +31,7 @@ const ROOT = resolve(".");
 const BINS_DIR = resolve(ROOT, "native-bins");
 
 for (const t of TRIPLES) {
-  const src = resolve(BINS_DIR, `textsift-native-${t.triple}`, "textsift-native.node");
+  const src = resolve(BINS_DIR, `textsift-${t.triple}`, "textsift-native.node");
   if (!existsSync(src)) {
     console.warn(`SKIP: no artifact for ${t.triple} (missing ${src})`);
     continue;
@@ -41,7 +41,7 @@ for (const t of TRIPLES) {
   copyFileSync(src, resolve(pkgDir, "textsift-native.node"));
 
   const pkgJson = {
-    name: `textsift-native-${t.triple}`,
+    name: `textsift-${t.triple}`,
     version: VERSION,
     description: `textsift native binding for ${t.triple}`,
     main: "textsift-native.node",
@@ -69,7 +69,7 @@ const pkg = JSON.parse(readFileSync(umbrella, "utf8"));
 pkg.version = VERSION;
 pkg.optionalDependencies = pkg.optionalDependencies || {};
 for (const t of TRIPLES) {
-  pkg.optionalDependencies[`textsift-native-${t.triple}`] = VERSION;
+  pkg.optionalDependencies[`textsift-${t.triple}`] = VERSION;
 }
 writeFileSync(umbrella, JSON.stringify(pkg, null, 2));
 console.log(`updated ${umbrella} to v${VERSION} with ${TRIPLES.length} optionalDependencies`);

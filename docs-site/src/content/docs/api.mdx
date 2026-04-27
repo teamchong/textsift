@@ -27,6 +27,10 @@ static create(options?: CreateOptions): Promise<PrivacyFilter>;
 | `maxChunkTokens` | `number` | `2048` | Chunk size for long inputs. |
 | `rules` | `Rule[]` | `[]` | Custom regex / function detectors merged with model spans. |
 | `presets` | `string[]` | `[]` | Built-in rule sets. Currently: `"secrets"`. |
+| `minConfidence` | `number` | `0` | Drop spans whose model confidence is below this (0..1). Rule spans always pass. |
+| `cacheDir` | `string` | `~/.cache/textsift` | **Node only**. Override the model cache root. |
+| `modelPath` | `string` | — | **Node only**. Local pre-staged ONNX file; skip cache+fetch. Companion `.onnx_data` expected at `<modelPath>_data`. |
+| `offline` | `boolean` | `false` | **Node only**. Fail loudly on cache miss instead of fetching. No silent WASM fallback. |
 
 ## Instance methods
 
@@ -53,6 +57,39 @@ redactBatch(inputs: readonly string[], options?: RedactOptions): Promise<RedactR
 ```
 
 Serial processing. For real parallelism, construct multiple `PrivacyFilter` instances.
+
+### `classifyColumns(rows, options?)`
+
+```ts
+classifyColumns(
+  rows: readonly (readonly string[])[],
+  options?: ClassifyTableOptions,
+): Promise<ColumnClassification[]>;
+```
+
+Sample cells from each column of a tabular dataset, run `detect()` on each sample, and return per-column classification + confidence. For audits ("which columns are PII?"), GDPR right-to-be-forgotten, vendor data sharing prep.
+
+```ts
+const cols = await filter.classifyColumns(rows, {
+  headerRow: true,
+  sampleSize: 50,
+});
+// → [
+//     { index: 0, header: "id",    label: null,             confidence: 0,    samples: 50, labelCounts: {} },
+//     { index: 1, header: "email", label: "private_email",  confidence: 0.96, samples: 50, labelCounts: { private_email: 48 } },
+//   ]
+```
+
+### `redactTable(rows, options?)`
+
+```ts
+redactTable(
+  rows: readonly (readonly string[])[],
+  options?: RedactTableOptions,
+): Promise<string[][]>;
+```
+
+Classifies columns (or uses pre-supplied `classifications`), then per-cell applies one of three modes to PII columns: `"redact"` (default — markers via the filter's `markers` strategy), `"synth"` (realistic fakes via `markerPresets.faker()` shared across the table for cross-row consistency), or `"drop_column"` (omit the column entirely).
 
 ### `dispose()`
 
@@ -155,6 +192,80 @@ const filter = await PrivacyFilter.create({
 The `"secrets"` preset covers credentials/API keys the model wasn't trained on: JWT, GitHub PAT (all variants), AWS access key, Slack tokens + webhooks, OpenAI/Anthropic/Google API keys, Stripe live/test keys, Stripe webhook secrets, npm tokens, PEM private-key headers. All default to `severity: "block"`.
 
 Performance note: the runtime unions all regex rules into one alternation and scans the input once, regardless of preset count. N rules ≈ 1 scan.
+
+### `markerPresets.faker()`
+
+Built-in `MarkerStrategy` factory that emits realistic-looking fake values instead of `[label]` markers. Stateful per instance — same input text always maps to the same fake within the strategy's lifetime, so relationships across mentions are preserved.
+
+```ts
+import { PrivacyFilter, markerPresets } from "textsift";
+
+const filter = await PrivacyFilter.create({ markers: markerPresets.faker() });
+await filter.redact("Hi Alice, alice@example.com");
+// → "Hi Alice Anderson, alice.anderson@example.com"
+```
+
+`secret` spans deliberately render as `[secret]` regardless of preset — emitting another credible-looking secret is a security footgun. See the [Faker mode playground](/textsift/playground-faker/) for an interactive demo.
+
+### `ColumnClassification`
+
+```ts
+interface ColumnClassification {
+  index: number;
+  header?: string;
+  label: SpanLabel | string | null;     // null = no PII detected in samples
+  confidence: number;                    // 0..1, fraction of samples matching
+  samples: number;
+  labelCounts: Readonly<Record<string, number>>;
+}
+```
+
+### `ClassifyTableOptions` / `RedactTableOptions`
+
+```ts
+interface ClassifyTableOptions {
+  sampleSize?: number;                  // default: 50
+  headerRow?: boolean;                  // first row is column names
+  headers?: readonly string[];          // explicit, overrides headerRow
+  rules?: readonly Rule[];
+  presets?: readonly string[];
+  signal?: AbortSignal;
+}
+
+type RedactTableMode = "redact" | "synth" | "drop_column";
+
+interface RedactTableOptions extends ClassifyTableOptions {
+  mode?: RedactTableMode;               // default: "redact"
+  classifications?: readonly ColumnClassification[];   // skip the classify step
+  markers?: MarkerStrategy;
+  enabledCategories?: readonly SpanLabel[];
+}
+```
+
+### SARIF export — `textsift/sarif`
+
+Convert detection results to SARIF v2.1.0 for GitHub Code Scanning, GitLab SAST, etc.:
+
+```ts
+import { PrivacyFilter } from "textsift";
+import { toSarif, detectResultToSarif } from "textsift/sarif";
+
+const filter = await PrivacyFilter.create();
+const result = await filter.detect(text);
+
+// Single file
+const log = detectResultToSarif(result, "src/test.ts");
+
+// Multiple files
+const log = toSarif([
+  { uri: "src/a.ts", text: textA, spans: spansA },
+  { uri: "src/b.ts", text: textB, spans: spansB },
+], { modelSpanLevel: "warning" });   // optional: downgrade model spans
+
+await writeFile("findings.sarif", JSON.stringify(log, null, 2));
+```
+
+The output is GitHub-Code-Scanning-ready: `partialFingerprints` for cross-run dedup, per-label rule definitions in `tool.driver.rules`, severity mapping (model→error, rule:block→error, rule:warn→warning) overridable via `modelSpanLevel`.
 
 ### `ProgressEvent`
 

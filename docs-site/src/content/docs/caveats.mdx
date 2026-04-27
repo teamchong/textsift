@@ -21,7 +21,7 @@ description: What textsift does well, and what it doesn't.
 - **Browser storage quota.** The 770 MB model is persisted via OPFS. Users with tight storage (Safari's 1 GB origin quota at 77% full, mobile browsers, private-mode tabs) may hit eviction. We fall back to plain fetch if OPFS write fails — no re-download loop, but warmup reverts to ~13 seconds on subsequent visits.
 - **WebGPU availability.** `backend: "webgpu"` requires `shader-f16`. Chromium 147 ships it; Firefox + Safari are still behind a pref. Use `backend: "wasm"` as the universal fallback.
 - **fp16 accumulation drift.** GPU and WASM forward logits RMS-disagree by ~0.18 due to different rounding paths across 8 layers. Argmax is preserved (span output is byte-exact across backends); only the softmax probabilities differ by a few percent in magnitude.
-- **No streaming.** `forward` processes one chunk synchronously; for inputs > `maxChunkTokens` the chunking is invisible to the caller. You get all spans at once, not as they're decoded.
+- **Streaming has narrow uses.** The streaming `detect()` / `redact()` overload exists for AI-gateway / mid-stream-abort scenarios. If you can buffer the full response, the non-streaming form takes the same time and less code.
 
 ## Not-a-replacement for
 
@@ -35,6 +35,9 @@ description: What textsift does well, and what it doesn't.
 - Browser-extension "warn before paste" prompts.
 - Offline / air-gapped environments where sending text to a server isn't acceptable.
 - Node pipelines where you want the same model locally without a Python stack.
+- Pre-commit / CI gating to block commits or PRs that introduce PII (via the [pre-commit hook](/textsift/precommit/) and [GitHub Action](/textsift/github-action/)).
+- Generating realistic test fixtures from prod data (via [Faker mode](/textsift/playground-faker/)) so downstream code keeps working.
+- CSV / DB-dump audits — `classifyColumns` finds which of N columns are PII; `redactTable` produces a clean copy in three modes.
 
 ## Upstream references
 

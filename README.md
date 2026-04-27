@@ -43,6 +43,17 @@ repos:
       - id: textsift-pii-scan
 ```
 
+```yaml
+# Or as a GitHub Action — block PRs that introduce PII; findings
+# show up inline + in the repo's Security tab via SARIF.
+# .github/workflows/pii.yml
+- uses: teamchong/textsift@v1
+  with:
+    sarif-output: textsift.sarif
+- uses: github/codeql-action/upload-sarif@v3
+  with: { sarif_file: textsift.sarif, category: textsift }
+```
+
 Bundlers (Vite/Webpack/esbuild/etc.) resolve `textsift/browser` and never touch the native entry. Node code resolves `textsift` and gets the platform-native binding via `optionalDependencies`.
 
 The model is OpenAI's; the value here is packaging:

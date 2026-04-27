@@ -78,11 +78,22 @@ Bundlers (Vite/Webpack/esbuild/etc.) resolve `textsift/browser` and pull in only
 
 See the [API reference](https://teamchong.github.io/textsift/api/). Highlights:
 
-- `PrivacyFilter.create({ backend, modelSource, markers, enabledCategories, rules, presets })`
+- `PrivacyFilter.create({ backend, modelSource, markers, enabledCategories, rules, presets, minConfidence, cacheDir, modelPath, offline })`
 - `filter.detect(text | AsyncIterable<string>)` — batch returns a Promise; streaming returns a sync handle with `spanStream` + `result`
 - `filter.redact(text | AsyncIterable<string>)` — same shape; streaming surfaces `textStream` of safe-to-emit pieces
+- `filter.classifyColumns(rows, { headerRow, sampleSize })` — per-column PII classification for tabular data
+- `filter.redactTable(rows, { mode })` — `"redact"` / `"synth"` / `"drop_column"` for one-shot CSV cleaning
 - `presets: ["secrets"]` enables JWT, GitHub PAT, AWS, Slack, OpenAI/Anthropic/Google/Stripe keys, and PEM private-key headers (all severity `"block"`)
+- `markerPresets.faker()` — realistic-looking fake values instead of `[label]` markers (consistent across mentions)
 - Custom `rules` (regex or function) merge with model spans
+- SARIF v2.1.0 export at `textsift/sarif` for GitHub Code Scanning / similar consumers
+
+## Other surfaces
+
+Same engine, four surfaces total:
+- `npx textsift` — [CLI](https://teamchong.github.io/textsift/cli/) (`redact`, `detect`, `table`, `classify`, `download`, `cache`).
+- [Pre-commit hook](https://teamchong.github.io/textsift/precommit/) — block commits containing PII.
+- [GitHub Action](https://teamchong.github.io/textsift/github-action/) — `uses: teamchong/textsift@v1` with PR annotations + Security-tab integration via SARIF.
 
 ## License
 

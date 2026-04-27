@@ -79,3 +79,14 @@ filter.dispose();
 ```
 
 Releases GPU buffers and WASM memory. Safe to call multiple times.
+
+## More than the library
+
+Same engine, four distribution surfaces:
+
+- **[CLI](/textsift/cli/)** — `npx textsift redact file.txt` for shell pipelines + scripts.
+- **[Pre-commit hook](/textsift/precommit/)** — block commits containing PII before they land.
+- **[GitHub Action](/textsift/github-action/)** — `uses: teamchong/textsift@v1` to scan PRs with inline annotations.
+- **Tabular data** — [`classifyColumns`](/textsift/api/#classifycolumnsrows-options) + [`redactTable`](/textsift/api/#redacttablerows-options) for CSV / DB-dump audits.
+
+The [Faker mode playground](/textsift/playground-faker/) shows synthetic-data redaction in action — useful when downstream code expects PII-shaped inputs (test fixtures, sales demos, vendor data sharing).

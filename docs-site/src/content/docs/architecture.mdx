@@ -23,8 +23,11 @@ description: How textsift turns text into redacted output, from tokenizer to spa
             ▼
  ┌─────────────────────┐
  │ Backend.forward()   │   One of:
- │                     │     webgpu (custom WGSL)
- │                     │     wasm   (custom Zig + SIMD128)
+ │                     │     metal-direct  (Node, macOS — hand-written MSL)
+ │                     │     vulkan-direct (Node, Linux — hand-written GLSL→SPIR-V)
+ │                     │     dawn-direct   (Node, Windows + Linux fallback)
+ │                     │     webgpu        (browser — custom WGSL)
+ │                     │     wasm          (any platform fallback — Zig + SIMD128)
  └──────────┬──────────┘
             │ Float32Array [T, 33]  (background + 8 labels × BIOES)
             ▼
@@ -79,25 +82,46 @@ We read OpenAI's upstream `onnx/model_q4f16.onnx` + `.onnx_data` directly. No co
 
 ## Backend internals
 
+### Native (Node)
+
+Per-platform GPU fast paths, comptime-gated in `packages/textsift/src/native/napi.zig` so each platform's `.node` only contains the relevant backend:
+
+- **macOS** — `metal/{bridge.h,bridge.m,shaders.metal}`: hand-written MSL kernels via an Obj-C bridge. Beats Tint's WGSL→MSL codegen by ~1.9× at T=32 on M2 Pro.
+- **Linux** — `vulkan/{bridge.h,bridge.c,shaders/*.comp.glsl}`: hand-written GLSL compiled to SPIR-V at build time via `glslangValidator`. ~28× faster than ORT Node CPU on Intel Iris Xe.
+- **Windows + Linux fallback** — `dawn/{bridge.h,bridge.c}`: thin C bridge over statically-linked Google Dawn. Tint compiles the canonical WGSL kernels at runtime — single source shared with the browser path.
+
+The 15 canonical kernels live as WGSL at `src/native/shaders/*.wgsl` (single source of truth); per-platform ports (MSL, GLSL) are byte-equal vs the WGSL fixtures.
+
 ### Zig + WASM
 
 Hand-written kernels in `packages/textsift/src/zig/wasm_exports.zig`, compiled with `-target wasm32-freestanding -mcpu=generic+simd128+relaxed_simd -O ReleaseFast`. The output `textsift.wasm` is ~92 KB, inlined into the JS bundle as base64.
 
 Kernels: embed lookup, RMSNorm (incl. fused add+rms+widen variant), int4 matmul (three X×Out type variants), RoPE, banded attention with sinks, swiGLU with clamp, QMoE dispatch, scatter-add, cast, softmax, top-K. Multi-thread version (`textsift-mt.wasm`) builds with `+atomics+bulk_memory` for SAB-backed worker pools.
 
-### WGSL
+### WGSL (browser)
 
-14 compute shaders in `packages/textsift/src/browser/backends/webgpu.ts`. Highlights:
+15 compute shaders in `packages/textsift/src/browser/backends/webgpu.ts`. Highlights:
 
 - `MATMUL_INT4_FP16_F16`: fp16 input → fp16 output with 8-nibble/word unpack (one u32 load dispatches 8 FMAs). Used for Q/K/V/O projections.
 - `BANDED_ATTENTION`: one workgroup per `(t_query, h_query)`, 64 threads sharing scores/softmax scratch in workgroup memory, one thread per head_dim lane for AV combine.
 - `QMOE_GATE_UP` + `SWIGLU_CLAMP` + `QMOE_DOWN_SCATTER`: token-major MoE (one workgroup per `(token, k_pick)`), atomic CAS on f32-as-u32 bits for the scatter-add. No CPU readback needed.
 
+## Distribution surfaces
+
+The library is the engine; each surface is a thin wrapper:
+
+- **`textsift/browser`** — browser entry. WebGPU + WASM, no native binary.
+- **`textsift`** — Node entry. Auto-picks the platform native fast path with WASM fallback.
+- **`npx textsift`** — CLI. `redact` / `detect` / `table` / `classify` / `download` / `cache` subcommands.
+- **`.pre-commit-hooks.yaml`** — pre-commit framework hook entry. Loads the model once, scans staged files in-process.
+- **`action.yml`** — GitHub composite Action. Wraps the precommit script with `actions/cache` integration + GitHub annotations + SARIF output.
+- **`textsift/sarif`** — convert detection results to SARIF v2.1.0 for GitHub Code Scanning / GitLab SAST / etc.
+
 ## Design invariants
 
-1. **Public API is narrow** — `PrivacyFilter.create`, `redact`, `detect` (overloaded for both `string` and `AsyncIterable<string>`), `redactBatch`, `dispose`, plus the exported types.
-2. **Backends are interchangeable** — all backends produce byte-identical spans on the same input.
-3. **Weights live outside the npm bundle** — `textsift/browser` ships 76 KB gzipped of JS + a 90 KB WASM module. The 770 MB model is fetched on first use and persisted via OPFS by default.
+1. **Public API is narrow** — `PrivacyFilter.create`, `redact`, `detect` (overloaded for both `string` and `AsyncIterable<string>`), `redactBatch`, `classifyColumns`, `redactTable`, `dispose`, plus the exported types.
+2. **Backends are interchangeable** — all backends produce byte-identical spans on the same input. Conformance is enforced kernel-by-kernel against the canonical browser WGSL fixtures.
+3. **Weights live outside the npm bundle** — `textsift/browser` ships 76 KB gzipped of JS + a 90 KB WASM module. The 770 MB model is fetched on first use and persisted via OPFS in browsers / `~/.cache/textsift/` in Node.
 4. **No server-side fallback** — if inference can't run locally, an error is thrown. The library does not call any server.
-5. **No transformers.js dependency** — the shipped library has zero `@huggingface/transformers` surface. (transformers.js shows up only as a baseline in `tests/browser/bench.spec.ts`, where it's loaded externally via esm.sh and never bundled into the package.)
+5. **Local-first execution** — every distribution surface runs entirely on the user's machine. No telemetry, no opt-in cloud path. Same engine in browsers, Node, CLI, pre-commit, GitHub Actions.
 6. **Apache 2.0** — matches the upstream model.

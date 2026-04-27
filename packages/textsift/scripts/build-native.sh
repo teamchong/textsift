@@ -35,9 +35,25 @@ case "$HOST_OS-$HOST_ARCH" in
   *) echo "unsupported host: $HOST_OS-$HOST_ARCH" >&2; exit 1 ;;
 esac
 
-NODE_INC="$(node -p "require('path').join(process.execPath, '../../include/node')")"
 OUT="${PKG_ROOT}/dist/textsift-native.node"
 
+# Locate Node headers. macOS/Linux ship them next to node.exe; Windows
+# distributions don't, so we download the official headers tarball
+# under the package's vendor/ dir and reuse on subsequent runs.
+NODE_INC="$(node -p "require('path').join(process.execPath, '../../include/node')")"
+if [[ ! -d "$NODE_INC" ]]; then
+  if [[ "$HOST_OS" == "windows" ]]; then
+    NODE_VERSION="$(node -p 'process.versions.node')"
+    VENDOR_HEADERS="${PKG_ROOT}/vendor/node-headers/${NODE_VERSION}"
+    NODE_INC="${VENDOR_HEADERS}/include/node"
+    if [[ ! -d "$NODE_INC" ]]; then
+      echo "fetching Node ${NODE_VERSION} headers (Windows distros omit them)..." >&2
+      mkdir -p "$VENDOR_HEADERS"
+      TARBALL="https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-headers.tar.gz"
+      curl -fsSL "$TARBALL" | tar -xz -C "$VENDOR_HEADERS" --strip-components=1
+    fi
+  fi
+fi
 if [[ ! -d "$NODE_INC" ]]; then
   echo "node headers not found at $NODE_INC" >&2
   exit 1

@@ -1,0 +1,177 @@
+---
+title: GitHub Action
+description: Block PRs that introduce PII. Composite Action that wraps the textsift CLI; runs entirely on the GitHub runner.
+---
+
+textsift ships a [composite GitHub Action](https://docs.github.com/en/actions/creating-actions/creating-a-composite-action) at the repo root. Add it to a workflow and PRs that introduce PII fail the check, with inline annotations on the offending lines.
+
+Same engine as the [CLI](/textsift/cli/) and the [pre-commit hook](/textsift/precommit/). Runs entirely on the GitHub runner; **no source code or detected PII leaves CI**.
+
+## Quick start
+
+```yaml
+# .github/workflows/pii.yml
+name: PII scan
+on: [pull_request, push]
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need full history for the diff
+      - uses: teamchong/textsift@v1
+```
+
+That's the minimum. The action handles cache, model download, file selection (PR diff vs full-tree), scanning, and inline PR annotations.
+
+## Inputs
+
+| Input | Default | Effect |
+|---|---|---|
+| `files` | `'changed'` | `changed` — only PR diff (or last-commit diff on push). `all` — every tracked file. Glob like `'src/**/*.{ts,md}'` for an explicit set. |
+| `severity` | `'block'` | `block` (model PII + rule:block spans), `warn` (only rule:block), `all` (anything detected). |
+| `warn-only` | `'false'` | `'true'` to emit warnings without failing the check. |
+| `secrets` | `'true'` | Set to `'false'` if you already use gitleaks / trufflehog. |
+| `textsift-version` | `'latest'` | npm version. Pin to a tag (`'0.1.0'`) for reproducible CI. |
+| `cache-dir` | runner default | Override the model cache location. |
+
+## Common patterns
+
+### Strict PR check (block bad PRs)
+
+```yaml
+- uses: teamchong/textsift@v1
+  with:
+    severity: block
+    files: changed
+```
+
+### Soft warning (annotate but don't fail)
+
+```yaml
+- uses: teamchong/textsift@v1
+  with:
+    warn-only: 'true'
+```
+
+Useful for legacy codebases — adds annotations to surface findings in PR review without blocking ship.
+
+### Scan a specific path
+
+```yaml
+- uses: teamchong/textsift@v1
+  with:
+    files: 'docs/**/*.md'
+```
+
+Glob is passed to `git ls-files`; respects `.gitignore`.
+
+### Skip secrets scanning (delegated to gitleaks)
+
+```yaml
+- uses: gitleaks/gitleaks-action@v2
+- uses: teamchong/textsift@v1
+  with:
+    secrets: 'false'
+```
+
+textsift's regex secrets preset overlaps with gitleaks. If gitleaks is your secrets baseline, let textsift focus on what only the model catches (names, emails, phones, addresses, etc.).
+
+### Pin the version for reproducible CI
+
+```yaml
+- uses: teamchong/textsift@v1
+  with:
+    textsift-version: '0.1.0'
+```
+
+Otherwise `latest` is pulled at each run; new minor versions can change the model output.
+
+## How it works under the hood
+
+The composite action runs four steps:
+
+1. **Restore cache** — `actions/cache` restores `~/.cache/textsift/` from the previous run if available. Cache key includes textsift version + runner OS + arch so unrelated upgrades don't churn it.
+2. **Pre-warm model** — `npx textsift download --no-prompt`. No-op on cache hit; downloads the ~770 MB model on miss.
+3. **Determine files** — uses `git diff` for PR / push, or `git ls-files` for `all`. File list goes to a tempfile (avoids argv length limits).
+4. **Scan** — invokes `precommit.js` (the same hook that runs locally) which loads the model once, scans all files in-process, and emits GitHub `::error` / `::warning` workflow commands so findings show up as PR annotations on the right lines.
+
+## Performance
+
+| Scenario | Cold (first PR) | Warm (cache hit) |
+|---|---|---|
+| Linux runner, 50-file PR | ~3 min (model download) | ~15 sec |
+| Linux runner, 1000-file `all` scan | ~5 min | ~2 min |
+
+The cold-start cost is dominated by the 770 MB download. Once the cache is populated, subsequent runs across PRs hit `actions/cache` and start in seconds.
+
+## Annotations
+
+When findings exist, the action emits GitHub workflow commands so each finding shows up as an inline annotation on the PR's "Files changed" tab:
+
+```
+::error file=src/test.ts,line=42,col=18,title=textsift PII (private_person)::Found "Alice Carter"
+```
+
+`warn-only: true` switches `error` to `warning` so the check still passes but reviewers see the spans.
+
+## CI workflow examples
+
+### Just-block-the-PR (most common)
+
+```yaml
+name: PII scan
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  pii:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: teamchong/textsift@v1
+```
+
+### Required-status-check + soft warn
+
+Make a separate "required" job for severity:`block` and a "warn" job that's allowed to fail:
+
+```yaml
+jobs:
+  pii-block:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: teamchong/textsift@v1
+        with:
+          severity: block
+          secrets: 'true'
+
+  pii-suggest:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: teamchong/textsift@v1
+        with:
+          severity: all
+          warn-only: 'true'
+```
+
+The first job makes the PR red on real findings; the second annotates *every* detected span as a suggestion without blocking.
+
+## Comparison vs other actions
+
+| Action | What | Where it overlaps |
+|---|---|---|
+| [gitleaks-action](https://github.com/gitleaks/gitleaks-action) | Regex secrets | Heavy overlap with textsift's `secrets` preset — disable `secrets` in textsift if you use gitleaks. |
+| [trufflehog-actions-scan](https://github.com/trufflesecurity/trufflehog) | Verified secrets (validates against APIs) | Doesn't overlap — trufflehog confirms a secret is real; textsift catches everything that *looks* like one. Use both for layered defence. |
+| [super-linter](https://github.com/super-linter/super-linter) | Polyglot linting (eslint, rubocop, etc.) | No PII detection. Run alongside textsift. |
+
+textsift catches what regex-only tools can't: **names, emails, addresses, phone numbers, dates, account numbers in arbitrary text**. PRs that copy a real customer name into a code comment, or a personal phone number into a README, get caught here and not by the secrets scanners.

@@ -135,6 +135,37 @@ await check("TEXTSIFT_PRECOMMIT_SECRETS=0 drops the regex-rule labels", async ()
   assert.doesNotMatch(r.stderr, /GITHUB_PAT_CLASSIC/);
 });
 
+await check("GITHUB_ACTIONS=true emits ::error annotations on stdout", async () => {
+  const r = await run([piiFile], { GITHUB_ACTIONS: "true" });
+  assert.equal(r.code, 1);
+  // Annotation format: ::error file=...,line=...,col=...,title=...::Found "..."
+  assert.match(r.stdout, /^::error file=.+,line=\d+,col=\d+,title=textsift PII \(.+\)::Found ".+"/m);
+  // Should have one annotation per blocking span (PII file has 2: person + email).
+  const lines = r.stdout.split("\n").filter((l) => l.startsWith("::"));
+  assert.equal(lines.length, 2, `expected 2 annotations, got ${lines.length}: ${r.stdout}`);
+});
+
+await check("GITHUB_ACTIONS=true + --warn-only emits ::warning annotations", async () => {
+  const r = await run(["--warn-only", piiFile], { GITHUB_ACTIONS: "true" });
+  assert.equal(r.code, 0);
+  assert.match(r.stdout, /^::warning file=/m);
+  assert.doesNotMatch(r.stdout, /^::error /m);
+});
+
+await check("annotations escape newlines/percent in preview text", async () => {
+  // Span text with a newline + percent shouldn't break the workflow command parser.
+  const trickyFile = resolve(work, "tricky.txt");
+  await writeFile(trickyFile, "Email me at alice@example.com\n50%");
+  const r = await run([trickyFile], { GITHUB_ACTIONS: "true" });
+  assert.equal(r.code, 1);
+  // Each annotation should be on a single line.
+  for (const l of r.stdout.split("\n")) {
+    if (!l.startsWith("::")) continue;
+    assert.doesNotMatch(l, /\n/);
+    assert.doesNotMatch(l, /%[^:]/, `unescaped percent in: ${l}`);
+  }
+});
+
 await rm(work, { recursive: true, force: true });
 
 console.log(`\n${pass}/${pass + fail} passed`);

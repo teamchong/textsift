@@ -1,0 +1,125 @@
+name: 'textsift PII scan'
+description: 'Scan files for personally identifiable info using openai/privacy-filter. Runs entirely on the GitHub runner; no data leaves CI.'
+author: 'teamchong'
+branding:
+  icon: 'shield'
+  color: 'purple'
+
+inputs:
+  files:
+    description: |
+      Files to scan. Either a glob (e.g. `'src/**/*.{ts,md}'`) or `'changed'`
+      (default in PR context — scans only the diff). Set to `'all'` to scan
+      every tracked file in the repo.
+    required: false
+    default: 'changed'
+  severity:
+    description: |
+      `'block'` (default) blocks on all model PII + severity:block rule
+      spans. `'warn'` only blocks on rule:block spans (model spans become
+      warnings). `'all'` blocks on anything detected.
+    required: false
+    default: 'block'
+  warn-only:
+    description: |
+      `'true'` to emit findings as workflow warnings without failing the
+      check. Default: `'false'` — the action fails the check on blocking
+      findings.
+    required: false
+    default: 'false'
+  secrets:
+    description: |
+      `'true'` (default) enables the built-in secrets rule preset
+      (JWT, GitHub PAT, AWS, Slack, OpenAI/Anthropic/Google/Stripe keys,
+      PEM private keys). Set to `'false'` to disable if you already use
+      gitleaks or trufflehog for secrets.
+    required: false
+    default: 'true'
+  textsift-version:
+    description: |
+      npm version of textsift to use. Default: `'latest'`. Pin to a tag
+      (e.g. `'0.1.0'`) for reproducible CI.
+    required: false
+    default: 'latest'
+  cache-dir:
+    description: |
+      Override the model cache directory. Default: runner's `~/.cache/textsift`.
+      Pair with `actions/cache` to persist the 770 MB model across runs.
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Restore textsift model cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ inputs.cache-dir != '' && inputs.cache-dir || '~/.cache/textsift' }}
+        key: textsift-model-${{ inputs.textsift-version }}-${{ runner.os }}-${{ runner.arch }}
+        restore-keys: |
+          textsift-model-${{ inputs.textsift-version }}-${{ runner.os }}-
+
+    - name: Pre-warm model cache
+      shell: bash
+      env:
+        TEXTSIFT_CACHE_DIR: ${{ inputs.cache-dir }}
+      run: |
+        # `--no-prompt` prevents the TTY confirm; `download` is a no-op
+        # if the cache is already warm from actions/cache restore.
+        npx -y textsift@${{ inputs.textsift-version }} download --no-prompt
+
+    - name: Determine files to scan
+      id: files
+      shell: bash
+      run: |
+        case "${{ inputs.files }}" in
+          changed)
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              git fetch origin ${{ github.event.pull_request.base.ref }} --depth=1 2>/dev/null || true
+              files=$(git diff --name-only --diff-filter=ACMRT \
+                origin/${{ github.event.pull_request.base.ref }}...HEAD)
+            else
+              # Push event — diff against the previous commit.
+              files=$(git diff --name-only --diff-filter=ACMRT HEAD~1 HEAD 2>/dev/null || git ls-files)
+            fi
+            ;;
+          all)
+            files=$(git ls-files)
+            ;;
+          *)
+            # Treat as a glob pattern.
+            files=$(git ls-files "${{ inputs.files }}")
+            ;;
+        esac
+        # Write file list to a temp file (avoid argv length limits + quoting).
+        echo "$files" > /tmp/textsift-files.txt
+        echo "count=$(wc -l < /tmp/textsift-files.txt | tr -d ' ')" >> $GITHUB_OUTPUT
+        echo "Files to consider: $(wc -l < /tmp/textsift-files.txt | tr -d ' ')"
+
+    - name: Scan for PII
+      shell: bash
+      env:
+        TEXTSIFT_OFFLINE: '1'
+        TEXTSIFT_CACHE_DIR: ${{ inputs.cache-dir }}
+        TEXTSIFT_PRECOMMIT_SEVERITY: ${{ inputs.severity }}
+        TEXTSIFT_PRECOMMIT_SECRETS: ${{ inputs.secrets == 'true' && '1' || '0' }}
+      run: |
+        if [ "${{ steps.files.outputs.count }}" = "0" ]; then
+          echo "No files to scan."
+          exit 0
+        fi
+        # Resolve the precommit.js script from the installed package.
+        # `npm root -g` gives the global modules dir where `npx -y` cached
+        # textsift during the pre-warm step.
+        SCRIPT="$(npm root -g)/textsift/scripts/precommit.js"
+        if [ ! -f "$SCRIPT" ]; then
+          # Fallback: fetch and run via `npx` directly.
+          xargs -a /tmp/textsift-files.txt npx -y textsift@${{ inputs.textsift-version }} \
+            --no-prompt detect --jsonl
+          exit $?
+        fi
+        # Pass file list as args. The script emits ::error / ::warning
+        # workflow commands itself when GITHUB_ACTIONS=true.
+        EXTRA=()
+        if [ "${{ inputs.warn-only }}" = "true" ]; then EXTRA+=("--warn-only"); fi
+        xargs -a /tmp/textsift-files.txt node "$SCRIPT" "${EXTRA[@]}"

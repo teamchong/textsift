@@ -178,6 +178,7 @@ if (findings.length === 0) {
 }
 
 const isTty = stderr.isTTY;
+const inActions = env.GITHUB_ACTIONS === "true";
 const RED = isTty ? "\x1b[31m" : "";
 const YEL = isTty ? "\x1b[33m" : "";
 const DIM = isTty ? "\x1b[2m"  : "";
@@ -193,6 +194,17 @@ for (const f of findings) {
     const where = `${DIM}${rel}:${s.line}:${s.col}${RST}`;
     const preview = s.text.length > 80 ? s.text.slice(0, 77) + "..." : s.text;
     stderr.write(`  ${tag}  ${where}  ${YEL}"${preview}"${RST}\n`);
+
+    // GitHub Actions workflow command — pins the finding to a
+    // specific file:line in the PR diff view so reviewers see it
+    // inline. Severity flips to warning when --warn-only.
+    if (inActions) {
+      const cmd = warnOnly ? "warning" : "error";
+      const safeText = preview.replace(/[\r\n%]/g, " ");
+      stdout.write(
+        `::${cmd} file=${rel},line=${s.line},col=${s.col},title=textsift PII (${s.label})::Found "${safeText}"\n`,
+      );
+    }
   }
 }
 

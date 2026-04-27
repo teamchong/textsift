@@ -1,8 +1,17 @@
 {
   "name": "textsift",
   "version": "0.1.0",
-  "description": "PII detection + redaction. Browser entry (textsift/browser): WebGPU + WASM, no native binary. Native entry (textsift): NAPI binding for Node — coming with issue #79.",
+  "description": "Local-first PII detection + redaction running openai/privacy-filter on-device. Same engine in browser (WebGPU), Node native (Metal/Vulkan/Dawn), CLI, pre-commit hook, and GitHub Action.",
   "type": "module",
+  "author": "Steven Chong",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/teamchong/textsift.git"
+  },
+  "homepage": "https://teamchong.github.io/textsift/",
+  "bugs": {
+    "url": "https://github.com/teamchong/textsift/issues"
+  },
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",

@@ -131,4 +131,4 @@ jobs:
 | Browser app / front-end | Library (`import { PrivacyFilter } from "textsift/browser"`) |
 | Streaming AI proxy | Library — streaming `detect()` / `redact()` only available via the JS API |
 
-The CLI and lib share the same model cache, native binaries, and fallback logic. Whichever you reach for first, the other Just Works on the same machine without re-download.
+The CLI and lib share the same model cache, native binaries, and fallback logic. Whichever you reach for first, the other reuses the same cache on the same machine — no re-download.

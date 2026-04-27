@@ -61,24 +61,44 @@ fi
 
 mkdir -p "${PKG_ROOT}/dist"
 
-# Platform-specific link flags.
+# Platform-specific link flags. Use an array so paths with spaces
+# (Windows SDK paths under "Program Files (x86)") survive expansion.
+EXTRA_LINK_ARGS=()
 case "$HOST_OS" in
   darwin)
     # Metal frameworks for the Obj-C bridge.
-    EXTRA_LINK="-framework Metal -framework Foundation -framework QuartzCore -framework IOKit -framework CoreGraphics -framework MetalKit -framework AppKit"
+    EXTRA_LINK_ARGS=(
+      -framework Metal -framework Foundation -framework QuartzCore
+      -framework IOKit -framework CoreGraphics -framework MetalKit
+      -framework AppKit
+    )
     ;;
   linux)
     # libvulkan for Vulkan-direct. Dawn is no longer linked on Linux —
     # it would have used Vulkan internally anyway, so the fallback was
     # redundant.
-    EXTRA_LINK="-lvulkan -lpthread -ldl -lm"
+    EXTRA_LINK_ARGS=( -lvulkan -lpthread -ldl -lm )
     ;;
   windows)
     # Dawn brings its own D3D12 backend; we just link the static lib +
     # Windows system libs Dawn references (d3d12, dxgi, d3dcompiler).
-    # See vendor/dawn/lib/libwebgpu_dawn.a (built per-platform on the
-    # respective CI runner — same hidden-visibility CMake flags as Linux).
-    EXTRA_LINK="-L${PKG_ROOT}/vendor/dawn/lib -lwebgpu_dawn -ld3d12 -ldxgi -ld3dcompiler -lstdc++"
+    # See vendor/dawn/lib/webgpu_dawn.lib (built on the Windows CI
+    # runner — same hidden-visibility CMake flags as Linux).
+    EXTRA_LINK_ARGS=(
+      "-L${PKG_ROOT}/vendor/dawn/lib"
+      -lwebgpu_dawn -ld3d12 -ldxgi -ld3dcompiler -lstdc++
+    )
+    # Zig's link step on Windows (msvc ABI) doesn't pick up the LIB env
+    # var that vcvars64.bat / ilammy/msvc-dev-cmd populates. Translate
+    # each entry into an explicit `-L` so Zig finds the Windows SDK
+    # system libraries (d3dcompiler.lib, d3d12.lib, dxgi.lib live under
+    # `Windows Kits\10\Lib\<sdk-ver>\um\x64`).
+    if [[ -n "${LIB:-}" ]]; then
+      IFS=';' read -ra LIB_DIRS <<< "$LIB"
+      for d in "${LIB_DIRS[@]}"; do
+        [[ -n "$d" ]] && EXTRA_LINK_ARGS+=( "-L$d" )
+      done
+    fi
     ;;
   *) echo "no link config for $HOST_OS" >&2; exit 1 ;;
 esac
@@ -125,7 +145,7 @@ mise exec -- zig build-lib \
   -O ReleaseSafe \
   -fallow-shlib-undefined \
   -z undefs \
-  $EXTRA_LINK \
+  "${EXTRA_LINK_ARGS[@]}" \
   -femit-bin="$OUT"
 
 echo "built: $OUT ($(stat -f%z "$OUT" 2>/dev/null || stat -c%s "$OUT") bytes)"

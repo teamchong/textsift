@@ -212,6 +212,24 @@ export interface CreateOptions {
   signal?: AbortSignal;
 
   /**
+   * Node-only model loading overrides. Browser ignores these (model
+   * lives in OPFS there). All three are also pickable from env vars:
+   * `TEXTSIFT_CACHE_DIR`, `TEXTSIFT_MODEL_PATH`, `TEXTSIFT_OFFLINE`.
+   *
+   * - `cacheDir` — alternate cache root. Default:
+   *   `$XDG_CACHE_HOME/textsift` or `~/.cache/textsift`.
+   * - `modelPath` — absolute path to a pre-staged
+   *   `model_q4f16.onnx`. Skips both cache and network. The companion
+   *   `.onnx_data` file must live next to it as
+   *   `<modelPath>_data`.
+   * - `offline` — fail loudly on cache miss instead of fetching.
+   *   For CI / air-gapped environments.
+   */
+  cacheDir?: string;
+  modelPath?: string;
+  offline?: boolean;
+
+  /**
    * Override the default marker strategy. Default marker for a span
    * labelled `private_person` is `"[private_person]"`. Return `null`
    * to emit the original text unchanged for a given category.

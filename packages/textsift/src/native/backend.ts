@@ -404,9 +404,14 @@ export class NodeBackend implements InferenceBackend {
     this.handle = this.api.createBackend();
 
     // Pull ONNX from model source (HTTP + on-disk cache) and parse.
+    const loaderOpts = {
+      cacheDir: this.opts.cacheDir,
+      modelPath: this.opts.modelPath,
+      offline: this.opts.offline,
+    };
     const [graphBytes, extBytes] = await Promise.all([
-      fetchOnnxGraph(this.opts.bundle.modelSource),
-      fetchOnnxExtData(this.opts.bundle.modelSource),
+      fetchOnnxGraph(this.opts.bundle.modelSource, loaderOpts),
+      fetchOnnxExtData(this.opts.bundle.modelSource, loaderOpts),
     ]);
     const graph = parseOnnxGraph(graphBytes);
     const { buffers, numLayers } = uploadWeights(this.api, this.handle, graph, extBytes);

@@ -61,4 +61,13 @@ export interface BackendConstructionOptions {
   quantization: "int4" | "int8" | "fp16";
   /** Execution device hint. Custom backends may interpret this however they need; built-in backends ignore it. */
   device: "auto" | "wasm" | "webgpu";
+  /**
+   * Node-only model loading overrides. Ignored by browser backends.
+   * Forwarded to the on-disk loader so callers (especially the CLI)
+   * can pin a cache location, point at a pre-staged file, or fail
+   * loudly on cache miss.
+   */
+  cacheDir?: string;
+  modelPath?: string;
+  offline?: boolean;
 }

@@ -61,6 +61,11 @@ export class PrivacyFilter extends BrowserPrivacyFilter {
     // Try the native fast path first. If it fails (no GPU, missing
     // platform binary, etc.), fall back to the WASM CPU path so
     // PrivacyFilter still works — same API, slower runtime.
+    const loaderOverrides = {
+      cacheDir: opts.cacheDir,
+      modelPath: opts.modelPath,
+      offline: opts.offline,
+    };
     const resolver: BackendResolver = {
       async resolveAuto({ bundle, quantization }) {
         try {
@@ -68,6 +73,7 @@ export class PrivacyFilter extends BrowserPrivacyFilter {
             bundle,
             quantization,
             device: "webgpu",
+            ...loaderOverrides,
           });
           await backend.warmup();
           return backend;

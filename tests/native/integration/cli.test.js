@@ -172,6 +172,57 @@ await check("--offline + cold cacheDir exits with clear error", async () => {
   assert.match(r.stderr, /TEXTSIFT_OFFLINE|cache miss|offline/i);
 });
 
+await check("--min-confidence rejects out-of-range values", async () => {
+  const r = await run(["detect", "--min-confidence", "1.5", "--no-prompt"], "Hi");
+  assert.equal(r.code, 2);
+  assert.match(r.stderr, /must be a number between 0 and 1/);
+});
+
+await check("--min-confidence 0 (default) keeps all spans", async () => {
+  const r = await run(["detect", "--min-confidence", "0", "--no-prompt"], "Hi Alice, alice@example.com");
+  assert.equal(r.code, 0);
+  const parsed = JSON.parse(r.stdout);
+  assert.ok(parsed.spans.length >= 1);
+});
+
+await check("--min-confidence 0.999 still keeps high-confidence spans", async () => {
+  // Model returns confidence 1.0 for this clear input.
+  const r = await run(["detect", "--min-confidence", "0.999", "--no-prompt"], "Hi Alice, alice@example.com");
+  assert.equal(r.code, 0);
+  const parsed = JSON.parse(r.stdout);
+  // Every kept span should pass the threshold.
+  for (const s of parsed.spans) {
+    assert.ok(s.confidence >= 0.999, `span ${s.label} below threshold: ${s.confidence}`);
+  }
+});
+
+await check("detect --sarif emits valid SARIF v2.1.0", async () => {
+  const r = await run(["detect", "--sarif", "--no-prompt"], "Hi Alice, alice@example.com");
+  assert.equal(r.code, 0);
+  const sarif = JSON.parse(r.stdout);
+  assert.equal(sarif.version, "2.1.0");
+  assert.equal(sarif.runs[0].tool.driver.name, "textsift");
+  assert.ok(sarif.runs[0].results.length >= 1);
+  // First result has the expected SARIF shape
+  const result = sarif.runs[0].results[0];
+  assert.ok(result.ruleId);
+  assert.ok(["error", "warning", "note"].includes(result.level));
+  assert.ok(result.locations[0].physicalLocation.region.startLine);
+  assert.ok(result.partialFingerprints?.primaryLocationLineHash);
+});
+
+await check("detect --sarif from a file uses the path as the SARIF artifact uri", async () => {
+  const file = resolve(work, "input-for-sarif.txt");
+  await writeFile(file, "Email me at alice@example.com");
+  const r = await run(["detect", file, "--sarif", "--no-prompt"]);
+  assert.equal(r.code, 0);
+  const sarif = JSON.parse(r.stdout);
+  assert.equal(
+    sarif.runs[0].results[0].locations[0].physicalLocation.artifactLocation.uri,
+    file,
+  );
+});
+
 await rm(work, { recursive: true, force: true });
 
 console.log(`\n${pass}/${pass + fail} passed`);

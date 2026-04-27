@@ -47,6 +47,20 @@ inputs:
       Pair with `actions/cache` to persist the 770 MB model across runs.
     required: false
     default: ''
+  min-confidence:
+    description: |
+      Drop spans below this confidence threshold (0..1). Default: `0`
+      — keep every span. Higher values trade recall for precision.
+    required: false
+    default: '0'
+  sarif-output:
+    description: |
+      If set to a file path, write SARIF v2.1.0 to that path. Pair
+      with `github/codeql-action/upload-sarif` to surface findings
+      in the repo's Security tab as proper alerts (not just PR
+      annotations).
+    required: false
+    default: ''
 
 runs:
   using: 'composite'
@@ -103,6 +117,7 @@ runs:
         TEXTSIFT_CACHE_DIR: ${{ inputs.cache-dir }}
         TEXTSIFT_PRECOMMIT_SEVERITY: ${{ inputs.severity }}
         TEXTSIFT_PRECOMMIT_SECRETS: ${{ inputs.secrets == 'true' && '1' || '0' }}
+        TEXTSIFT_PRECOMMIT_MIN_CONFIDENCE: ${{ inputs.min-confidence }}
       run: |
         if [ "${{ steps.files.outputs.count }}" = "0" ]; then
           echo "No files to scan."
@@ -122,4 +137,7 @@ runs:
         # workflow commands itself when GITHUB_ACTIONS=true.
         EXTRA=()
         if [ "${{ inputs.warn-only }}" = "true" ]; then EXTRA+=("--warn-only"); fi
+        if [ -n "${{ inputs.sarif-output }}" ]; then
+          EXTRA+=("--sarif" "${{ inputs.sarif-output }}")
+        fi
         xargs -a /tmp/textsift-files.txt node "$SCRIPT" "${EXTRA[@]}"

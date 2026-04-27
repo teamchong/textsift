@@ -480,9 +480,17 @@ export class PrivacyFilter {
       opts.rules ?? this.opts.rules,
       opts.presets ?? this.opts.presets,
     );
-    if (rules.length === 0) return modelSpans;
-    const ruleSpans = runRules(text, rules);
-    return mergeRuleSpans(modelSpans, ruleSpans);
+    const allSpans = rules.length === 0
+      ? modelSpans
+      : mergeRuleSpans(modelSpans, runRules(text, rules));
+
+    // Confidence threshold: drop low-confidence model spans. Rule
+    // spans always have confidence: 1.0 so they pass any threshold.
+    // Per-call option wins over the create-time default; both default
+    // to 0 (keep every span).
+    const threshold = opts.minConfidence ?? this.opts.minConfidence ?? 0;
+    if (threshold <= 0) return allSpans;
+    return allSpans.filter((s) => s.confidence >= threshold);
   }
 
   private enqueue<T>(fn: () => Promise<T>): Promise<T> {

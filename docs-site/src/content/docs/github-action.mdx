@@ -36,6 +36,8 @@ That's the minimum. The action handles cache, model download, file selection (PR
 | `secrets` | `'true'` | Set to `'false'` if you already use gitleaks / trufflehog. |
 | `textsift-version` | `'latest'` | npm version. Pin to a tag (`'0.1.0'`) for reproducible CI. |
 | `cache-dir` | runner default | Override the model cache location. |
+| `min-confidence` | `'0'` | Drop spans below this confidence (0..1). Trades recall for precision. |
+| `sarif-output` | `''` | If set, write SARIF v2.1.0 to that path. Pair with `codeql-action/upload-sarif` for the GitHub Security tab. |
 
 ## Common patterns
 
@@ -78,6 +80,32 @@ Glob is passed to `git ls-files`; respects `.gitignore`.
 ```
 
 textsift's regex secrets preset overlaps with gitleaks. If gitleaks is your secrets baseline, let textsift focus on what only the model catches (names, emails, phones, addresses, etc.).
+
+### GitHub Code Scanning integration (Security tab)
+
+```yaml
+permissions:
+  contents: read
+  security-events: write   # required to upload SARIF
+
+jobs:
+  pii:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: teamchong/textsift@v1
+        with:
+          sarif-output: textsift.sarif
+          warn-only: 'true'   # let SARIF be the gating signal, not the action
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: textsift.sarif
+          category: textsift
+```
+
+After the first run, findings appear in the repo's **Security → Code scanning** tab as proper alerts (with assignment, dismissal, and history). PR check status comes from Code Scanning's rules, so you can configure `warn-only: 'true'` on the action and let GitHub gate the merge based on the alert severity.
 
 ### Pin the version for reproducible CI
 

@@ -18,6 +18,16 @@ import { argv, env, stderr, stdout, exit, cwd } from "node:process";
 const MAX_BYTES = Number(env.TEXTSIFT_PRECOMMIT_MAX_BYTES ?? 1_000_000); // 1 MB
 const SEVERITY = (env.TEXTSIFT_PRECOMMIT_SEVERITY ?? "block").toLowerCase();
 const ENABLE_SECRETS = (env.TEXTSIFT_PRECOMMIT_SECRETS ?? "1") !== "0";
+const MIN_CONFIDENCE = (() => {
+  const v = env.TEXTSIFT_PRECOMMIT_MIN_CONFIDENCE;
+  if (!v) return 0;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0 || n > 1) {
+    stderr.write(`textsift-pii-scan: invalid TEXTSIFT_PRECOMMIT_MIN_CONFIDENCE "${v}" (expected 0..1)\n`);
+    exit(2);
+  }
+  return n;
+})();
 
 // Extensions known to be generated / binary / not worth scanning.
 // Pre-commit's `exclude` regex in `.pre-commit-hooks.yaml` is the
@@ -40,12 +50,22 @@ const SKIP_EXT = new Set([
 const args = argv.slice(2);
 let warnOnly = false;
 let allowList = false;
+let sarifPath = null;
 const files = [];
 for (let i = 0; i < args.length; i++) {
   const a = args[i];
   if (a === "--warn-only") warnOnly = true;
   else if (a === "--severity") { /* env supersedes; advance past value */ i++; }
   else if (a === "--allow-list") allowList = true;
+  else if (a === "--sarif") {
+    const next = args[i + 1];
+    if (!next || next.startsWith("-")) {
+      stderr.write("textsift-pii-scan: --sarif requires a file path argument.\n");
+      exit(2);
+    }
+    sarifPath = next;
+    i++;
+  }
   else if (a === "--help" || a === "-h") {
     stdout.write([
       "textsift-pii-scan — pre-commit hook entry",
@@ -55,11 +75,14 @@ for (let i = 0; i < args.length; i++) {
       "Options:",
       "  --warn-only          Always exit 0 even if PII found.",
       "  --allow-list         Print files that would be skipped (debug).",
+      "  --sarif <path>       Also write SARIF v2.1.0 to <path> for upload to",
+      "                       GitHub Code Scanning / similar consumers.",
       "",
       "Env vars:",
-      "  TEXTSIFT_PRECOMMIT_MAX_BYTES   Skip files larger than N bytes (default 1000000).",
-      "  TEXTSIFT_PRECOMMIT_SEVERITY    'block' (default), 'warn', or 'all'.",
-      "  TEXTSIFT_PRECOMMIT_SECRETS     '0' to disable the secrets rule preset.",
+      "  TEXTSIFT_PRECOMMIT_MAX_BYTES        Skip files larger than N bytes (default 1000000).",
+      "  TEXTSIFT_PRECOMMIT_SEVERITY         'block' (default), 'warn', or 'all'.",
+      "  TEXTSIFT_PRECOMMIT_SECRETS          '0' to disable the secrets rule preset.",
+      "  TEXTSIFT_PRECOMMIT_MIN_CONFIDENCE   Drop spans below this confidence (0..1).",
       "  TEXTSIFT_OFFLINE / TEXTSIFT_MODEL_PATH / etc — same as the CLI loader flags.",
       "",
     ].join("\n"));
@@ -118,6 +141,7 @@ try {
   filter = await PrivacyFilter.create({
     backend: "auto",
     presets: ENABLE_SECRETS ? ["secrets"] : undefined,
+    minConfidence: MIN_CONFIDENCE > 0 ? MIN_CONFIDENCE : undefined,
     // CI defaults: respect TEXTSIFT_OFFLINE if set, never prompt.
     // First-run on a dev box: warn loudly so the user knows what's
     // about to download.
@@ -129,6 +153,9 @@ try {
 }
 
 const findings = [];
+// Raw per-file findings retained when --sarif was requested. Avoids
+// re-running detect just to emit a different format.
+const sarifFindings = sarifPath ? [] : null;
 
 function lineColOf(text, offset) {
   let line = 1, col = 1;
@@ -155,6 +182,13 @@ for (const { path } of candidates) {
   if (result.spans.length === 0) continue;
 
   const blockingSpans = result.spans.filter(spanIsBlocking);
+
+  // Collect for SARIF output if requested. Use the same blocking
+  // filter so the SARIF log matches the CLI's exit decision.
+  if (sarifFindings && blockingSpans.length > 0) {
+    sarifFindings.push({ uri: relative(cwd(), path), text, spans: blockingSpans });
+  }
+
   if (blockingSpans.length === 0) continue;
 
   findings.push({
@@ -170,6 +204,18 @@ for (const { path } of candidates) {
 }
 
 filter.dispose();
+
+// Write SARIF before any text output so a failed --sarif write
+// surfaces before the human-readable section.
+if (sarifPath) {
+  const { toSarif } = await import("textsift/sarif");
+  const log = toSarif(sarifFindings ?? [], {
+    modelSpanLevel: warnOnly ? "warning" : "error",
+  });
+  const { writeFile } = await import("node:fs/promises");
+  await writeFile(sarifPath, JSON.stringify(log, null, 2));
+  stderr.write(`textsift-pii-scan: wrote SARIF to ${sarifPath}\n`);
+}
 
 // ── Report + exit ──
 

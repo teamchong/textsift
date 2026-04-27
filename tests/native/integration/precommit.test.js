@@ -166,6 +166,32 @@ await check("annotations escape newlines/percent in preview text", async () => {
   }
 });
 
+await check("--sarif <path> writes SARIF v2.1.0 alongside human output", async () => {
+  const sarifOut = resolve(work, "findings.sarif");
+  const r = await run(["--sarif", sarifOut, piiFile]);
+  assert.equal(r.code, 1);
+  const { readFile } = await import("node:fs/promises");
+  const sarif = JSON.parse(await readFile(sarifOut, "utf8"));
+  assert.equal(sarif.version, "2.1.0");
+  assert.equal(sarif.runs[0].tool.driver.name, "textsift");
+  assert.ok(sarif.runs[0].results.length >= 1);
+});
+
+await check("TEXTSIFT_PRECOMMIT_MIN_CONFIDENCE filters low-confidence spans", async () => {
+  // Threshold of 0.999 keeps the high-confidence model spans on this
+  // input (they come back at 1.0). Set it to 1.1 to reject every span
+  // (impossible threshold) — should exit 0.
+  const r = await run([piiFile], { TEXTSIFT_PRECOMMIT_MIN_CONFIDENCE: "1.1" });
+  // Out-of-range; precommit.js validates it and exits 2.
+  assert.equal(r.code, 2);
+  assert.match(r.stderr, /invalid TEXTSIFT_PRECOMMIT_MIN_CONFIDENCE/);
+});
+
+await check("TEXTSIFT_PRECOMMIT_MIN_CONFIDENCE=0.5 still passes high-confidence model spans", async () => {
+  const r = await run([piiFile], { TEXTSIFT_PRECOMMIT_MIN_CONFIDENCE: "0.5" });
+  assert.equal(r.code, 1, "spans confidence 1.0 should pass 0.5 threshold");
+});
+
 await rm(work, { recursive: true, force: true });
 
 console.log(`\n${pass}/${pass + fail} passed`);

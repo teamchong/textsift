@@ -269,6 +269,13 @@ export interface CreateOptions {
    * Presets and `rules` compose — both run, both contribute spans.
    */
   presets?: readonly string[];
+
+  /**
+   * Drop spans whose model confidence is below this threshold (0..1).
+   * Default: `0` — keep every span. Per-call `RedactOptions.minConfidence`
+   * overrides this default.
+   */
+  minConfidence?: number;
 }
 
 /**
@@ -373,6 +380,14 @@ export interface RedactOptions {
    * semantics as the create-time option.
    */
   presets?: readonly string[];
+  /**
+   * Drop spans whose model confidence is below this threshold (0..1).
+   * Default: `0` — keep every span. Higher values trade recall for
+   * precision; useful for noisy inputs or when the false-positive
+   * rate matters more than missing PII. Rule spans always have
+   * `confidence: 1.0` (deterministic) so they pass any threshold.
+   */
+  minConfidence?: number;
   /** AbortSignal for cancelling a long inference. */
   signal?: AbortSignal;
 }

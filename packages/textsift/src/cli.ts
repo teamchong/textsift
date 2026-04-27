@@ -34,7 +34,9 @@ REDACT / DETECT FLAGS
   --in-place                 Write back to <file> instead of stdout.
   --secrets                  Enable the built-in "secrets" rule preset.
   --synth                    Faker mode: realistic fakes instead of [label] markers.
+  --min-confidence <N>       Drop spans with confidence < N (0..1). Default: 0.
   --jsonl                    detect: emit one span per line (jq-friendly).
+  --sarif                    detect: emit SARIF v2.1.0 (for GitHub Code Scanning, etc.).
 
 TABLE / CLASSIFY FLAGS
   --header                   First row is column headers (default: data only).
@@ -143,6 +145,17 @@ function loaderOptsFromFlags(flags: Record<string, string | boolean>): Partial<C
 
 function presetsFromFlags(flags: Record<string, string | boolean>): string[] | undefined {
   return flagBool(flags, "secrets") ? ["secrets"] : undefined;
+}
+
+function minConfidenceFromFlags(flags: Record<string, string | boolean>): number | undefined {
+  const v = flagStr(flags, "min-confidence");
+  if (v === undefined) return undefined;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0 || n > 1) {
+    stderr.write(`textsift: --min-confidence must be a number between 0 and 1, got "${v}"\n`);
+    exit(2);
+  }
+  return n;
 }
 
 function progressBar(loaded: number, total: number): string {
@@ -263,6 +276,7 @@ async function cmdRedact(args: ParsedArgs): Promise<void> {
   const filter = await buildFilter(args.flags, {
     presets: presetsFromFlags(args.flags),
     markers: flagBool(args.flags, "synth") ? markerPresets.faker() : undefined,
+    minConfidence: minConfidenceFromFlags(args.flags),
   });
   const result = await filter.redact(text);
   filter.dispose();
@@ -275,13 +289,17 @@ async function cmdRedact(args: ParsedArgs): Promise<void> {
 }
 
 async function cmdDetect(args: ParsedArgs): Promise<void> {
-  const { text } = await readInput(args.positional);
+  const { text, path } = await readInput(args.positional);
   const filter = await buildFilter(args.flags, {
     presets: presetsFromFlags(args.flags),
+    minConfidence: minConfidenceFromFlags(args.flags),
   });
   const result = await filter.detect(text);
   filter.dispose();
-  if (flagBool(args.flags, "jsonl")) {
+  if (flagBool(args.flags, "sarif")) {
+    const { detectResultToSarif } = await import("./sarif.js");
+    stdout.write(JSON.stringify(detectResultToSarif(result, path ?? "<stdin>"), null, 2) + "\n");
+  } else if (flagBool(args.flags, "jsonl")) {
     for (const s of result.spans) stdout.write(JSON.stringify(s) + "\n");
   } else {
     stdout.write(JSON.stringify({
@@ -297,6 +315,7 @@ async function cmdTable(args: ParsedArgs): Promise<void> {
   const rows = parseCsv(text);
   const filter = await buildFilter(args.flags, {
     presets: presetsFromFlags(args.flags),
+    minConfidence: minConfidenceFromFlags(args.flags),
   });
   const mode = (flagStr(args.flags, "mode") ?? "redact") as RedactTableMode;
   const sampleSize = flagStr(args.flags, "sample-size");
@@ -318,7 +337,9 @@ async function cmdTable(args: ParsedArgs): Promise<void> {
 async function cmdClassify(args: ParsedArgs): Promise<void> {
   const { text } = await readInput(args.positional);
   const rows = parseCsv(text);
-  const filter = await buildFilter(args.flags);
+  const filter = await buildFilter(args.flags, {
+    minConfidence: minConfidenceFromFlags(args.flags),
+  });
   const sampleSize = flagStr(args.flags, "sample-size");
   const cols = await filter.classifyColumns(rows, {
     headerRow: flagBool(args.flags, "header"),

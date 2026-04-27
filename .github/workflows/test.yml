@@ -183,6 +183,13 @@ jobs:
         shell: bash
         run: node tests/native/integration/filter-fallback.test.js
 
+      # Span output must agree with the PyTorch reference (committed
+      # fixtures from tests/conformance/pytorch/generate-fixtures.py).
+      # Skips cleanly if fixtures.json hasn't been generated yet.
+      - name: Integration test — PyTorch parity (committed fixtures)
+        shell: bash
+        run: node tests/native/integration/pytorch-parity.test.js
+
   # Browser test path — independent of the native test matrix above.
   browser-test:
     name: browser (playwright)

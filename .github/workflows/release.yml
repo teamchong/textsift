@@ -26,14 +26,23 @@ jobs:
             label: linux-arm64
             triple: linux-arm64
             backend: vulkan
+          # Both macOS targets build on the same Apple Silicon runner.
+          # darwin-x64 is produced via Zig cross-compile (`-target
+          # x86_64-macos`); we used to schedule it on `macos-13` (the
+          # only x64 Mac runner GitHub still offers in the free pool),
+          # but that pool is so capacity-starved that one v0.1.0 attempt
+          # sat queued for 24 hours and timed out without picking up a
+          # runner. Cross-compile from arm64 sidesteps the queue entirely.
           - os: macos-latest
             label: darwin-arm64
             triple: darwin-arm64
             backend: metal
-          - os: macos-13
+            zig_target: aarch64-macos
+          - os: macos-latest
             label: darwin-x64
             triple: darwin-x64
             backend: metal
+            zig_target: x86_64-macos
           - os: windows-latest
             label: windows-x64
             triple: windows-x64
@@ -112,7 +121,12 @@ jobs:
           fi
 
       - run: npm install --no-audit --no-fund
-      - run: bash packages/textsift/scripts/build-native.sh
+      - name: Build native (.node)
+        env:
+          # Empty for native builds; set per-row to cross-compile (only
+          # used by the darwin-x64-from-arm64 row today).
+          ZIG_TARGET: ${{ matrix.zig_target || '' }}
+        run: bash packages/textsift/scripts/build-native.sh
 
       - name: Upload .node binary
         uses: actions/upload-artifact@v4

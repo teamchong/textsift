@@ -80,6 +80,22 @@ case "$HOST_OS" in
       -framework IOKit -framework CoreGraphics -framework MetalKit
       -framework AppKit
     )
+    # Cross-compile (arm64 host → x86_64-macos target) needs explicit
+    # Apple SDK paths. Zig auto-discovers these for native targets
+    # only. Tried `--sysroot` alone — Zig still says "framework not
+    # found"; `-F` alone works for framework lookup but the C header
+    # search root is wrong (transitively including <Security/Security.h>
+    # pulls in `<libDER/DERItem.h>` which only resolves via the SDK's
+    # `usr/include`). Combine all three: `-F` for frameworks, `-L` for
+    # libs, `-I` for the SDK headers (so libDER and friends resolve).
+    if [[ -n "${ZIG_TARGET:-}" ]]; then
+      SDK_PATH="$(xcrun --sdk macosx --show-sdk-path)"
+      EXTRA_LINK_ARGS+=(
+        "-F" "$SDK_PATH/System/Library/Frameworks"
+        "-L" "$SDK_PATH/usr/lib"
+        "-I" "$SDK_PATH/usr/include"
+      )
+    fi
     ;;
   linux)
     # libvulkan for Vulkan-direct. Dawn is no longer linked on Linux —
@@ -154,14 +170,26 @@ case "$HOST_OS" in
     ;;
 esac
 
-# On Windows, target MSVC ABI explicitly. Zig's default
-# `native-native` resolves to `windows-gnu` (MinGW) — but Dawn's
-# webgpu_dawn.lib is built with MSVC ABI (clang on Windows defaults
-# to MSVC). Mixing them produces duplicate-symbol link errors on
-# Control Flow Guard intrinsics (libmingw32 vs msvcrt). Forcing
-# `windows-msvc` makes Zig link MSVC's C runtime exclusively.
+# Cross-compile target. Two reasons we set `-target` explicitly:
+#
+# 1. Windows: Zig's default `native-native` resolves to `windows-gnu`
+#    (MinGW) but Dawn's webgpu_dawn.lib is built MSVC ABI (clang on
+#    Windows defaults to MSVC). Mixing them produces duplicate-symbol
+#    link errors on Control Flow Guard intrinsics (libmingw32 vs
+#    msvcrt). `windows-msvc` makes Zig link MSVC's CRT exclusively.
+#
+# 2. Cross-compile from Apple Silicon to Intel macOS. GitHub Actions'
+#    `macos-13` (Intel) runner pool is unreliably available — jobs
+#    queue for hours and time out at 24h. Building `darwin-x64` from
+#    `macos-latest` (arm64) via `ZIG_TARGET=x86_64-macos` skips that
+#    queue entirely. Zig handles the cross-link to Apple's universal
+#    framework binaries (Metal, Foundation, etc.) natively.
+#
+# Caller can override the target with the ZIG_TARGET env var.
 ZIG_TARGET_ARGS=()
-if [[ "$HOST_OS" == "windows" ]]; then
+if [[ -n "${ZIG_TARGET:-}" ]]; then
+  ZIG_TARGET_ARGS=( -target "$ZIG_TARGET" )
+elif [[ "$HOST_OS" == "windows" ]]; then
   ZIG_TARGET_ARGS=( -target "${HOST_ARCH}-windows-msvc" )
 fi
 

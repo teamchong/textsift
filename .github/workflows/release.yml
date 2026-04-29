@@ -1,17 +1,50 @@
 name: release
 
+# Triggered by bumping `packages/textsift/package.json`'s `version`
+# field on `main`. Mirrors the turboquant-wasm / vectorjson release
+# shape; on push to `main` the OIDC token's `ref` is `refs/heads/main`,
+# which is what npm's Trusted Publisher entries expect by default.
+# (Tag-based pushes set `ref: refs/tags/...` and would need an
+# explicit tag pattern in each Trusted Publisher entry.)
 on:
-  push:
-    tags: ["v*.*.*"]
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Version tag to publish (e.g. v0.1.0)"
-        required: true
+  push:
+    branches: [main]
+    paths:
+      - "packages/textsift/package.json"
 
 jobs:
+  # ── Read the version from package.json; skip if a matching v* tag ──
+  # ── already exists (so re-running on the same version is a no-op). ──
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      should_release: ${{ steps.version.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Resolve version + check tag
+        id: version
+        run: |
+          VERSION=$(node -p "require('./packages/textsift/package.json').version")
+          TAG="v$VERSION"
+          echo "Version: $VERSION, tag: $TAG"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "tag $TAG already exists; skipping release"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
   # ── Build per-platform .node binary, upload as job artifact ──
   build:
+    needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
     name: build ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -139,7 +172,8 @@ jobs:
   publish:
     name: publish to npm
     runs-on: ubuntu-latest
-    needs: build
+    needs: [check-version, build]
+    if: needs.check-version.outputs.should_release == 'true'
     permissions:
       contents: read
       id-token: write   # for npm provenance
@@ -207,7 +241,24 @@ jobs:
       - name: Publish per-triple subpackages
         run: node scripts/publish-natives.mjs
         env:
-          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          RELEASE_TAG: ${{ needs.check-version.outputs.tag }}
 
       - name: Publish umbrella textsift package
         run: cd packages/textsift && npm publish --access public --provenance
+
+  # ── After successful publish, push the v$VERSION tag so the source ──
+  # ── of truth in git matches what's on npm. ──
+  create-tag:
+    needs: [check-version, publish]
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create and push tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "${{ needs.check-version.outputs.tag }}"
+          git push origin "${{ needs.check-version.outputs.tag }}"

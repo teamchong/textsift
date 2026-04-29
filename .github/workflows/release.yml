@@ -177,6 +177,28 @@ jobs:
       # Build the browser bundle (includes WASM SIMD path for browsers).
       - run: npm run build:browser -w textsift
 
+      # Diagnostic: print the GitHub OIDC token claims that npm uses
+      # to match against the Trusted Publisher config. If publish fails
+      # with the misleading 404 ("not in this registry"), the claims
+      # below are what to compare against the Trusted Publisher entry
+      # on npmjs.com. Especially `workflow_ref` (must end with the
+      # filename in the config) and `environment` (must match — empty
+      # config requires empty here).
+      - name: Print OIDC claims (diagnostic)
+        run: |
+          set -e
+          tok=$(curl -fsSL \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=npm:registry.npmjs.org" \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            | jq -r .value)
+          payload=$(printf '%s' "$tok" | cut -d. -f2)
+          # Pad base64url to base64 length, then decode
+          padding=$(( (4 - ${#payload} % 4) % 4 ))
+          printf '%s' "$payload$(printf '=%.0s' $(seq 1 $padding))" \
+            | tr '_-' '/+' \
+            | base64 -d \
+            | jq '{repository, workflow, workflow_ref, ref, ref_type, environment, sub, job_workflow_ref}'
+
       # npm trusted publishing (OIDC). The job's `id-token: write`
       # permission lets `npm publish --provenance` exchange the GitHub
       # OIDC token for an npm publish token at request time — no

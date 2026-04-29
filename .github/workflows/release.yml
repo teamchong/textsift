@@ -168,15 +168,91 @@ jobs:
           path: packages/textsift/dist/textsift-native.node
           retention-days: 7
 
-  # ── Pull all binaries down + publish per-triple optionalDependencies + the umbrella ──
-  publish:
-    name: publish to npm
-    runs-on: ubuntu-latest
+  # ── Per-triple OIDC publish: one top-level `npm publish --provenance` ──
+  # ── per matrix row, mirroring the turboquant-wasm / vectorjson shape. ──
+  # ── (Earlier we wrapped this in execSync from a Node script and npm  ──
+  # ── rejected with the misleading 404; matching the working sibling   ──
+  # ── repos exactly takes that variable off the table.)                ──
+  publish-native:
     needs: [check-version, build]
     if: needs.check-version.outputs.should_release == 'true'
+    name: publish ${{ matrix.triple }}
+    runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write   # for npm provenance
+      id-token: write   # for npm provenance / OIDC trusted publishing
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - triple: linux-x64
+            os: linux
+            cpu: x64
+            libc: glibc
+          - triple: linux-arm64
+            os: linux
+            cpu: arm64
+            libc: glibc
+          - triple: darwin-x64
+            os: darwin
+            cpu: x64
+          - triple: darwin-arm64
+            os: darwin
+            cpu: arm64
+          - triple: windows-x64
+            os: win32
+            cpu: x64
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Download .node artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: textsift-${{ matrix.triple }}
+          path: pkg
+
+      - name: Stage package.json
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+          TRIPLE: ${{ matrix.triple }}
+          OS: ${{ matrix.os }}
+          CPU: ${{ matrix.cpu }}
+          LIBC: ${{ matrix.libc }}
+        run: |
+          libc_field=""
+          if [[ -n "${LIBC:-}" ]]; then
+            libc_field=$',\n  "libc": ["'"$LIBC"'"]'
+          fi
+          cat > pkg/package.json <<EOF
+          {
+            "name": "textsift-$TRIPLE",
+            "version": "$VERSION",
+            "description": "textsift native binding for $TRIPLE",
+            "main": "textsift-native.node",
+            "files": ["textsift-native.node"],
+            "os": ["$OS"],
+            "cpu": ["$CPU"]$libc_field,
+            "license": "Apache-2.0",
+            "repository": { "type": "git", "url": "git+https://github.com/teamchong/textsift.git" }
+          }
+          EOF
+
+      - name: Publish to npm (OIDC)
+        run: cd pkg && npm publish --access public --provenance
+
+  # ── After all 5 natives publish, build the browser bundle and publish ──
+  # ── the umbrella with optionalDependencies pinned to matching versions. ──
+  publish-umbrella:
+    needs: [check-version, publish-native]
+    if: needs.check-version.outputs.should_release == 'true'
+    name: publish textsift (umbrella)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -184,50 +260,46 @@ jobs:
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
-
       - uses: jdx/mise-action@v2
-        with:
-          experimental: true
+        with: { experimental: true }
 
       - name: Install binaryen (wasm-opt) from upstream release
-        # Apt's binaryen is too old to parse the SIMD opcodes Zig 0.16
-        # emits. Pin to match developer Macs (homebrew binaryen 128).
+        # Apt's binaryen is too old to parse the SIMD opcodes Zig 0.16 emits.
         run: |
           set -e
           BINARYEN_VERSION="version_128"
           curl -fsSL "https://github.com/WebAssembly/binaryen/releases/download/${BINARYEN_VERSION}/binaryen-${BINARYEN_VERSION}-x86_64-linux.tar.gz" | tar -xz -C /tmp
           sudo cp -r /tmp/binaryen-${BINARYEN_VERSION}/bin/* /usr/local/bin/
           sudo cp -r /tmp/binaryen-${BINARYEN_VERSION}/lib/* /usr/local/lib/
-          wasm-opt --version
-
-      - name: Download all .node artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: native-bins
-          pattern: textsift-*
 
       - run: npm install --no-audit --no-fund
 
-      # Build the browser bundle (includes WASM SIMD path for browsers).
+      # Build dist/browser/* and dist/index.js / cli.js / sarif.js + types.
       - run: npm run build:browser -w textsift
+      - run: cd packages/textsift && bun build src/index.ts --outdir dist --target node --format esm --sourcemap=external && bun build src/cli.ts --outdir dist --target node --format esm --sourcemap=external && bun build src/sarif.ts --outdir dist --target node --format esm --sourcemap=external
 
-      # npm trusted publishing (OIDC). The job's `id-token: write`
-      # permission lets `npm publish --provenance` exchange the GitHub
-      # OIDC token for an npm publish token at request time — no
-      # NPM_TOKEN secret needed. Configure on npmjs.com per package
-      # before tagging.
-      - name: Publish per-triple subpackages
-        run: node scripts/publish-natives.mjs
+      - name: Pin optionalDependencies to matching version
         env:
-          RELEASE_TAG: ${{ needs.check-version.outputs.tag }}
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs");
+          const p = "packages/textsift/package.json";
+          const pkg = JSON.parse(fs.readFileSync(p, "utf8"));
+          pkg.optionalDependencies = {};
+          for (const t of ["linux-x64","linux-arm64","darwin-x64","darwin-arm64","windows-x64"]) {
+            pkg.optionalDependencies["textsift-" + t] = process.env.VERSION;
+          }
+          fs.writeFileSync(p, JSON.stringify(pkg, null, 2) + "\n");
+          NODE
 
-      - name: Publish umbrella textsift package
+      - name: Publish to npm (OIDC)
         run: cd packages/textsift && npm publish --access public --provenance
 
   # ── After successful publish, push the v$VERSION tag so the source ──
   # ── of truth in git matches what's on npm. ──
   create-tag:
-    needs: [check-version, publish]
+    needs: [check-version, publish-umbrella]
     if: needs.check-version.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     permissions:

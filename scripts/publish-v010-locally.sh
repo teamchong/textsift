@@ -52,6 +52,10 @@ trap 'rm -rf "$WORKDIR"' EXIT
 for entry in "${TRIPLES[@]}"; do
   read -r triple os cpu libc <<< "$entry"
   echo
+  if npm view "textsift-$triple@$VERSION" version >/dev/null 2>&1; then
+    echo "==> textsift-$triple@$VERSION already on npm, skipping"
+    continue
+  fi
   echo "==> publish textsift-$triple@$VERSION"
 
   src="$ARTIFACTS_DIR/textsift-$triple/textsift-native.node"
@@ -86,18 +90,33 @@ EOF
   ( cd "$pkgdir" && npm publish --access public )
 done
 
-# Step 2: stage the umbrella with optionalDependencies pinned to the
-# just-published native versions, then publish it.
+# Step 2: build the umbrella IN-PLACE in the workspace so it sees the
+# hoisted node_modules (`@types/node`, `@webgpu/types`, etc. live at
+# the workspace root, not in the umbrella subpackage). Then stage a
+# temp copy with patched package.json for publish.
 echo
+echo "==> build umbrella in-place"
+( cd "$ROOT" && npm run build:browser -w textsift && npm run build:native -w textsift )
+
+echo
+if npm view "textsift@$VERSION" version >/dev/null 2>&1; then
+  echo "==> textsift@$VERSION already on npm, done."
+  exit 0
+fi
 echo "==> publish textsift@$VERSION"
 umbrella_src="$ROOT/packages/textsift"
 umbrella_stage="$WORKDIR/textsift-umbrella"
-cp -R "$umbrella_src" "$umbrella_stage"
+mkdir -p "$umbrella_stage"
 
-# Build the umbrella so dist/ is fresh.
-( cd "$umbrella_stage" && npm install --no-audit --no-fund && npm run build:browser )
+# Copy only what npm would actually publish (per the package.json
+# `files` allowlist) plus package.json itself. Avoids dragging
+# node_modules / src / scripts into the publish staging.
+cp "$umbrella_src/package.json" "$umbrella_stage/package.json"
+[[ -f "$umbrella_src/LICENSE" ]] && cp "$umbrella_src/LICENSE" "$umbrella_stage/LICENSE"
+cp "$umbrella_src/README.md" "$umbrella_stage/README.md"
+cp -R "$umbrella_src/dist" "$umbrella_stage/dist"
 
-# Inject optionalDependencies + correct version, in place.
+# Inject optionalDependencies + correct version into the staged copy.
 node <<NODE
 const fs = require("node:fs");
 const p = "$umbrella_stage/package.json";

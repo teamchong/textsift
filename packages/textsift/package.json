@@ -1,6 +1,6 @@
 {
   "name": "textsift",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Local-first PII detection + redaction running openai/privacy-filter on-device. Same engine in browser (WebGPU), Node native (Metal/Vulkan/Dawn), CLI, pre-commit hook, and GitHub Action.",
   "type": "module",
   "author": "Steven Chong",

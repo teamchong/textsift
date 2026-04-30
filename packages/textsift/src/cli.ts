@@ -8,14 +8,30 @@
  */
 
 import { readFile, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { stdin, stdout, stderr, exit, argv, env } from "node:process";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { PrivacyFilter, markerPresets } from "./index.js";
 import { getCacheInfo, clearCache, getCacheRoot } from "./native/loader.js";
 import type { CreateOptions, RedactTableMode } from "./browser/types.js";
 import type { LoaderProgress } from "./native/loader.js";
 
-const VERSION = "0.1.0";
+// Read the live version from the umbrella package.json at runtime so
+// `textsift --version` and the CLI banner stay in sync with what's
+// actually installed. Hardcoding the string means a package.json bump
+// without a CLI source edit silently leaves the wrong version on
+// `--help` (caught during the v0.1.1 smoke test).
+const VERSION: string = ((): string => {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const pkg = JSON.parse(readFileSync(resolve(here, "../package.json"), "utf8"));
+    return pkg.version;
+  } catch {
+    return "unknown";
+  }
+})();
 const HELP = `textsift ${VERSION} — local-first PII detection / redaction
 
 USAGE

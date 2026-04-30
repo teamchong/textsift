@@ -240,7 +240,15 @@ jobs:
           }
           EOF
 
-      - name: Publish to npm (OIDC)
+      - name: Publish to npm
+        # NODE_AUTH_TOKEN is the fallback auth path. npm's Trusted-
+        # Publisher OIDC matcher 404s on this account's six-package
+        # one-repo setup despite identical config to working sibling
+        # repos (turboquant-wasm, vectorjson). `--provenance` still
+        # uses GitHub OIDC for the Sigstore attestation, so the
+        # published packages keep the signed provenance metadata.
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: cd pkg && npm publish --access public --provenance
 
   # ── After all 5 natives publish, build the browser bundle and publish ──
@@ -293,7 +301,9 @@ jobs:
           fs.writeFileSync(p, JSON.stringify(pkg, null, 2) + "\n");
           NODE
 
-      - name: Publish to npm (OIDC)
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: cd packages/textsift && npm publish --access public --provenance
 
   # ── After successful publish, push the v$VERSION tag so the source ──
